@@ -615,7 +615,11 @@ async fn dispatch(
             {
                 Ok(strategy_id) => success(
                     request.id,
-                    json!({"strategy_id": strategy_id, "state": "stopped"}),
+                    json!({
+                        "strategy_id": strategy_id,
+                        "state": "stopped",
+                        "kind": params.kind
+                    }),
                 ),
                 Err(error) => failure(request.id, -32030, &error.to_string()),
             }

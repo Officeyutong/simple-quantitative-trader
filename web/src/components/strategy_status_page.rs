@@ -172,6 +172,7 @@ pub fn strategy_status_page(props: &StrategyStatusPageProps) -> Html {
                     bars={(*bars).clone()}
                     evaluations={(*evaluations).clone()}
                     symbol={strategy.map(|value| text(value, "symbol")).unwrap_or_else(|| "—".into())}
+                    view_key={strategy.map(|value| text(value, "strategy_id")).unwrap_or_default()}
                 />
             </div></section>
 

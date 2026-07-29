@@ -5,17 +5,30 @@ use plotly::{
     layout::{Axis, HoverMode, Layout, RangeSlider},
 };
 use serde_json::Value;
-#[cfg(target_arch = "wasm32")]
-use wasm_bindgen_futures::spawn_local;
 use yew::prelude::*;
+#[cfg(target_arch = "wasm32")]
+use {
+    wasm_bindgen::{JsValue, prelude::wasm_bindgen},
+    wasm_bindgen_futures::{js_sys::Object, spawn_local},
+};
 
 const CHART_ID: &str = "strategy-price-chart";
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(catch, js_namespace = Plotly, js_name = react)]
+    async fn plotly_react(id: &str, plot: &Object) -> Result<JsValue, JsValue>;
+}
 
 #[derive(Properties, PartialEq)]
 pub struct StrategyChartProps {
     pub bars: Vec<Value>,
     pub evaluations: Vec<Value>,
     pub symbol: String,
+    /// Remains stable while one strategy is selected, so Plotly preserves the
+    /// user's zoom and pan during data refreshes.
+    pub view_key: String,
 }
 
 #[function_component(StrategyChart)]
@@ -23,10 +36,11 @@ pub fn strategy_chart(props: &StrategyChartProps) -> Html {
     let bars = props.bars.clone();
     let evaluations = props.evaluations.clone();
     let symbol = props.symbol.clone();
+    let view_key = props.view_key.clone();
 
     use_effect_with(
-        (bars, evaluations, symbol),
-        move |(bars, evaluations, symbol)| {
+        (bars, evaluations, symbol, view_key),
+        move |(bars, evaluations, symbol, view_key)| {
             let mut ordered_bars = bars.clone();
             ordered_bars.sort_by_key(|bar| {
                 bar.get("bar_time")
@@ -94,8 +108,22 @@ pub fn strategy_chart(props: &StrategyChartProps) -> Html {
             );
 
             #[cfg(target_arch = "wasm32")]
-            spawn_local(async move {
-                plotly::bindings::new_plot(CHART_ID, &plot).await;
+            spawn_local({
+                let view_key = view_key.clone();
+                async move {
+                    let plot_object = plot.to_js_object();
+                    let layout = js_sys::Reflect::get(&plot_object, &JsValue::from_str("layout"))
+                        .expect("Plotly layout must exist");
+                    js_sys::Reflect::set(
+                        &layout,
+                        &JsValue::from_str("uirevision"),
+                        &JsValue::from_str(&view_key),
+                    )
+                    .expect("Plotly uirevision must be writable");
+                    plotly_react(CHART_ID, &plot_object)
+                        .await
+                        .expect("Error updating chart");
+                }
             });
             || ()
         },

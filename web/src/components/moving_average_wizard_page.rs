@@ -34,6 +34,7 @@ pub fn moving_average_wizard_page(props: &MovingAverageWizardPageProps) -> Html 
     let health = use_state(|| None::<Value>);
     let name = use_state(|| "moving-average-strategy".to_owned());
     let bar_timeframe = use_state(|| "1m".to_owned());
+    let bar_timeframe_ref = use_node_ref();
     let short_window = use_state(|| "5".to_owned());
     let long_window = use_state(|| "20".to_owned());
     let strategy_id = use_state(String::new);
@@ -101,6 +102,7 @@ pub fn moving_average_wizard_page(props: &MovingAverageWizardPageProps) -> Html 
         let selected = selected.clone();
         let name = name.clone();
         let bar_timeframe = bar_timeframe.clone();
+        let bar_timeframe_ref = bar_timeframe_ref.clone();
         let short_window = short_window.clone();
         let long_window = long_window.clone();
         let strategy_id = strategy_id.clone();
@@ -133,7 +135,14 @@ pub fn moving_average_wizard_page(props: &MovingAverageWizardPageProps) -> Html 
                 return;
             }
             let conid = contract.get("conid").and_then(Value::as_i64).unwrap_or(0);
-            let kind = if *bar_timeframe == "5s" {
+            // Read the select element at submission time. This avoids creating
+            // the previous render's strategy kind when selection and creation
+            // happen before Yew has completed another render.
+            let selected_timeframe = bar_timeframe_ref
+                .cast::<web_sys::HtmlSelectElement>()
+                .map(|select| select.value())
+                .unwrap_or_else(|| (*bar_timeframe).clone());
+            let kind = if selected_timeframe == "5s" {
                 "moving_average_cross_5s"
             } else {
                 "moving_average_cross"
@@ -157,8 +166,11 @@ pub fn moving_average_wizard_page(props: &MovingAverageWizardPageProps) -> Html 
                 match call_method(&endpoint, "strategy.create", params).await {
                     Ok(response) => {
                         let id = text(&response, "strategy_id");
+                        let created_kind = text(&response, "kind");
                         strategy_id.set(id.clone());
-                        notice.set(Some(Ok(format!("均线策略已创建：{id}"))));
+                        notice.set(Some(Ok(format!(
+                            "均线策略已创建：{id}（类型：{created_kind}）"
+                        ))));
                         on_completed.emit(());
                     }
                     Err(error) => notice.set(Some(Err(error))),
@@ -353,7 +365,7 @@ pub fn moving_average_wizard_page(props: &MovingAverageWizardPageProps) -> Html 
                     </div>
                     <div class="col-12 col-lg-2">
                         <label class="form-label" for="ma-bar-timeframe">{"Bar 周期"}</label>
-                        <select id="ma-bar-timeframe" class="form-select"
+                        <select id="ma-bar-timeframe" class="form-select" ref={bar_timeframe_ref}
                             value={(*bar_timeframe).clone()}
                             disabled={!strategy_id.is_empty()}
                             onchange={{
