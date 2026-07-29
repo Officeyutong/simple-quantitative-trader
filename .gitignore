@@ -1,0 +1,7 @@
+/target
+target/
+data/
+*.duckdb
+*.duckdb.wal
+logs/
+/dist

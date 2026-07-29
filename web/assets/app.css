@@ -1,0 +1,75 @@
+:root {
+  color-scheme: light;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: #f4f6f8;
+  color: #17212b;
+  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+}
+
+.sidebar {
+  min-height: calc(100vh - 56px);
+  background: #fff;
+  border-right: 1px solid #e5e7eb;
+}
+
+.sidebar .nav-link {
+  border: 0;
+  border-radius: .5rem;
+  background: transparent;
+  color: #52606d;
+  padding: .7rem .8rem;
+}
+
+.sidebar .nav-link:hover,
+.sidebar .nav-link.active {
+  background: #e9f2ff;
+  color: #0d6efd;
+  font-weight: 600;
+}
+
+.json-view {
+  max-height: 30rem;
+  overflow: auto;
+  color: #243b53;
+  white-space: pre-wrap;
+}
+
+code {
+  color: #334e68;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.strategy-id {
+  width: 12rem;
+  max-width: 12rem;
+}
+
+.strategy-id code {
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}
+
+.rpc-params,
+.rpc-result {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: .875rem;
+}
+
+.rpc-result {
+  max-height: 36rem;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+
+@media (max-width: 991.98px) {
+  .sidebar {
+    min-height: auto;
+    border-right: 0;
+    border-bottom: 1px solid #e5e7eb;
+  }
+}

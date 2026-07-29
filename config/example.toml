@@ -1,0 +1,59 @@
+[app]
+environment = "paper"
+data_dir = "../data"
+timezone = "UTC"
+
+[rpc]
+http_listen = "127.0.0.1:8787"
+allowed_web_origin = "http://127.0.0.1:8080"
+max_request_bytes = 1048576
+max_concurrent_requests = 32
+request_timeout_seconds = 30
+
+[web]
+enabled = true
+listen = "127.0.0.1:8080"
+static_dir = "../web/dist"
+
+[storage]
+duckdb_path = "state.duckdb"
+lake_dir = "lake"
+staging_dir = "staging"
+backup_dir = "backups"
+
+[logging]
+level = "info"
+format = "pretty"
+
+[ibkr]
+host = "127.0.0.1"
+port = 4002
+client_id = 17
+# account = "DU123456"
+connect_on_start = false
+request_timeout_seconds = 10
+reconnect_max_seconds = 60
+readonly = false
+
+[risk]
+base_currency = "HKD"
+max_fx_rate_age_seconds = 3600
+trading_enabled = true
+max_order_notional = 10000.0
+max_order_quantity = 1000.0
+max_market_data_age_seconds = 30
+max_account_data_age_seconds = 3600
+max_position_quantity = 1000.0
+max_gross_exposure = 100000.0
+max_net_exposure = 100000.0
+max_open_orders = 20
+max_orders_per_minute = 10
+max_daily_loss = 1000.0
+max_price_deviation_bps = 500.0
+
+[monitoring]
+enabled = true
+interval_seconds = 30
+performance_snapshot_seconds = 300
+performance_initial_capital = 100000.0
+alert_on_delayed_market_data = true

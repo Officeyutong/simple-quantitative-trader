@@ -1,0 +1,37 @@
+[workspace]
+members = [".", "rpc-types", "web"]
+resolver = "3"
+
+[package]
+name = "simple-quantitative-trader"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+duckdb = { version = "1", features = ["bundled", "chrono", "uuid"] }
+fs2 = "0.4"
+futures = "0.3"
+http = "1"
+ibapi = "3.3"
+jsonrpsee = { version = "=0.26.0", features = ["server", "http-client"] }
+quant-rpc-types = { path = "rpc-types" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+time = "0.3"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = "0.7"
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+tower = "0.5"
+tower-http = { version = "0.7", features = ["validate-request"] }
+uuid = { version = "1", features = ["serde", "v7"] }
+
+[dev-dependencies]
+tempfile = "3"

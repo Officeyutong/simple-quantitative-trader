@@ -1,0 +1,19 @@
+[package]
+name = "quant-web"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+gloo-timers = "0.3"
+chrono = { version = "0.4", features = ["clock", "wasmbind"] }
+jsonrpsee = { version = "=0.26.0", features = ["wasm-client"] }
+plotly = "0.14.1"
+quant-rpc-types = { path = "../rpc-types" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["HtmlInputElement", "HtmlSelectElement", "HtmlTextAreaElement", "Storage", "Window"] }
+yew = { version = "=0.22.0", features = ["csr"] }
+yew-bootstrap = "=0.14.0"
+yew-router = "=0.19.0"
