@@ -40,7 +40,7 @@ pub fn strategy_chart(props: &StrategyChartProps) -> Html {
 
     use_effect_with(
         (bars, evaluations, symbol, view_key),
-        move |(bars, evaluations, symbol, view_key)| {
+        move |(bars, evaluations, symbol, _)| {
             let mut ordered_bars = bars.clone();
             ordered_bars.sort_by_key(|bar| {
                 bar.get("bar_time")
