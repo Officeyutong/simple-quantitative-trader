@@ -33,10 +33,18 @@ pub fn moving_average_wizard_page(props: &MovingAverageWizardPageProps) -> Html 
     let selected = use_state(|| None::<Value>);
     let health = use_state(|| None::<Value>);
     let name = use_state(|| "moving-average-strategy".to_owned());
+    let strategy_version = use_state(|| "v2".to_owned());
     let bar_timeframe = use_state(|| "1m".to_owned());
     let bar_timeframe_ref = use_node_ref();
     let short_window = use_state(|| "5".to_owned());
     let long_window = use_state(|| "20".to_owned());
+    let average_type = use_state(|| "ema".to_owned());
+    let min_gap_percent = use_state(|| "0.05".to_owned());
+    let confirmation_bars = use_state(|| "2".to_owned());
+    let cooldown_bars = use_state(|| "3".to_owned());
+    let atr_window = use_state(|| "14".to_owned());
+    let min_atr_percent = use_state(|| "0".to_owned());
+    let trend_window = use_state(|| "0".to_owned());
     let strategy_id = use_state(String::new);
     let account = use_state(|| {
         props
@@ -53,6 +61,21 @@ pub fn moving_average_wizard_page(props: &MovingAverageWizardPageProps) -> Html 
     let execution_confirmed = use_state(|| false);
     let busy_action = use_state(String::new);
     let notice = use_state(|| None::<Result<String, String>>);
+    {
+        let managed_account = props
+            .system
+            .pointer("/ibkr/managed_accounts/0")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let account = account.clone();
+        use_effect_with(managed_account.clone(), move |_| {
+            if account.trim().is_empty() && !managed_account.is_empty() {
+                account.set(managed_account);
+            }
+            || ()
+        });
+    }
 
     let subscribe = wizard_rpc(
         props.endpoint.clone(),
@@ -101,10 +124,18 @@ pub fn moving_average_wizard_page(props: &MovingAverageWizardPageProps) -> Html 
         let endpoint = props.endpoint.clone();
         let selected = selected.clone();
         let name = name.clone();
+        let strategy_version = strategy_version.clone();
         let bar_timeframe = bar_timeframe.clone();
         let bar_timeframe_ref = bar_timeframe_ref.clone();
         let short_window = short_window.clone();
         let long_window = long_window.clone();
+        let average_type = average_type.clone();
+        let min_gap_percent = min_gap_percent.clone();
+        let confirmation_bars = confirmation_bars.clone();
+        let cooldown_bars = cooldown_bars.clone();
+        let atr_window = atr_window.clone();
+        let min_atr_percent = min_atr_percent.clone();
+        let trend_window = trend_window.clone();
         let strategy_id = strategy_id.clone();
         let busy_action = busy_action.clone();
         let notice = notice.clone();
@@ -134,6 +165,20 @@ pub fn moving_average_wizard_page(props: &MovingAverageWizardPageProps) -> Html 
                 notice.set(Some(Err("策略名称不能为空".into())));
                 return;
             }
+            let parse_percentage = |value: &str, label: &str| {
+                value
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|value| value.is_finite() && (0.0..=100.0).contains(value))
+                    .ok_or_else(|| format!("{label}必须是 0 到 100 之间的数字"))
+            };
+            let parse_count = |value: &str, label: &str, min: usize, max: usize| {
+                value
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|value| (min..=max).contains(value))
+                    .ok_or_else(|| format!("{label}必须在 {min} 到 {max} 之间"))
+            };
             let conid = contract.get("conid").and_then(Value::as_i64).unwrap_or(0);
             // Read the select element at submission time. This avoids creating
             // the previous render's strategy kind when selection and creation
@@ -142,19 +187,63 @@ pub fn moving_average_wizard_page(props: &MovingAverageWizardPageProps) -> Html 
                 .cast::<web_sys::HtmlSelectElement>()
                 .map(|select| select.value())
                 .unwrap_or_else(|| (*bar_timeframe).clone());
-            let kind = if selected_timeframe == "5s" {
+            let kind = if *strategy_version == "v2" {
+                "moving_average_cross_v2"
+            } else if selected_timeframe == "5s" {
                 "moving_average_cross_5s"
             } else {
                 "moving_average_cross"
             };
+            let mut config = json!({
+                "conid": conid,
+                "short_window": short,
+                "long_window": long
+            });
+            if *strategy_version == "v2" {
+                let advanced = (
+                    parse_percentage(&min_gap_percent, "最小均线差"),
+                    parse_count(&confirmation_bars, "确认 Bar 数", 1, 1_000),
+                    parse_count(&cooldown_bars, "冷却 Bar 数", 0, 10_000),
+                    parse_count(&atr_window, "ATR 窗口", 1, 10_000),
+                    parse_percentage(&min_atr_percent, "最小 ATR"),
+                    parse_count(&trend_window, "趋势窗口", 0, 10_000),
+                );
+                let (Ok(gap), Ok(confirm), Ok(cooldown), Ok(atr), Ok(min_atr), Ok(trend)) =
+                    advanced
+                else {
+                    let error = [
+                        advanced.0.err(),
+                        advanced.1.err(),
+                        advanced.2.err(),
+                        advanced.3.err(),
+                        advanced.4.err(),
+                        advanced.5.err(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .next()
+                    .unwrap_or_else(|| "V2 参数无效".into());
+                    notice.set(Some(Err(error)));
+                    return;
+                };
+                config = json!({
+                    "conid": conid,
+                    "short_window": short,
+                    "long_window": long,
+                    "bar_timeframe": selected_timeframe,
+                    "average_type": &*average_type,
+                    "min_gap_percent": gap,
+                    "confirmation_bars": confirm,
+                    "cooldown_bars": cooldown,
+                    "atr_window": atr,
+                    "min_atr_percent": min_atr,
+                    "trend_window": trend
+                });
+            }
             let params = json!({
                 "name": name.trim(),
                 "kind": kind,
-                "config": {
-                    "conid": conid,
-                    "short_window": short,
-                    "long_window": long
-                }
+                "config": config
             });
             let endpoint = endpoint.clone();
             let strategy_id = strategy_id.clone();
@@ -359,9 +448,25 @@ pub fn moving_average_wizard_page(props: &MovingAverageWizardPageProps) -> Html 
             <section class="card shadow-sm mb-4"><div class="card-body">
                 <h2 class="h5">{"3. 设置参数并创建策略"}</h2>
                 <div class="row g-3 align-items-end">
-                    <div class="col-12 col-lg-4">
+                    <div class="col-12 col-lg-3">
                         <label class="form-label">{"策略名称"}</label>
                         <input class="form-control" value={(*name).clone()} oninput={state_input(name.clone())} />
+                    </div>
+                    <div class="col-12 col-lg-3">
+                        <label class="form-label" for="ma-strategy-version">{"策略版本"}</label>
+                        <select id="ma-strategy-version" class="form-select"
+                            value={(*strategy_version).clone()}
+                            disabled={!strategy_id.is_empty()}
+                            onchange={{
+                                let strategy_version = strategy_version.clone();
+                                Callback::from(move |event: Event| {
+                                    let input: web_sys::HtmlSelectElement = event.target_unchecked_into();
+                                    strategy_version.set(input.value());
+                                })
+                            }}>
+                            <option value="v2">{"V2（推荐，过滤噪声）"}</option>
+                            <option value="v1">{"V1（简单交叉）"}</option>
+                        </select>
                     </div>
                     <div class="col-12 col-lg-2">
                         <label class="form-label" for="ma-bar-timeframe">{"Bar 周期"}</label>
@@ -392,6 +497,61 @@ pub fn moving_average_wizard_page(props: &MovingAverageWizardPageProps) -> Html 
                             {button_content(&busy_action, "create", "创建策略")}
                         </button>
                     </div>
+                    {
+                        (*strategy_version == "v2").then(|| html! {
+                            <>
+                                <div class="col-6 col-lg-2">
+                                    <label class="form-label">{"均线类型"}</label>
+                                    <select class="form-select" value={(*average_type).clone()}
+                                        onchange={{
+                                            let average_type = average_type.clone();
+                                            Callback::from(move |event: Event| {
+                                                let input: web_sys::HtmlSelectElement = event.target_unchecked_into();
+                                                average_type.set(input.value());
+                                            })
+                                        }}>
+                                        <option value="ema">{"EMA（推荐）"}</option>
+                                        <option value="sma">{"SMA"}</option>
+                                    </select>
+                                </div>
+                                <div class="col-6 col-lg-2">
+                                    <label class="form-label">{"最小均线差（%）"}</label>
+                                    <input class="form-control" type="number" min="0" max="100" step="0.01"
+                                        value={(*min_gap_percent).clone()} oninput={state_input(min_gap_percent.clone())} />
+                                </div>
+                                <div class="col-6 col-lg-2">
+                                    <label class="form-label">{"确认 Bar 数"}</label>
+                                    <input class="form-control" type="number" min="1" max="1000"
+                                        value={(*confirmation_bars).clone()} oninput={state_input(confirmation_bars.clone())} />
+                                </div>
+                                <div class="col-6 col-lg-2">
+                                    <label class="form-label">{"冷却 Bar 数"}</label>
+                                    <input class="form-control" type="number" min="0" max="10000"
+                                        value={(*cooldown_bars).clone()} oninput={state_input(cooldown_bars.clone())} />
+                                </div>
+                                <div class="col-6 col-lg-2">
+                                    <label class="form-label">{"ATR 窗口"}</label>
+                                    <input class="form-control" type="number" min="1" max="10000"
+                                        value={(*atr_window).clone()} oninput={state_input(atr_window.clone())} />
+                                </div>
+                                <div class="col-6 col-lg-2">
+                                    <label class="form-label">{"最小 ATR（%）"}</label>
+                                    <input class="form-control" type="number" min="0" max="100" step="0.01"
+                                        value={(*min_atr_percent).clone()} oninput={state_input(min_atr_percent.clone())} />
+                                </div>
+                                <div class="col-6 col-lg-2">
+                                    <label class="form-label">{"趋势窗口（0=关闭）"}</label>
+                                    <input class="form-control" type="number" min="0" max="10000"
+                                        value={(*trend_window).clone()} oninput={state_input(trend_window.clone())} />
+                                </div>
+                                <div class="col-12">
+                                    <div class="form-text">
+                                        {"V2 只有在均线差、ATR、趋势和连续确认条件全部满足时才产生信号；冷却期可阻止短时间内反向交易。"}
+                                    </div>
+                                </div>
+                            </>
+                        }).unwrap_or_default()
+                    }
                     <div class="col-12">
                         <div class="form-text">
                             {format!(

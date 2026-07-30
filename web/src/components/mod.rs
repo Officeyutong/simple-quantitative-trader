@@ -7,6 +7,7 @@ mod cancel_order_button;
 mod dashboard_page;
 mod delete_strategy_button;
 mod error_modal;
+mod execution_cost_page;
 mod instrument_search;
 mod instruments_page;
 mod key_value;

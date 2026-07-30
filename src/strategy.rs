@@ -190,6 +190,310 @@ impl Strategy for FiveSecondMovingAverageCross {
     }
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MovingAverageType {
+    Sma,
+    Ema,
+}
+
+fn default_average_type() -> MovingAverageType {
+    MovingAverageType::Ema
+}
+
+fn default_bar_timeframe() -> String {
+    "1m".into()
+}
+
+fn default_confirmation_bars() -> usize {
+    2
+}
+
+fn default_atr_window() -> usize {
+    14
+}
+
+/// A noise-resistant moving-average crossover.
+///
+/// V2 keeps order sizing and broker interaction outside the strategy. Its
+/// responsibility is to produce a better-audited directional signal from
+/// finalized Bars.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MovingAverageCrossV2Config {
+    pub conid: i32,
+    pub short_window: usize,
+    pub long_window: usize,
+    #[serde(default = "default_bar_timeframe")]
+    pub bar_timeframe: String,
+    #[serde(default = "default_average_type")]
+    pub average_type: MovingAverageType,
+    #[serde(default)]
+    pub min_gap_percent: f64,
+    #[serde(default = "default_confirmation_bars")]
+    pub confirmation_bars: usize,
+    #[serde(default)]
+    pub cooldown_bars: usize,
+    #[serde(default = "default_atr_window")]
+    pub atr_window: usize,
+    #[serde(default)]
+    pub min_atr_percent: f64,
+    /// Zero disables the long-term price trend filter.
+    #[serde(default)]
+    pub trend_window: usize,
+}
+
+pub struct MovingAverageCrossV2 {
+    config: MovingAverageCrossV2Config,
+}
+
+impl MovingAverageCrossV2 {
+    pub fn new(config: MovingAverageCrossV2Config) -> Result<Self, String> {
+        if config.conid <= 0
+            || config.short_window == 0
+            || config.long_window <= config.short_window
+            || config.long_window > 10_000
+            || !matches!(config.bar_timeframe.as_str(), "1m" | "5s")
+            || !config.min_gap_percent.is_finite()
+            || !(0.0..=100.0).contains(&config.min_gap_percent)
+            || config.confirmation_bars == 0
+            || config.confirmation_bars > 1_000
+            || config.cooldown_bars > 10_000
+            || config.atr_window == 0
+            || config.atr_window > 10_000
+            || !config.min_atr_percent.is_finite()
+            || !(0.0..=100.0).contains(&config.min_atr_percent)
+            || config.trend_window > 10_000
+        {
+            return Err(
+                "moving_average_cross_v2 requires conid > 0, timeframe 1m or 5s, \
+                 0 < short_window < long_window <= 10000, confirmation_bars 1..=1000, \
+                 cooldown_bars <= 10000, atr_window 1..=10000, trend_window <= 10000, \
+                 and percentage filters between 0 and 100"
+                    .into(),
+            );
+        }
+        Ok(Self { config })
+    }
+
+    fn base_history(&self) -> usize {
+        self.config
+            .long_window
+            .max(self.config.atr_window + 1)
+            .max(self.config.trend_window)
+    }
+
+    fn indicators(&self, bars: &[StrategyBar], end: usize) -> V2Indicators {
+        let closes: Vec<f64> = bars[..end].iter().map(|bar| bar.close).collect();
+        let short = moving_average(
+            &closes[end - self.config.short_window..end],
+            self.config.average_type,
+        );
+        let long = moving_average(
+            &closes[end - self.config.long_window..end],
+            self.config.average_type,
+        );
+        let close = closes[end - 1];
+        let gap_percent = if close > 0.0 {
+            (short - long).abs() / close * 100.0
+        } else {
+            0.0
+        };
+        let atr = average_true_range(&bars[..end], self.config.atr_window);
+        let atr_percent = if close > 0.0 {
+            atr / close * 100.0
+        } else {
+            0.0
+        };
+        let trend_average = (self.config.trend_window > 0).then(|| {
+            moving_average(
+                &closes[end - self.config.trend_window..end],
+                self.config.average_type,
+            )
+        });
+        let filters_pass = gap_percent >= self.config.min_gap_percent
+            && atr_percent >= self.config.min_atr_percent;
+        let direction = if filters_pass
+            && short > long
+            && trend_average.is_none_or(|trend| close >= trend)
+        {
+            1
+        } else if filters_pass && short < long && trend_average.is_none_or(|trend| close <= trend) {
+            -1
+        } else {
+            0
+        };
+        V2Indicators {
+            short,
+            long,
+            gap_percent,
+            atr,
+            atr_percent,
+            trend_average,
+            direction,
+        }
+    }
+}
+
+struct V2Indicators {
+    short: f64,
+    long: f64,
+    gap_percent: f64,
+    atr: f64,
+    atr_percent: f64,
+    trend_average: Option<f64>,
+    direction: i8,
+}
+
+impl Strategy for MovingAverageCrossV2 {
+    fn kind(&self) -> &'static str {
+        "moving_average_cross_v2"
+    }
+
+    fn conid(&self) -> i32 {
+        self.config.conid
+    }
+
+    fn minimum_history(&self) -> usize {
+        self.base_history() + self.config.confirmation_bars + self.config.cooldown_bars
+    }
+
+    fn bar_timeframe(&self) -> &'static str {
+        match self.config.bar_timeframe.as_str() {
+            "5s" => "5s",
+            _ => "1m",
+        }
+    }
+
+    fn evaluate(&self, bars: &[StrategyBar]) -> Result<StrategyOutput, String> {
+        if bars.len() < self.minimum_history() {
+            return Err(format!(
+                "{} requires at least {} finalized bars, found {}",
+                self.kind(),
+                self.minimum_history(),
+                bars.len()
+            ));
+        }
+        // Live evaluation loads exactly `minimum_history`, while backtests
+        // provide an expanding history. Use the same trailing window in both
+        // environments so signals cannot depend on the caller's retention
+        // policy.
+        let bars = &bars[bars.len() - self.minimum_history()..];
+
+        let mut streak_direction = 0;
+        let mut streak = 0usize;
+        let mut previous_emission = None;
+        let mut current_emission = None;
+        for end in self.base_history()..=bars.len() {
+            let direction = self.indicators(bars, end).direction;
+            if direction == 0 {
+                streak_direction = 0;
+                streak = 0;
+            } else if direction == streak_direction {
+                streak += 1;
+            } else {
+                streak_direction = direction;
+                streak = 1;
+            }
+            if streak == self.config.confirmation_bars {
+                if end == bars.len() {
+                    current_emission = Some(direction);
+                } else {
+                    previous_emission = Some(end);
+                }
+            }
+        }
+
+        let current = self.indicators(bars, bars.len());
+        let previous = self.indicators(bars, bars.len() - 1);
+        let cooling_down = current_emission.is_some()
+            && previous_emission
+                .is_some_and(|end| bars.len().saturating_sub(end) <= self.config.cooldown_bars);
+        let signal = match (current_emission, cooling_down) {
+            (Some(1), false) => StrategySignal::Buy,
+            (Some(-1), false) => StrategySignal::Sell,
+            _ => StrategySignal::Hold,
+        };
+        let reason = if cooling_down {
+            "cooldown"
+        } else if current_emission.is_some() {
+            "confirmed_cross"
+        } else if current.gap_percent < self.config.min_gap_percent {
+            "gap_below_threshold"
+        } else if current.atr_percent < self.config.min_atr_percent {
+            "atr_below_threshold"
+        } else if current.direction == 0 && self.config.trend_window > 0 {
+            "trend_filter"
+        } else {
+            "waiting_for_confirmation_or_new_cross"
+        };
+        let current_bar = bars.last().expect("minimum history validated");
+        Ok(StrategyOutput {
+            signal,
+            indicator_a: current.short,
+            indicator_b: current.long,
+            previous_indicator_a: previous.short,
+            previous_indicator_b: previous.long,
+            details: json!({
+                "version": 2,
+                "timeframe": self.bar_timeframe(),
+                "average_type": self.config.average_type,
+                "short_window": self.config.short_window,
+                "long_window": self.config.long_window,
+                "min_gap_percent": self.config.min_gap_percent,
+                "confirmation_bars": self.config.confirmation_bars,
+                "cooldown_bars": self.config.cooldown_bars,
+                "atr_window": self.config.atr_window,
+                "min_atr_percent": self.config.min_atr_percent,
+                "trend_window": self.config.trend_window,
+                "short_average": current.short,
+                "long_average": current.long,
+                "gap_percent": current.gap_percent,
+                "atr": current.atr,
+                "atr_percent": current.atr_percent,
+                "trend_average": current.trend_average,
+                "qualified_direction": match current.direction { 1 => "buy", -1 => "sell", _ => "none" },
+                "signal_reason": reason,
+                "bar": {
+                    "time": current_bar.time,
+                    "open": current_bar.open,
+                    "high": current_bar.high,
+                    "low": current_bar.low,
+                    "close": current_bar.close,
+                    "volume": current_bar.volume
+                }
+            }),
+        })
+    }
+}
+
+fn moving_average(values: &[f64], average_type: MovingAverageType) -> f64 {
+    match average_type {
+        MovingAverageType::Sma => values.iter().sum::<f64>() / values.len() as f64,
+        MovingAverageType::Ema => {
+            let alpha = 2.0 / (values.len() as f64 + 1.0);
+            values[1..]
+                .iter()
+                .fold(values[0], |ema, value| alpha * value + (1.0 - alpha) * ema)
+        }
+    }
+}
+
+fn average_true_range(bars: &[StrategyBar], window: usize) -> f64 {
+    let start = bars.len() - window;
+    bars[start..]
+        .iter()
+        .enumerate()
+        .map(|(offset, bar)| {
+            let index = start + offset;
+            let previous_close = bars[index - 1].close;
+            (bar.high - bar.low)
+                .max((bar.high - previous_close).abs())
+                .max((bar.low - previous_close).abs())
+        })
+        .sum::<f64>()
+        / window as f64
+}
+
 /// A deliberately small second strategy that also serves as an extension example.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CloseThresholdConfig {
@@ -343,6 +647,11 @@ pub fn build(kind: &str, config: Value) -> Result<Box<dyn Strategy>, String> {
                 serde_json::from_value(config).map_err(|error| error.to_string())?;
             Ok(Box::new(FiveSecondMovingAverageCross::new(config)?))
         }
+        "moving_average_cross_v2" => {
+            let config: MovingAverageCrossV2Config =
+                serde_json::from_value(config).map_err(|error| error.to_string())?;
+            Ok(Box::new(MovingAverageCrossV2::new(config)?))
+        }
         "close_threshold" => {
             let config: CloseThresholdConfig =
                 serde_json::from_value(config).map_err(|error| error.to_string())?;
@@ -361,6 +670,7 @@ pub fn registered_kinds() -> &'static [&'static str] {
     &[
         "moving_average_cross",
         "moving_average_cross_5s",
+        "moving_average_cross_v2",
         "close_threshold",
         "paper_round_trip",
     ]
@@ -421,6 +731,105 @@ mod tests {
         let output = strategy.evaluate(&bars).unwrap();
         assert_eq!(output.signal, StrategySignal::Buy);
         assert_eq!(output.details["timeframe"], "5s");
+    }
+
+    fn bars_from_closes(closes: &[f64]) -> Vec<StrategyBar> {
+        let start = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        closes
+            .iter()
+            .enumerate()
+            .map(|(index, close)| StrategyBar {
+                time: start + chrono::Duration::seconds(index as i64 * 5),
+                open: *close,
+                high: *close,
+                low: *close,
+                close: *close,
+                volume: 1.0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn v2_waits_for_confirmation_and_supports_five_second_ema() {
+        let strategy = build(
+            "moving_average_cross_v2",
+            json!({
+                "conid": 756733,
+                "short_window": 2,
+                "long_window": 3,
+                "bar_timeframe": "5s",
+                "average_type": "sma",
+                "confirmation_bars": 2,
+                "cooldown_bars": 0,
+                "atr_window": 1
+            }),
+        )
+        .unwrap();
+        assert_eq!(strategy.kind(), "moving_average_cross_v2");
+        assert_eq!(strategy.bar_timeframe(), "5s");
+        let output = strategy.evaluate(&bars_from_closes(&[3.0, 2.0, 1.0, 4.0, 5.0]));
+        let output = output.unwrap();
+        assert_eq!(output.signal, StrategySignal::Buy);
+        assert_eq!(output.details["signal_reason"], "confirmed_cross");
+        assert_eq!(output.details["version"], 2);
+    }
+
+    #[test]
+    fn v2_gap_filter_and_cooldown_explain_held_signals() {
+        let gap_filtered = build(
+            "moving_average_cross_v2",
+            json!({
+                "conid": 756733,
+                "short_window": 2,
+                "long_window": 3,
+                "average_type": "sma",
+                "min_gap_percent": 100.0,
+                "confirmation_bars": 1,
+                "cooldown_bars": 0,
+                "atr_window": 1
+            }),
+        )
+        .unwrap();
+        let output = gap_filtered
+            .evaluate(&bars_from_closes(&[3.0, 2.0, 1.0, 4.0]))
+            .unwrap();
+        assert_eq!(output.signal, StrategySignal::Hold);
+        assert_eq!(output.details["signal_reason"], "gap_below_threshold");
+
+        let cooling_down = build(
+            "moving_average_cross_v2",
+            json!({
+                "conid": 756733,
+                "short_window": 2,
+                "long_window": 3,
+                "average_type": "sma",
+                "confirmation_bars": 1,
+                "cooldown_bars": 3,
+                "atr_window": 1
+            }),
+        )
+        .unwrap();
+        let output = cooling_down
+            .evaluate(&bars_from_closes(&[3.0, 2.0, 1.0, 4.0, 1.0, 0.0, 3.0]))
+            .unwrap();
+        assert_eq!(output.signal, StrategySignal::Hold);
+        assert_eq!(output.details["signal_reason"], "cooldown");
+    }
+
+    #[test]
+    fn v2_rejects_invalid_timeframe_and_windows() {
+        assert!(
+            build(
+                "moving_average_cross_v2",
+                json!({
+                    "conid": 756733,
+                    "short_window": 20,
+                    "long_window": 5,
+                    "bar_timeframe": "1h"
+                }),
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -9,7 +9,6 @@ use crate::api::call_method;
 use super::{
     backtest_data_panel::BacktestDataPanel,
     error_modal::ErrorModal,
-    instrument_search::InstrumentSearch,
     value::{
         array, format_number, integer, local_time, number, official_security_name,
         security_exchange, text,
@@ -32,8 +31,6 @@ pub fn backtest_page(props: &BacktestPageProps) -> Html {
             .filter(|value| value != "—")
             .unwrap_or_default()
     });
-    let instrument = use_state(|| None::<Value>);
-    let timeframe = use_state(|| "1m".to_owned());
     let start = use_state(|| local_datetime_value(-7.0 * 86_400_000.0));
     let end = use_state(|| local_datetime_value(0.0));
     let quantity = use_state(|| "1".to_owned());
@@ -48,6 +45,31 @@ pub fn backtest_page(props: &BacktestPageProps) -> Html {
     let detail = use_state(|| None::<Value>);
     let detail_busy = use_state(|| None::<String>);
     let notice = use_state(|| None::<Result<String, String>>);
+    {
+        let strategy_ids = strategies
+            .iter()
+            .map(|strategy| text(strategy, "strategy_id"))
+            .filter(|id| id != "—")
+            .collect::<Vec<_>>();
+        let strategy_id = strategy_id.clone();
+        let data_ready = data_ready.clone();
+        use_effect_with(strategy_ids.clone(), move |_| {
+            if !strategy_ids.iter().any(|id| id == strategy_id.as_str()) {
+                strategy_id.set(strategy_ids.first().cloned().unwrap_or_default());
+                data_ready.set(false);
+            }
+            || ()
+        });
+    }
+    let selected_strategy = strategies
+        .iter()
+        .find(|strategy| text(strategy, "strategy_id") == *strategy_id)
+        .cloned();
+    let instrument = selected_strategy.as_ref().and_then(strategy_instrument);
+    let timeframe = selected_strategy
+        .as_ref()
+        .map(strategy_timeframe)
+        .unwrap_or_default();
 
     {
         let endpoint = props.endpoint.clone();
@@ -80,8 +102,10 @@ pub fn backtest_page(props: &BacktestPageProps) -> Html {
         let notice = notice.clone();
         Callback::from(move |event: SubmitEvent| {
             event.prevent_default();
-            let Some(contract) = (*instrument).clone() else {
-                notice.set(Some(Err("请先搜索并选择证券".into())));
+            let Some(contract) = instrument.clone() else {
+                notice.set(Some(Err(
+                    "策略绑定的证券资料不完整；请先通过证券搜索或行情订阅保存该合约资料。".into(),
+                )));
                 return;
             };
             if !*data_ready {
@@ -136,16 +160,14 @@ pub fn backtest_page(props: &BacktestPageProps) -> Html {
                 notice.set(Some(Err("所选证券没有有效 Conid".into())));
                 return;
             }
-            let mut strategy_config = strategy.get("config").cloned().unwrap_or_else(|| json!({}));
-            strategy_config["conid"] = Value::from(conid);
             let params = json!({
                 "strategy_id": *strategy_id,
                 "conid": conid,
-                "timeframe": *timeframe,
+                "timeframe": timeframe.clone(),
                 "start": start_utc,
                 "end": end_utc,
                 "strategy_kind": text(strategy, "kind"),
-                "strategy_config": strategy_config,
+                "strategy_config": strategy.get("config").cloned().unwrap_or_else(|| json!({})),
                 "quantity": quantity_value,
                 "initial_cash": cash_value,
                 "slippage_bps": slippage_bps.parse::<f64>().unwrap_or(0.0),
@@ -205,27 +227,15 @@ pub fn backtest_page(props: &BacktestPageProps) -> Html {
                 <form onsubmit={run}>
                     <div class="row g-3">
                         <div class="col-12">
-                            <label class="form-label">{"1. 选择证券"}</label>
-                            <InstrumentSearch endpoint={props.endpoint.clone()} on_select={{
-                                let instrument = instrument.clone();
-                                Callback::from(move |value| instrument.set(Some(value)))
-                            }} />
-                            {instrument.as_ref().map(|value| html! {
-                                <div class="alert alert-success mt-3 mb-0">
-                                    {format!("已选择：{} ({}) · {} · Conid {}",
-                                        official_security_name(value), text(value, "symbol"),
-                                        security_exchange(value), integer(value, "conid"))}
-                                </div>
-                            }).unwrap_or_default()}
-                        </div>
-                        <div class="col-12">
-                            <label class="form-label" for="backtest-strategy">{"2. 选择策略"}</label>
+                            <label class="form-label" for="backtest-strategy">{"1. 选择策略"}</label>
                             <select id="backtest-strategy" class="form-select" value={(*strategy_id).clone()}
                                 onchange={{
                                     let strategy_id = strategy_id.clone();
+                                    let data_ready = data_ready.clone();
                                     Callback::from(move |event: Event| {
                                         let input: web_sys::HtmlSelectElement = event.target_unchecked_into();
                                         strategy_id.set(input.value());
+                                        data_ready.set(false);
                                     })
                                 }}>
                                 {strategies.iter().map(|strategy| {
@@ -235,13 +245,36 @@ pub fn backtest_page(props: &BacktestPageProps) -> Html {
                             </select>
                             <div class="form-text strategy-id">{format!("完整策略 UUID：{}", *strategy_id)}</div>
                         </div>
-                        <Field label="时间周期" value={timeframe.clone()} kind="text" />
+                        <div class="col-12">
+                            <label class="form-label">{"2. 策略绑定的证券与周期"}</label>
+                            {instrument.as_ref().map(|value| html! {
+                                <div class="alert alert-success mb-0">
+                                    <div>{format!("{} ({}) · {} · Conid {}",
+                                        official_security_name(value), text(value, "symbol"),
+                                        security_exchange(value), integer(value, "conid"))}</div>
+                                    <div class="small mt-1">{format!("Bar 周期：{}（由策略配置锁定）", timeframe)}</div>
+                                </div>
+                            }).unwrap_or_else(|| html! {
+                                <div class="alert alert-danger mb-0">
+                                    {"该策略的 Conid 或本地证券资料不完整，暂时无法准备回测数据。"}
+                                </div>
+                            })}
+                        </div>
                         <Field label="开始时间（本地）" value={start.clone()} kind="datetime-local" />
                         <Field label="结束时间（本地）" value={end.clone()} kind="datetime-local" />
+                        {if timeframe == "5s" {
+                            html! {
+                                <div class="col-12">
+                                    <div class="alert alert-info mb-0">
+                                        {"5 秒历史数据将按每小时分片从 IBKR 下载。较长范围会产生较多请求，请等待下载任务完成。"}
+                                    </div>
+                                </div>
+                            }
+                        } else { Html::default() }}
                         <BacktestDataPanel
                             endpoint={props.endpoint.clone()}
-                            instrument={(*instrument).clone()}
-                            timeframe={(*timeframe).clone()}
+                            instrument={instrument.clone()}
+                            timeframe={timeframe.clone()}
                             start={(*start).clone()}
                             end={(*end).clone()}
                             on_ready={{
@@ -344,6 +377,41 @@ pub fn backtest_page(props: &BacktestPageProps) -> Html {
                 Callback::from(move |_| detail.set(None))
             })).unwrap_or_default()}
         </>
+    }
+}
+
+fn strategy_instrument(strategy: &Value) -> Option<Value> {
+    let conid = strategy
+        .get("conid")
+        .and_then(Value::as_i64)
+        .or_else(|| strategy.pointer("/config/conid").and_then(Value::as_i64))
+        .filter(|value| *value > 0)?;
+    let symbol = strategy
+        .get("symbol")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())?;
+    Some(json!({
+        "conid": conid,
+        "symbol": symbol,
+        "security_type": strategy.get("security_type").and_then(Value::as_str).unwrap_or("STK"),
+        "currency": strategy.get("currency").and_then(Value::as_str).unwrap_or_default(),
+        "exchange": strategy.get("exchange").and_then(Value::as_str).unwrap_or("SMART"),
+        "primary_exchange": strategy.get("primary_exchange").and_then(Value::as_str).unwrap_or_default(),
+        "local_symbol": strategy.get("local_symbol").and_then(Value::as_str).unwrap_or(symbol),
+        "description": strategy.get("description").and_then(Value::as_str).unwrap_or_default(),
+        "derivative_security_types": []
+    }))
+}
+
+fn strategy_timeframe(strategy: &Value) -> String {
+    match text(strategy, "kind").as_str() {
+        "moving_average_cross_5s" => "5s".into(),
+        "moving_average_cross_v2" => strategy
+            .pointer("/config/bar_timeframe")
+            .and_then(Value::as_str)
+            .unwrap_or("1m")
+            .to_owned(),
+        _ => "1m".into(),
     }
 }
 

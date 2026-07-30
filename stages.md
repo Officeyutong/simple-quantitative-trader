@@ -680,7 +680,7 @@ quant market-data bars --conid <CONID> --limit 100
 
 ## 14. 阶段 11：策略运行器
 
-**状态：已完成（安全的信号模式）**
+**状态：已完成（信号、共享策略核心与 paper 执行）**
 
 ### 已完成内容
 
@@ -705,9 +705,8 @@ quant strategy stop <STRATEGY_ID>
 quant strategy signals <STRATEGY_ID> --limit 100
 ```
 
-### 后续执行层扩展
+### 尚未实现的更通用事件运行时
 
-- `Strategy` trait；
 - `StrategyContext`；
 - 行情、定时器、订单和成交事件；
 - 每个策略独立任务；
@@ -728,7 +727,8 @@ quant strategy signals <STRATEGY_ID> --limit 100
 - `strategy kinds` 列出当前二进制已注册策略；
 - `strategy create --kind --config-json` 创建任意注册策略；
 - `backtest run-strategy --kind --config-json` 回测同一份策略代码；
-- 内置 `close_threshold` 作为第二个策略和扩展示例；
+- 当前注册五种策略：`moving_average_cross`、`moving_average_cross_5s`、
+  `moving_average_cross_v2`、`close_threshold` 和 `paper_round_trip`；
 - 完整开发说明见 [STRATEGIES.md](STRATEGIES.md)；
 - 通用策略完成创建、启动、停止及本地 Parquet 回测验收。
 
@@ -736,8 +736,8 @@ quant strategy signals <STRATEGY_ID> --limit 100
 
 - schema 17：`strategy_execution_configs` 与 `strategy_execution_actions`；
 - 每个 execution config 默认 disabled、强制 `paper_only=true`；
-- buy 信号补仓到 `target_quantity`，sell 信号仅清空现有多头；
-- 不自动做空，不在已有活动订单时重复下单；
+- buy/sell 分别调整到配置的目标仓位；支持显式空头目标和多腿组合；
+- 同一账户、同一合约存在活动订单时跳过，不重复下单；
 - config 启用时间以前的历史信号不会被执行；
 - `(evaluation_id)` 和策略信号幂等键防止重复 action/订单；
 - processing、submitted、rejected、failed、skipped 全程持久化；
@@ -846,7 +846,7 @@ compaction、retention、任意只读 SQL 和 Polars 属于容量扩展。首版
 - 进程锁；
 - 优雅停止；
 - 配置校验；
-- RPC 仅监听 loopback。
+- RPC 安全默认监听 loopback，监听地址与浏览器 Origin 可显式配置。
 
 ### 剩余工作
 
@@ -991,7 +991,8 @@ trading_enabled = false
 
 ## 20. 当前可用功能清单
 
-当前可以安全用于 paper 验证的命令：
+当前可以安全用于 paper 验证的主要命令（完整参数以 `quant --help` 和各子命令
+`--help` 为准）：
 
 ```bash
 quant daemon
@@ -1020,10 +1021,16 @@ quant data snapshot create/list ...
 quant market-data subscribe ...
 quant market-data subscriptions
 quant market-data quote --conid <CONID>
+quant market-data health/bars ...
 quant market-data unsubscribe --conid <CONID>
 
-quant strategy create-ma/list/start/pause/stop/signals ...
-quant backtest run/list ...
+quant strategy kinds/create/create-ma/list/start/pause/stop/signals ...
+quant strategy execution configure/configure-portfolio/enable/disable/list/actions ...
+quant performance report/snapshots ...
+quant monitor metrics/alerts/acknowledge ...
+quant fx set/list ...
+quant calendar add/list/status ...
+quant backtest run/run-strategy/list ...
 
 quant order preview ...
 quant order submit ... --confirm
@@ -1040,12 +1047,11 @@ quant safety status/set/live-approve/live-revoke ...
 当前支持的交易范围：
 
 - IBKR paper；
-- 美国股票和 ETF，即 `STK`；
+- 当前风险与执行主路径面向股票和 ETF，即 `STK`；
 - buy/sell；
 - market/limit；
-- regular hours；
-- extended hours；
-- `OVERNIGHT` 直接路由；
+- 人工订单可按参数选择常规/盘前盘后及路由；
+- 策略自动执行固定使用市价单、`SMART`/配置的交易所且 `outside_rth=false`；
 - 整股数量。
 
 ## 21. 当前已知风险和技术债
@@ -1058,8 +1064,9 @@ quant safety status/set/live-approve/live-revoke ...
 4. 撤单、部分成交和 execution correction 仍需更长时间 paper 故障注入；
 5. 存储使用进程内互斥串行写入（已具备锁中毒恢复与任务监督），回测、备份等
    长操作仍会阻塞其他请求；长查询未来可迁移到 StorageWriter actor；
-6. 当前策略运行器只产出信号，自动执行层仍需单独授权和 paper 验收；
-7. 首版仅支持股票/ETF 市价、限价单；多资产与高级订单明确延期；
+6. 策略运行器会产出信号；只有单独配置、显式授权且通过全部门控的 paper 策略才会
+   自动执行；
+7. 首版主路径仅支持股票/ETF 市价、限价单；多资产与高级订单明确延期；
 8. IBKR 请求仍无 token bucket pacing（backfill 依靠切片加 2 秒轮询节流）；
 9. Parquet staging 残留临时文件与无 manifest 孤儿文件尚无启动扫描/quarantine。
 
@@ -1140,3 +1147,45 @@ deploy/screen-stop.sh config/paper.toml
 这一阶段完成的是可验证的 paper 运行能力，并不自动构成实盘盈利证明。策略盈利能力
 仍需依靠未参与参数选择的样本外数据、合理成本模型和持续数周的 paper forward test
 来评估。
+
+## 25. 阶段 18：高频 Bar、V2 策略与订单诊断
+
+**状态：已完成（paper 诊断增量）**
+
+- schema 20 增加 5 秒 Bar；实时成交 Tick 同时聚合 1 分钟和 5 秒 OHLC；
+- 增加 `moving_average_cross_5s`，以及支持 1m/5s、SMA/EMA、均线 gap、确认、
+  冷却、ATR 和趋势过滤的 `moving_average_cross_v2`；
+- schema 21 为订单保存 `remaining_quantity`、`last_fill_price`、`why_held` 和
+  `market_cap_price`；
+- 新增 `broker_order_events`，审计 IBKR open/completed order 的状态、拒绝原因、
+  警告文本和完成状态；
+- 风控认可当前会话已完成的空持仓快照，避免完全空仓账户因没有持仓行而被错误判定
+  为“position data is missing”；同步中和真正过期的快照仍禁止开仓；
+- Web 的订单与策略状态页面展示这些诊断字段，便于区分未成交、部分成交、broker
+  已无活动订单和明确拒绝；
+- 实时绩效佣金继续以 IBKR `CommissionReport` 为准，非基础币种在报告生成时按当前
+  新鲜 FX 换算。
+
+仍未解决的成本建模限制：
+
+- 回测 `commission_per_order` 只是每笔固定金额，不识别市场费率、最低收费、税费或
+  平台费；
+- `min_gap_percent` 是指标过滤条件，不代表预期收益覆盖费用；
+- 本阶段结束时自动执行尚无交易成本门槛；该限制已由下一阶段的数据库费用模型解决。
+  5 秒等高换手策略仍需要长周期 paper 验证。
+
+## 26. 阶段 19：数据库费用模型与成本感知执行
+
+**状态：已完成（paper）**
+
+- schema 22 增加数据库费用模型、策略成本控制和 action 成本审计字段；
+- Web“交易成本”页面支持创建和修改固定费、比例费、最低费、卖出税费、点差和
+  滑点模型，并绑定到策略；
+- 执行前把完整往返费用折算为 bps，并乘配置安全倍数与均线指标差强度比较；
+- 固定费自动惩罚小额订单，比例费随名义金额计算，两者可同时配置；
+- 使用策略历史实际 `CommissionReport` 有效费率 P90 与配置模型取更保守值；
+- 成本不足的 action 记为 `skipped`，保留名义金额、预计成本、信号强度和门槛；
+- 最新绩效快照达到最少交易数后，佣金/毛利润超过上限会自动关闭该策略执行配置。
+
+schema 23 继续为费用模型增加买入和卖出每股费用，单边费用统一按
+`max(最低费, 每笔固定费 + 数量×每股费 + 名义金额×比例费率)` 计算。

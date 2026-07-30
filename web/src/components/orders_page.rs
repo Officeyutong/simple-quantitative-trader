@@ -144,6 +144,9 @@ pub fn orders_page(props: &OrdersPageProps) -> Html {
                                                 title={order_status_explanation(&status)}>
                                                 {order_status_label(&status)}
                                             </span>
+                                            {order_diagnostics(row).into_iter().map(|detail| html! {
+                                                <div class="small text-secondary mt-1 text-break">{detail}</div>
+                                            }).collect::<Html>()}
                                         </td>
                                         <td class="text-end">{number(row, "filled_quantity")}</td>
                                         <td class="text-end">{number(row, "average_fill_price")}</td>
@@ -278,6 +281,50 @@ fn order_status_explanation(status: &str) -> &'static str {
         "cancelled" | "canceled" => "IBKR 已确认订单取消",
         _ => "订单状态来自本地记录或 IBKR 回报",
     }
+}
+
+fn order_diagnostics(order: &Value) -> Vec<String> {
+    let mut details = Vec::new();
+    if let Some(remaining) = order.get("remaining_quantity").and_then(Value::as_f64) {
+        details.push(format!(
+            "剩余数量：{}",
+            super::value::format_number(remaining)
+        ));
+    }
+    if let Some(reason) = order
+        .get("why_held")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        details.push(format!("IBKR Hold：{reason}"));
+    }
+    if let Some(price) = order.get("last_fill_price").and_then(Value::as_f64) {
+        details.push(format!(
+            "最近成交价：{}",
+            super::value::format_number(price)
+        ));
+    }
+    if let Some(price) = order.get("market_cap_price").and_then(Value::as_f64) {
+        details.push(format!(
+            "IBKR 限价上限：{}",
+            super::value::format_number(price)
+        ));
+    }
+    let event = order.get("latest_broker_event").unwrap_or(&Value::Null);
+    for (key, label) in [
+        ("reject_reason", "拒绝原因"),
+        ("warning_text", "IBKR 警告"),
+        ("completed_status", "完成说明"),
+    ] {
+        if let Some(value) = event
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            details.push(format!("{label}：{value}"));
+        }
+    }
+    details
 }
 
 fn load_page(

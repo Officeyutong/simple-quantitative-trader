@@ -820,6 +820,63 @@ async fn dispatch(
                 Err(error) => failure(request.id, -32030, &error.to_string()),
             }
         }
+        "execution_cost.model.upsert" => {
+            let params = match serde_json::from_value::<crate::storage::ExecutionCostModelInput>(
+                request.params,
+            ) {
+                Ok(params) => params,
+                Err(error) => {
+                    return failure(request.id, -32602, &format!("invalid parameters: {error}"));
+                }
+            };
+            match storage.lock_safe().upsert_execution_cost_model(&params) {
+                Ok(cost_model_id) => success(request.id, json!({"cost_model_id": cost_model_id})),
+                Err(error) => failure(request.id, -32030, &error.to_string()),
+            }
+        }
+        "execution_cost.model.list" => match storage.lock_safe().list_execution_cost_models() {
+            Ok(models) => success(request.id, json!({"models": models})),
+            Err(error) => failure(request.id, -32030, &error.to_string()),
+        },
+        "execution_cost.model.delete" => {
+            #[derive(serde::Deserialize)]
+            struct Params {
+                cost_model_id: uuid::Uuid,
+                confirm: bool,
+            }
+            let params = match serde_json::from_value::<Params>(request.params) {
+                Ok(params) if params.confirm => params,
+                Ok(_) => return failure(request.id, -32602, "delete requires confirm=true"),
+                Err(error) => {
+                    return failure(request.id, -32602, &format!("invalid parameters: {error}"));
+                }
+            };
+            match storage
+                .lock_safe()
+                .delete_execution_cost_model(params.cost_model_id)
+            {
+                Ok(deleted) => success(request.id, json!({"deleted": deleted})),
+                Err(error) => failure(request.id, -32030, &error.to_string()),
+            }
+        }
+        "execution_cost.control.configure" => {
+            let params = match serde_json::from_value::<crate::storage::StrategyCostControlInput>(
+                request.params,
+            ) {
+                Ok(params) => params,
+                Err(error) => {
+                    return failure(request.id, -32602, &format!("invalid parameters: {error}"));
+                }
+            };
+            match storage.lock_safe().configure_strategy_cost_control(&params) {
+                Ok(()) => success(request.id, json!({"strategy_id": params.strategy_id})),
+                Err(error) => failure(request.id, -32030, &error.to_string()),
+            }
+        }
+        "execution_cost.control.list" => match storage.lock_safe().list_strategy_cost_controls() {
+            Ok(controls) => success(request.id, json!({"controls": controls})),
+            Err(error) => failure(request.id, -32030, &error.to_string()),
+        },
         "performance.report" => {
             let params = match serde_json::from_value::<PerformanceReportParams>(request.params) {
                 Ok(params) => params,

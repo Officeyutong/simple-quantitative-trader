@@ -1,8 +1,27 @@
 # Web 前端与 RPC Workspace 设计
 
+> 本文保留 Web/RPC 重构的设计依据，并记录当前实现。实际命令和操作流程以
+> [README.md](README.md) 为准，策略行为以 [STRATEGIES.md](STRATEGIES.md) 为准。
+
+## 0. 当前实现状态
+
+重构已经完成：根后端、`rpc-types` 与 `web` 是同一个 Cargo workspace；daemon
+使用 `jsonrpsee` 同时提供 HTTP 和 WebSocket JSON-RPC，CLI 与 Yew/WASM 客户端共享
+`quant-rpc-types`。Unix Domain Socket 和自定义换行 framing 已不再使用。
+
+Web 当前包含总览、证券搜索、策略、策略状态、策略绩效、回测、交易成本、均线策略向导、
+Paper 验证、订单与成交、运行维护、实时日志、RPC 工具和 RPC 设置。页面默认每
+5 秒刷新；RPC 工具的方法表来自 `quant_rpc_types::ALL_METHODS`，因此新增 RPC 时
+应同时更新共享清单。
+
+监听地址不是代码硬编码的 loopback：`rpc.http_listen` 与 `web.listen` 决定实际
+网络边界。示例配置使用 loopback；若配置为 `0.0.0.0`，必须依靠可信局域网、防火墙
+或带 TLS、认证和访问控制的反向代理。`allowed_web_origin = "*"` 只影响浏览器
+Origin 校验，不会把外部监听自动变安全。
+
 ## 1. 目标
 
-为现有个人量化交易平台增加一个位于 `web/` 的 Yew WebAssembly 前端，使用
+为现有个人量化交易平台提供一个位于 `web/` 的 Yew WebAssembly 前端，使用
 [`isosphere/yew-bootstrap`](https://github.com/isosphere/yew-bootstrap) 提供
 Bootstrap 5 组件，通过 JSON-RPC 操作 daemon。
 
@@ -12,17 +31,17 @@ Bootstrap 5 组件，通过 JSON-RPC 操作 daemon。
 - 将目前散落在 `src/rpc.rs`、`src/main.rs` 和领域模块中的 RPC 请求、响应与公共
   DTO 抽到独立的 `rpc-types` crate；
 - 使用 `jsonrpsee` 统一服务端、CLI client、WASM client 和 RPC codegen；
-- 删除 Unix Domain Socket RPC，CLI 和 Web 统一使用仅监听本机 TCP Socket 的
-  HTTP JSON-RPC；
+- 删除 Unix Domain Socket RPC，CLI 和 Web 统一使用监听地址可配置的 HTTP/WebSocket
+  JSON-RPC；
 - 所有查询和变更都经过现有 daemon 的 RPC、风控、审计和幂等链路，前端不直接访问
   DuckDB、Parquet 或 IB Gateway；
 - 对下单、启用自动执行、紧急停止、live approval 等高风险操作提供明确确认流程。
 
 首版是本机单用户控制台，不设计多租户、远程公网部署或移动端应用。
 
-## 2. 现状与关键约束
+## 2. 重构前现状与关键约束
 
-当前 RPC 是手写的 JSON-RPC 2.0：
+重构前 RPC 是手写的 JSON-RPC 2.0：
 
 - Unix Socket：`data/run/quant.sock`；
 - 请求和响应以换行符分隔；
@@ -32,8 +51,8 @@ Bootstrap 5 组件，通过 JSON-RPC 操作 daemon。
 - 许多响应通过 `serde_json::json!` 临时构造，前端无法在编译期检查字段；
 - RPC dispatch 同时依赖 IBKR handle、Storage、风险配置和取消令牌。
 
-重构时不保留 Unix Socket。daemon 只在 loopback TCP Socket 上提供
-`jsonrpsee` HTTP server：
+重构后不保留 Unix Socket。daemon 在配置的 TCP Socket 上提供 `jsonrpsee`
+HTTP/WebSocket server：
 
 ```text
 CLI ── jsonrpsee HttpClient ─┐
@@ -41,9 +60,9 @@ CLI ── jsonrpsee HttpClient ─┐
 Web ─ jsonrpsee WasmClient ─┘
 ```
 
-`jsonrpsee` 是唯一 RPC 实现，不新增绕过 RPC 的 REST 业务接口。CLI 在
-`127.0.0.1:8787` 上使用 HTTP，浏览器受 WASM 限制在同一 TCP listener 上使用
-WebSocket；两者都使用 JSON-RPC 2.0，而不是自定义裸 TCP framing。
+`jsonrpsee` 是唯一 RPC 实现，不新增绕过 RPC 的 REST 业务接口。CLI 使用 HTTP，
+浏览器受 WASM 限制在同一 TCP listener 上使用 WebSocket；两者都使用 JSON-RPC
+2.0，而不是自定义裸 TCP framing。
 现有 `unix_socket` 配置、UDS listener、换行 framing、socket 文件权限和 stale
 socket 清理代码均直接删除。
 
@@ -273,20 +292,19 @@ GET /assets/*         带 hash 的静态文件
 GET /*                SPA history fallback
 ```
 
-不为每个 method 创建 REST endpoint。RPC 和静态文件使用不同的 loopback 端口，
+不为每个 method 创建 REST endpoint。RPC 和静态文件使用不同端口，
 减少静态资源路由对交易 RPC 的影响。
 
-开发模式由 Trunk 在 `127.0.0.1:8080` 提供前端，daemon 允许这个明确 origin。生产
-构建由 daemon 同源提供静态文件，避免 CORS。禁止 `0.0.0.0` 默认监听；若未来需要
-远程访问，应通过 SSH tunnel 或具备 TLS/身份认证的反向代理，而不是直接暴露交易
-RPC。
+开发模式由 Trunk 在 `127.0.0.1:8080` 提供前端，daemon 允许这个明确 origin。
+安全默认值和示例配置使用 loopback；配置允许显式改为 `0.0.0.0`，此时必须通过可信
+局域网、防火墙、SSH tunnel 或具备 TLS/身份认证的反向代理访问。
 
 ### 5.3 安全
 
-- HTTP RPC 始终启用但默认只允许 loopback；
+- HTTP RPC 始终启用；默认配置使用 loopback，显式配置可开放到其他接口；
 - 浏览器 WebSocket 默认严格校验精确的 `allowed_web_origin`；显式配置 `*` 时允许
   任意 Origin 并记录安全警告，不支持部分 glob；
-- CLI 等原生客户端不发送 `Origin`，但仍只能从本机 loopback 连接；
+- CLI 等原生客户端不发送 `Origin`；可达范围取决于 `rpc.http_listen` 和网络策略；
 - 本地同权限进程属于信任边界；如需跨机器使用，必须另加 TLS 和身份认证代理；
 - 设置 CSP、`X-Content-Type-Options: nosniff`、`frame-ancestors 'none'`；
 - mutation 不使用 GET；
@@ -448,14 +466,13 @@ cargo build --workspace --release
 deploy/screen-start.sh config/paper.toml
 ```
 
-daemon 启动时始终启动 loopback jsonrpsee HTTP server；若 `[web].enabled = true`，
-再提供静态页面：
+daemon 启动时始终在 `rpc.http_listen` 启动 jsonrpsee HTTP/WebSocket server；若
+`[web].enabled = true`，再在 `web.listen` 提供静态页面：
 
-1. 校验 listener 只能是 loopback；
-2. 创建或读取 RPC token；
-3. 注册生成的 `QuantRpcServer::into_rpc()`；
-4. 可选校验 `web/dist/index.html` 并提供静态文件；
-5. HTTP 关键任务异常退出时触发 supervisor，使 daemon 非零退出并由现有 screen runner
+1. 校验 RPC 与 Web 不能使用同一监听地址；
+2. 注册共享 RPC module 并应用请求大小、并发数和 Origin 限制；
+3. 校验 `web/dist/index.html` 并提供静态文件；
+4. HTTP 关键任务异常退出时触发 supervisor，使 daemon 非零退出并由现有 screen runner
    拉起。
 
 静态资源不嵌进二进制，便于单独重建 Web；发布包必须把 `web/dist` 与 release binary
@@ -507,7 +524,7 @@ cargo check -p quant-web --target wasm32-unknown-unknown
 trunk build web/index.html --release
 ```
 
-## 10. 实施阶段
+## 10. 原始实施阶段（已完成的历史计划）
 
 ### 阶段 A：协议抽取
 
@@ -521,11 +538,11 @@ trunk build web/index.html --release
 ### 阶段 B：jsonrpsee 服务端与 CLI
 
 1. 实现生成的 `QuantRpcServer` 并注册 `RpcModule`；
-2. 增加 loopback `/rpc`、token/origin 安全和 supervisor；
+2. 增加 HTTP/WebSocket listener、Origin 限制和 supervisor；
 3. CLI 改用生成的 `QuantRpcClient` 和 `HttpClient`；
 4. 删除 UDS server/client、socket 配置和运行时文件处理。
 
-验收：CLI/Web API 都来自同一 trait，非 loopback 默认拒绝启动。
+验收：CLI/Web API 共享 RPC 类型和方法清单，安全默认使用 loopback。
 
 ### 阶段 C：Yew 外壳
 
@@ -567,7 +584,7 @@ execution enable/disable 和 safety 操作。
 - daemon、CLI 和 Web 使用同一 `jsonrpsee` API trait；
 - Web 不直接访问数据库或 IBKR；
 - CLI 使用 `HttpClient`，Web 使用 `WasmClient`，代码中不存在 UDS transport；
-- HTTP 默认仅 loopback、启用 token 和严格 origin；
+- HTTP 默认监听 loopback 并严格校验 Origin；外部监听由部署层补充认证和 TLS；
 - `yew-bootstrap`、Yew 与 Bootstrap CSS 版本被精确锁定；
 - Dashboard、策略、绩效、订单、监控和对账可用；
 - paper 危险操作有确认、幂等和 unknown outcome 处理；

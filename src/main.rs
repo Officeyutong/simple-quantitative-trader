@@ -1462,6 +1462,107 @@ async fn run_daemon(config: Config) -> Result<()> {
                             continue;
                         }
 
+                        if let Some(cost) = &action.cost_control {
+                            let risk_reducing =
+                                action.legs.iter().all(|leg| leg.is_risk_reducing());
+                            if risk_reducing {
+                                let detail = "cost gate bypassed: every execution leg reduces or \
+                                              closes an existing position";
+                                let _ = execution_storage.lock_safe().record_strategy_cost_gate(
+                                    action.action_id,
+                                    "processing",
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    action.signal_edge_bps,
+                                    detail,
+                                );
+                            } else if action.legs.iter().any(|leg| {
+                                !leg.contract.currency.eq_ignore_ascii_case(&cost.currency)
+                            }) {
+                                let detail = format!(
+                                    "cost gate blocked: model currency {} does not match every \
+                                     execution leg currency",
+                                    cost.currency
+                                );
+                                let mut guard = execution_storage.lock_safe();
+                                let _ = guard.record_strategy_cost_gate(
+                                    action.action_id,
+                                    "skipped",
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    action.signal_edge_bps,
+                                    &detail,
+                                );
+                                for leg in &action.legs {
+                                    let _ = guard.finish_strategy_action_leg(
+                                        action.action_id,
+                                        leg.leg_index,
+                                        "skipped",
+                                        None,
+                                        None,
+                                        Some(&detail),
+                                    );
+                                }
+                                continue;
+                            } else {
+                                let mut notional = 0.0;
+                                let mut round_trip_cost = 0.0;
+                                for (leg, price) in &prepared_legs {
+                                    let leg_notional = leg.quantity * price.unwrap_or(0.0);
+                                    notional += leg_notional;
+                                    round_trip_cost +=
+                                        estimate_round_trip_cost(cost, leg_notional, leg.quantity);
+                                }
+                                let required_edge_bps = if notional > 0.0 {
+                                    round_trip_cost / notional * 10_000.0
+                                        * cost.minimum_cost_multiple
+                                } else {
+                                    f64::INFINITY
+                                };
+                                let passed = action
+                                    .signal_edge_bps
+                                    .is_some_and(|edge| edge >= required_edge_bps);
+                                let detail = format!(
+                                    "cost gate {}: signal edge {} bps, required {:.4} bps, \
+                                     estimated round-trip cost {:.4} on notional {:.4}",
+                                    if passed { "passed" } else { "blocked" },
+                                    action
+                                        .signal_edge_bps
+                                        .map(|value| format!("{value:.4}"))
+                                        .unwrap_or_else(|| "unavailable".into()),
+                                    required_edge_bps,
+                                    round_trip_cost,
+                                    notional
+                                );
+                                let state = if passed { "processing" } else { "skipped" };
+                                let mut guard = execution_storage.lock_safe();
+                                let _ = guard.record_strategy_cost_gate(
+                                    action.action_id,
+                                    state,
+                                    notional,
+                                    round_trip_cost,
+                                    required_edge_bps,
+                                    action.signal_edge_bps,
+                                    &detail,
+                                );
+                                if !passed {
+                                    for leg in &action.legs {
+                                        let _ = guard.finish_strategy_action_leg(
+                                            action.action_id,
+                                            leg.leg_index,
+                                            "skipped",
+                                            None,
+                                            None,
+                                            Some(&detail),
+                                        );
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+
                         let mut first_order_intent_id = None;
                         let mut first_broker_order_id = None;
                         let mut batch_error = None;
@@ -1928,6 +2029,28 @@ fn strategy_execution_price(quote: &Value, side: &str) -> Option<f64> {
     })
 }
 
+fn estimate_round_trip_cost(
+    cost: &crate::storage::ClaimedCostControl,
+    notional: f64,
+    quantity: f64,
+) -> f64 {
+    let buy_fee = (cost.buy_fixed_fee
+        + quantity * cost.buy_per_share_fee
+        + notional * cost.buy_rate_bps / 10_000.0)
+        .max(cost.buy_min_fee);
+    let sell_fee = (cost.sell_fixed_fee
+        + quantity * cost.sell_per_share_fee
+        + notional * (cost.sell_rate_bps + cost.sell_tax_bps) / 10_000.0)
+        .max(cost.sell_min_fee);
+    let configured_commissions = buy_fee + sell_fee;
+    let learned_commissions = cost
+        .actual_fee_bps_p90
+        .map(|bps| 2.0 * notional * bps / 10_000.0)
+        .unwrap_or(0.0);
+    configured_commissions.max(learned_commissions)
+        + notional * (cost.estimated_spread_bps + 2.0 * cost.estimated_slippage_bps) / 10_000.0
+}
+
 fn order_params(order: OrderArgs) -> Value {
     json!({
         "idempotency_key": order.idempotency_key,
@@ -1957,6 +2080,9 @@ fn historical_slice_end(
     start: chrono::DateTime<chrono::Utc>,
     requested_end: chrono::DateTime<chrono::Utc>,
 ) -> chrono::DateTime<chrono::Utc> {
+    if timeframe == "5s" {
+        return (start + chrono::Duration::hours(1)).min(requested_end);
+    }
     let days = match timeframe {
         "1m" => 1,
         "5m" => 7,
@@ -1972,6 +2098,7 @@ fn historical_slice_end(
 #[cfg(test)]
 mod execution_tests {
     use super::*;
+    use crate::storage::position_change_is_risk_reducing;
 
     #[test]
     fn automatic_execution_never_uses_delayed_ticks() {
@@ -1990,5 +2117,69 @@ mod execution_tests {
         });
         assert_eq!(strategy_execution_price(&live, "buy"), Some(101.0));
         assert_eq!(strategy_execution_price(&live, "sell"), Some(100.0));
+    }
+
+    #[test]
+    fn five_second_backfills_are_split_into_hourly_requests() {
+        let start = Utc::now();
+        let end = start + chrono::Duration::hours(3);
+        assert_eq!(
+            historical_slice_end("5s", start, end),
+            start + chrono::Duration::hours(1)
+        );
+        assert_eq!(
+            historical_slice_end("5s", start, start + chrono::Duration::minutes(30)),
+            start + chrono::Duration::minutes(30)
+        );
+    }
+
+    #[test]
+    fn cost_estimate_supports_fixed_and_proportional_fees() {
+        let mut cost = crate::storage::ClaimedCostControl {
+            currency: "USD".into(),
+            buy_fixed_fee: 1.0,
+            buy_per_share_fee: 0.0,
+            buy_rate_bps: 0.0,
+            buy_min_fee: 1.0,
+            sell_fixed_fee: 1.0,
+            sell_per_share_fee: 0.0,
+            sell_rate_bps: 0.0,
+            sell_min_fee: 1.0,
+            sell_tax_bps: 0.0,
+            estimated_spread_bps: 0.0,
+            estimated_slippage_bps: 0.0,
+            minimum_cost_multiple: 2.0,
+            maximum_commission_to_gross_profit_ratio: 0.5,
+            minimum_completed_trades: 5,
+            actual_fee_bps_p90: None,
+        };
+        assert_eq!(estimate_round_trip_cost(&cost, 1_000.0, 10.0), 2.0);
+        cost.buy_fixed_fee = 0.0;
+        cost.sell_fixed_fee = 0.0;
+        cost.buy_min_fee = 0.0;
+        cost.sell_min_fee = 0.0;
+        cost.buy_rate_bps = 5.0;
+        cost.sell_rate_bps = 5.0;
+        assert_eq!(estimate_round_trip_cost(&cost, 10_000.0, 10.0), 10.0);
+        cost.buy_min_fee = 15.0;
+        cost.sell_min_fee = 15.0;
+        assert_eq!(estimate_round_trip_cost(&cost, 1_000.0, 10.0), 30.0);
+        cost.buy_min_fee = 0.0;
+        cost.sell_min_fee = 0.0;
+        cost.buy_rate_bps = 0.0;
+        cost.sell_rate_bps = 0.0;
+        cost.buy_per_share_fee = 0.005;
+        cost.sell_per_share_fee = 0.005;
+        assert_eq!(estimate_round_trip_cost(&cost, 1_000.0, 100.0), 1.0);
+    }
+
+    #[test]
+    fn cost_gate_only_bypasses_position_reducing_changes() {
+        assert!(position_change_is_risk_reducing(10.0, 0.0));
+        assert!(position_change_is_risk_reducing(10.0, 4.0));
+        assert!(position_change_is_risk_reducing(-10.0, -4.0));
+        assert!(!position_change_is_risk_reducing(0.0, 10.0));
+        assert!(!position_change_is_risk_reducing(4.0, 10.0));
+        assert!(!position_change_is_risk_reducing(10.0, -4.0));
     }
 }

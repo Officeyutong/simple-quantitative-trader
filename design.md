@@ -1,5 +1,32 @@
 # 基于 IBKR API 的个人量化交易平台设计
 
+> 本文是架构基线和演进目标，不保证每个示例都与当前 CLI 一字不差。当前操作方式以
+> [README.md](README.md) 为准，策略实现以 [STRATEGIES.md](STRATEGIES.md) 为准，
+> 已交付阶段和技术债以 [stages.md](stages.md) 为准。
+
+## 0. 当前实现与设计基线的差异
+
+当前代码已经是由后端、`rpc-types` 和 Yew `web` 组成的 Cargo workspace。
+`jsonrpsee` 在配置指定的 TCP 地址上提供 HTTP/WebSocket JSON-RPC；示例配置使用
+loopback，但监听并非硬编码，外部监听需要额外的 TLS、认证和网络访问控制。
+
+策略层现有五种注册实现：`moving_average_cross`、
+`moving_average_cross_5s`、`moving_average_cross_v2`、`close_threshold` 和
+`paper_round_trip`。实时与回测共享同步、确定性的 `Strategy::evaluate` 核心；
+自动执行仅限 paper，采用目标仓位语义，可配置空头和多腿，但当前策略订单只使用
+市价单且不允许盘前盘后。
+
+DuckDB 当前由进程内互斥保护的 `Storage` 统一访问，而不是下文概念图中的独立
+Storage Writer actor。数据库最新 schema 为 23：除账户、行情、策略、订单、成交、
+风控和绩效数据外，还包含 5 秒 Bar、订单剩余数量/最近成交价/`why_held`/
+market-cap price，以及 `broker_order_events` 状态事件审计。
+
+当前回测是多头、下一根 Bar 开盘撮合，佣金参数是每笔固定金额；它不会自动计算
+不同市场的阶梯佣金、最低收费、税费或平台费。实时绩效则使用 IBKR 实际
+`CommissionReport`。实时自动执行可绑定数据库费用模型，以每笔固定费、每股费、
+比例费、最低费、税费、点差、滑点和实际佣金 P90 建立成本门槛，并在佣金/毛利润
+超限时自动停用。
+
 ## 1. 文档目的
 
 本文描述一个面向个人使用、长期后台运行的量化交易平台。平台通过 Interactive Brokers（IBKR）TWS 或 IB Gateway 连接市场和账户，完成：
@@ -30,7 +57,7 @@
 | ID | UUID / bigint + IBKR conid | 内部实体不依赖外部 ID；合约同时保存 `conid` |
 | 日志 | `tracing` | 结构化日志、span、轮转文件和可选 JSON 输出 |
 | 配置 | TOML + `serde` | 文件配置、环境变量覆盖、启动时校验 |
-| RPC | JSON-RPC 2.0 | `jsonrpsee`，仅监听 loopback TCP，CLI 使用 HTTP、Web 使用 WebSocket |
+| RPC | JSON-RPC 2.0 | `jsonrpsee`，监听地址可配置，CLI 使用 HTTP、Web 使用 WebSocket |
 | CLI | 同一二进制 | `clap` 子命令通过 JSON-RPC 操作 daemon |
 
 建议使用当前稳定 Rust 工具链。依赖版本在实现时锁定到 `Cargo.lock`，升级必须通过回归测试，尤其是 `ibapi`、DuckDB 和 Parquet 写入相关依赖。
@@ -68,7 +95,7 @@
                         | status/data/order/...|
                         +----------+-----------+
                                    |
-                  JSON-RPC 2.0 / loopback TCP
+                  JSON-RPC 2.0 / configured TCP
                                    |
 +----------------------------------v----------------------------------+
 | quant daemon                                                        |
@@ -1139,7 +1166,8 @@ CPU 密集分析、DuckDB 查询、Parquet 编解码均使用 `spawn_blocking` �
 
 ## 10. 安全设计
 
-- daemon RPC 默认仅监听 loopback TCP，不允许配置为非 loopback 地址；
+- daemon RPC 安全默认监听 loopback TCP；显式配置外部接口时必须增加防火墙、TLS、
+  身份认证和访问控制；
 - 数据目录、配置和日志权限仅限当前用户；
 - 实盘必须显式配置账户白名单和开启交易；
 - CLI 默认先 `order preview`，实际提交需要明确确认；

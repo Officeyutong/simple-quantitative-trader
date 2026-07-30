@@ -6,7 +6,7 @@ Parquet。
 当前版本提供：
 
 - 长期运行的 daemon 和同一二进制 CLI；
-- loopback TCP 上由 `jsonrpsee` 提供的 HTTP/WebSocket JSON-RPC 2.0；
+- 由 `jsonrpsee` 提供、监听地址可配置的 HTTP/WebSocket JSON-RPC 2.0；
 - Yew + `yew-bootstrap` 本地 Web 控制台；
 - IB Gateway/TWS 连接、断线检测和指数退避重连；
 - managed accounts 校验；
@@ -15,11 +15,12 @@ Parquet。
 - 历史行情下载、质量检查和 Parquet 原子落盘；
 - Parquet 文件 DuckDB manifest；
 - Parquet 校验和、数据快照和确定性回测；
-- 持久化策略状态与均线交叉信号；
+- 五种内置策略、持久化运行状态、1 分钟/5 秒实时 Bar 和可复用回测核心；
+- 仅限 paper 的目标仓位自动执行，支持单腿、多腿与目标空头仓位；
 - 市价单/限价单风险预览；
 - `trading_enabled`、最大数量和最大名义价值检查；
 - 幂等订单意图、风险决策和提交记录；
-- 订单提交和撤单入口；
+- 订单提交、撤单、状态诊断和 broker 事件审计；
 - 结构化日志、进程锁、数据库迁移和优雅停止。
 - 健康检查、一致性联合备份、`screen` 守护脚本和持久化紧急停止。
 
@@ -70,8 +71,11 @@ $BIN --config "$CFG" executions
 http://127.0.0.1:8080
 ```
 
-CLI 通过 HTTP/TCP 调用 `127.0.0.1:8787`，Web 前端通过同一 `jsonrpsee` server 的
-WebSocket transport 调用 RPC。两个监听地址都只允许 loopback，不应直接暴露到公网。
+CLI 通过 HTTP 调用 RPC，Web 前端通过同一 `jsonrpsee` server 的 WebSocket
+transport 调用 RPC。`config/example.toml` 默认监听 `127.0.0.1:8787` 和
+`127.0.0.1:8080`；实际边界由 `rpc.http_listen` 与 `web.listen` 决定。
+仓库中的长期 paper 配置可能面向局域网监听，必须只在可信网络或带 TLS、认证和
+访问控制的反向代理后使用，绝不能直接暴露到公网。
 
 如果 `ibkr status` 没有进入 Ready，可手动请求连接：
 
@@ -113,7 +117,9 @@ cp config/example.toml config/local.toml
 cargo run -- --config config/local.toml daemon
 ```
 
-默认 `trading_enabled = false`。只有在 paper 环境完成验收后才应显式开启。
+启动前必须检查配置中的 `risk.trading_enabled`；示例配置可能为了 paper 验证而
+开启它。即使该值为 `true`，策略执行仍默认关闭，必须逐个策略显式配置并确认启用。
+live 自动执行始终被程序硬性禁止。
 
 ## Web 控制台
 
@@ -140,8 +146,9 @@ listen = "127.0.0.1:8080"
 static_dir = "../web/dist"
 ```
 
-daemon 启动后打开 `http://127.0.0.1:8080`。控制台当前提供运行总览、IBKR/对账
-状态、持仓、策略启动/暂停、paper 执行启停、订单与成交、告警、立即对账和备份。
+daemon 启动后打开 `http://127.0.0.1:8080`。控制台当前提供总览、证券搜索、策略、
+策略状态、策略绩效、回测、交易成本、均线策略向导、Paper 验证、订单与成交、运行维护、
+实时日志、RPC 工具和 RPC 设置。
 持仓、策略执行配置、执行动作、订单、成交、告警、监控指标和系统状态均以表格展示，
 页面每 5 秒自动刷新，也可以手动立即刷新。所有操作都调用 daemon RPC，不直接访问
 DuckDB 或 IB Gateway。
@@ -173,9 +180,10 @@ Sharpe、Sortino、交易统计及历史绩效快照。绩效只归因于该策�
 allowed_web_origin = "*"
 ```
 
-这会允许任意网站发起浏览器 RPC 请求，daemon 启动时会记录安全警告。该选项不会
-解除 `rpc.http_listen` 的 loopback 限制，但如果前面还有反向代理，必须由代理提供
-可靠的 TLS 和身份认证。能使用精确 Origin 时仍应优先使用精确值。暂不支持
+这会允许任意网站发起浏览器 RPC 请求，daemon 启动时会记录安全警告。它不改变
+`rpc.http_listen` 的值；如果该监听地址不是 loopback，任意 Origin 与外部监听组合
+会显著扩大攻击面。必须由防火墙或反向代理提供可靠的 TLS、身份认证和访问控制。
+能使用精确 Origin 时仍应优先使用精确值。暂不支持
 `https://*.example.com` 这类部分通配模式。
 
 另一个终端中：
@@ -213,7 +221,7 @@ cargo run -- --config config/local.toml market-data bars --conid 756733 --limit 
 cargo run -- --config config/local.toml market-data unsubscribe --conid 756733
 ```
 
-策略默认仅生成可审计信号，不会自动下单：
+策略在未配置并启用执行层时仅生成可审计信号，不会自动下单：
 
 ```bash
 cargo run -- --config config/local.toml strategy create-ma \
@@ -263,13 +271,20 @@ cargo run -- --config config/local.toml backtest run \
 cargo run -- --config config/local.toml backtest list
 ```
 
+Web 回测选择已有策略后，会从该策略的持久化配置自动锁定证券 `conid` 和 Bar 周期，
+不再要求重复搜索证券，也不能用另一只证券或其他周期替换。后端同样以
+`strategy_id` 对应的保存配置为权威，忽略请求中冲突的 kind、config、conid 和
+timeframe。需要测试另一只证券时，应创建新的策略配置。Parquet 历史回测不允许用
+其他周期冒充策略绑定周期；`5s` 策略会下载真实 5 秒历史 Bar，并使用这些数据回测。
+
 `quote` 会同时返回最新 ticks 和订阅状态。IBKR 拒绝订阅时，错误会持久化并显示，
 后台每 15 秒受控重试。
 
 `risk.max_market_data_age_seconds` 控制报价最大允许年龄，默认 30 秒。新开仓要求
 行情状态为 `fresh`；缺失、失败或过期行情都会阻止提交。基于当前会话持仓的
 严格平仓不受行情故障阻止。成交价 tick 会聚合成 DuckDB 中的一分钟 OHLC，
-下一分钟首个成交到达时，前一根 Bar 标记为 final。
+并同时聚合 5 秒 OHLC；下一个对应区间的首个成交到达时，前一根 Bar 标记为
+final。没有成交的区间不会合成空 Bar。
 
 ## 历史行情
 
@@ -284,7 +299,8 @@ cargo run -- --config config/local.toml data backfill \
   --end 2026-07-27T00:00:00Z
 ```
 
-支持 `1m`、`5m`、`15m`、`30m`、`1h` 和 `1d`。结果写入
+支持 `5s`、`1m`、`5m`、`15m`、`30m`、`1h` 和 `1d`。其中 `5s` 按每小时分片
+请求 IBKR，较长范围会产生较多请求。结果写入
 `data/lake/bars/timeframe=.../conid=...`，时间统一为 UTC。
 backfill 会返回持久化 Job ID，由 daemon 在 IBKR Ready 后后台执行：
 
@@ -367,6 +383,19 @@ Sharpe、Sortino、每日权益和可选基准超额收益。启用策略会按 
 周期保存快照。告警持久化 IBKR/对账异常、失败或延迟行情、Unknown 订单、失败
 策略 action 和绩效快照错误。
 
+佣金来自 IBKR 的实际 `CommissionReport`，不是程序按固定费率推算；非基础币种佣金
+在生成报告时使用当前新鲜 FX 汇率换算，因此不同时间生成的历史快照可能随汇率轻微
+变化。累计佣金会随成交增加。“交易成本”页面可在 DuckDB 中维护每笔固定费、每股
+费用、成交额比例费、最低收费、卖出税费、点差和滑点模型，并为策略启用下单前成本
+门控。模型不写入 TOML。
+短周期和高换手策略仍应单独评估费用。
+
+成本门控将信号指标差换算成 bps，并与预计完整往返成本乘安全倍数后的门槛比较。
+固定费用会使小额订单的门槛自动升高，比例费用则随成交额变化。系统还会使用该策略
+历史实际 `CommissionReport` 的单边有效费率 P90（如果存在）与配置估算取更保守者。
+不满足条件的 action 记为 `skipped`，并保存名义金额、预计往返成本、信号强度和所需
+强度。达到配置的最少平仓交易数后，若佣金/毛利润超过上限，执行配置会自动停用。
+
 非账户基础币种必须有新鲜 FX 汇率。IBKR Account Summary 的 ExchangeRate 会自动
 写入，也可人工维护：
 
@@ -397,8 +426,10 @@ chmod 600 config/paper.toml
 在 `config/paper.toml` 中确认：
 
 ```toml
-[ibkr]
+[app]
 environment = "paper"
+
+[ibkr]
 connect_on_start = true
 host = "127.0.0.1"
 port = 4002
@@ -429,12 +460,14 @@ IB Gateway 需要保持登录 paper 账户、开放 API、关闭 Read-Only，并
 
 ### 创建并启用策略
 
-均线策略向导支持两种彼此独立的实时策略：
+均线策略向导支持三种彼此独立的实时策略：
 
 - `moving_average_cross`：使用已完成的 1 分钟 Bar；
-- `moving_average_cross_5s`：使用已完成的 5 秒 Bar。
+- `moving_average_cross_5s`：使用已完成的 5 秒 Bar；
+- `moving_average_cross_v2`：可选 1 分钟或 5 秒、SMA/EMA，并提供确认、冷却、
+  ATR 与趋势过滤。
 
-两者可以同时存在。daemon 会从实时成交 Tick 同时聚合 1 分钟和 5 秒 OHLC，
+三者可以同时存在。daemon 会从实时成交 Tick 同时聚合 1 分钟和 5 秒 OHLC，
 策略只在对应周期的 Bar 完成后计算，且同一 Bar 只计算一次。5 秒策略需要持续的
 实时成交 Tick；没有成交的 5 秒区间不会凭空生成 Bar。
 
@@ -553,6 +586,12 @@ $BIN --config "$CFG" performance snapshots <STRATEGY_ID> --limit 500
 - Gateway、网络或 daemon 重启后没有重复订单；
 - 没有未解决的 `unknown` 订单和持仓差异。
 
+均线交叉的 `min_gap` 只过滤均线差距，不是预期收益保证。尤其是 5 秒
+策略，在存在按成交额收费、最低收费、印花税或平台费的市场，频繁反转很可能让费用
+超过毛收益。应把该市场的完整费用估算写入回测的 `commission_per_order`，并以实际
+paper `CommissionReport` 校准；当前回测只接受“每笔固定金额”，不会自动套用各市场
+阶梯费率或税费。实时自动执行应在“交易成本”页面绑定费用模型并启用成本门控。
+
 正式评估开始后应冻结参数。需要调参时创建新的策略 ID，将其视为新的实验，避免
 把样本内调参与样本外结果混在一起。每天或修改策略前创建一致性备份：
 
@@ -605,6 +644,13 @@ cargo run -- --config config/local.toml order submit \
   并返回错误码 `-32026`。此时订单可能仍在 IBKR 存活，必须先 `reconcile`
   查看开放订单，绝不能换 key 重发。
 
+订单列表会保存 `remaining_quantity`、`last_fill_price`、`why_held` 和
+`market_cap_price`。IBKR 的 open/completed order 回调还会写入
+`broker_order_events`，保留状态、拒绝原因和警告文本。诊断“为什么没成交”时，应
+同时检查订单当前状态、剩余数量、`why_held`、限价与实时 bid/ask、交易时段以及事件
+历史；`IBKR 无活动订单`只表示当前 broker open-orders 集合中不存在它，不等于已经
+成交。
+
 所有 submit 尝试（包括被紧急停止、live 未批准、账户校验或就绪门控拒绝的）
 都会持久化 order intent 和 risk decision 审计记录，并消耗对应 idempotency
 key。风控检查与 intent 写入在同一个临界区内完成，并发提交无法一起挤过
@@ -626,7 +672,9 @@ max_account_data_age_seconds = 120
 
 `order preview` 会返回投影持仓、gross/net exposure、活跃订单数、最近一分钟
 订单数、账户 PnL 和价格偏离。账户或持仓数据过期时禁止开仓；严格平仓可以绕过
-持仓、敞口和亏损上限，但仍受下单速率限制。
+持仓、敞口和亏损上限，但仍受下单速率限制。当前 IBKR 持仓快照成功完成后，即使
+账户完全空仓、没有任何 `positions_current` 行，也会按“已确认的零持仓”参与风控；
+尚在同步或超过 `max_account_data_age_seconds` 的快照仍会阻止开仓。
 
 daemon 每次连接 IBKR 后会自动执行订单对账。对账完成前会拒绝提交；存在
 blocking difference 时进入 `Degraded`，只允许基于当前会话新鲜持仓、方向朝向

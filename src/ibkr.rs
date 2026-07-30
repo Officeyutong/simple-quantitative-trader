@@ -119,8 +119,22 @@ pub enum BrokerEvent {
         broker_order_id: i32,
         status: String,
         filled: f64,
+        remaining: f64,
         average_fill_price: Option<f64>,
+        last_fill_price: Option<f64>,
         perm_id: i64,
+        why_held: String,
+        market_cap_price: Option<f64>,
+    },
+    OpenOrder {
+        connection_session_id: Option<uuid::Uuid>,
+        broker_order_id: i32,
+        perm_id: i64,
+        status: String,
+        reject_reason: String,
+        warning_text: String,
+        completed_time: String,
+        completed_status: String,
     },
     Execution {
         connection_session_id: Option<uuid::Uuid>,
@@ -673,11 +687,10 @@ impl Actor {
         } else {
             ibapi::market_data::TradingHours::Regular
         };
-        let seconds = (request.end - request.start).num_seconds();
-        let days = ((seconds + 86_399) / 86_400).clamp(1, i32::MAX as i64) as i32;
+        let duration = historical_duration(&request.timeframe, request.start, request.end)?;
         let data = client
             .historical_data(&contract, parse_bar_size(&request.timeframe)?)
-            .duration(HistoricalDuration::days(days))
+            .duration(duration)
             .ending(end)
             .trading_hours(trading_hours)
             .fetch()
@@ -1418,14 +1431,33 @@ fn candidate_contract(candidate: &ContractCandidate) -> Contract {
 
 fn parse_bar_size(value: &str) -> CommandResult<BarSize> {
     match value {
+        "5s" => Ok(BarSize::Sec5),
         "1m" => Ok(BarSize::Min),
         "5m" => Ok(BarSize::Min5),
         "15m" => Ok(BarSize::Min15),
         "30m" => Ok(BarSize::Min30),
         "1h" => Ok(BarSize::Hour),
         "1d" => Ok(BarSize::Day),
-        _ => Err("unsupported timeframe; use 1m, 5m, 15m, 30m, 1h, or 1d".into()),
+        _ => Err("unsupported timeframe; use 5s, 1m, 5m, 15m, 30m, 1h, or 1d".into()),
     }
+}
+
+fn historical_duration(
+    timeframe: &str,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> CommandResult<HistoricalDuration> {
+    let seconds = (end - start).num_seconds();
+    if seconds <= 0 {
+        return Err("historical end must be after start".into());
+    }
+    if timeframe == "5s" {
+        return Ok(HistoricalDuration::seconds(
+            seconds.clamp(1, i32::MAX as i64) as i32,
+        ));
+    }
+    let days = ((seconds + 86_399) / 86_400).clamp(1, i32::MAX as i64) as i32;
+    Ok(HistoricalDuration::days(days))
 }
 
 fn bar_timestamp_utc(timestamp: BarTimestamp) -> CommandResult<DateTime<Utc>> {
@@ -1454,8 +1486,12 @@ async fn send_place_order_event(
             broker_order_id: status.order_id,
             status: status.status.to_string(),
             filled: status.filled,
+            remaining: status.remaining,
             average_fill_price: status.average_fill_price,
+            last_fill_price: status.last_fill_price,
             perm_id: status.perm_id,
+            why_held: status.why_held,
+            market_cap_price: status.market_cap_price,
         },
         ibapi::orders::PlaceOrder::ExecutionData(data) => BrokerEvent::Execution {
             connection_session_id: Some(connection_session_id),
@@ -1472,10 +1508,16 @@ async fn send_place_order_event(
             commission: report.commission,
             currency: report.currency,
         },
-        ibapi::orders::PlaceOrder::OpenOrder(data) => {
-            tracing::debug!(order_id = data.order.order_id, "IBKR open-order event");
-            return;
-        }
+        ibapi::orders::PlaceOrder::OpenOrder(data) => BrokerEvent::OpenOrder {
+            connection_session_id: Some(connection_session_id),
+            broker_order_id: data.order_id,
+            perm_id: data.order.perm_id,
+            status: data.order_state.status.to_string(),
+            reject_reason: data.order_state.reject_reason,
+            warning_text: data.order_state.warning_text,
+            completed_time: data.order_state.completed_time,
+            completed_status: data.order_state.completed_status,
+        },
     };
     if sender.send(event).await.is_err() {
         tracing::error!("IBKR broker event consumer stopped");
@@ -1537,6 +1579,20 @@ mod tests {
         assert_eq!(reconnect_delay(6, 60), Duration::from_secs(32));
         assert_eq!(reconnect_delay(7, 60), Duration::from_secs(60));
         assert_eq!(reconnect_delay(100, 60), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn five_second_historical_requests_use_seconds() {
+        assert_eq!(parse_bar_size("5s").unwrap(), BarSize::Sec5);
+        let start = Utc::now();
+        assert_eq!(
+            historical_duration("5s", start, start + chrono::Duration::hours(1)).unwrap(),
+            HistoricalDuration::seconds(3_600)
+        );
+        assert_eq!(
+            historical_duration("1m", start, start + chrono::Duration::hours(1)).unwrap(),
+            HistoricalDuration::days(1)
+        );
     }
 
     #[test]

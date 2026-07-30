@@ -10,7 +10,8 @@ use crate::api::{DashboardData, call_method, load_dashboard, load_rpc_endpoint};
 
 use super::{
     MutationRequest, backtest_page::BacktestPage, dashboard_page::DashboardPage,
-    error_modal::ErrorModal, instruments_page::InstrumentsPage, logs_page::LogsPage,
+    error_modal::ErrorModal, execution_cost_page::ExecutionCostPage,
+    instruments_page::InstrumentsPage, logs_page::LogsPage,
     moving_average_wizard_page::MovingAverageWizardPage, nav_button::NavButton,
     operations_page::OperationsPage, orders_page::OrdersPage,
     paper_validation_page::PaperValidationPage, performance_page::PerformancePage,
@@ -28,6 +29,7 @@ pub enum Page {
     StrategyStatus,
     Performance,
     Backtest,
+    ExecutionCosts,
     MovingAverageWizard,
     PaperValidation,
     Orders,
@@ -151,6 +153,7 @@ pub fn app() -> Html {
                     <NavButton label="策略状态" target={Page::StrategyStatus} page={page.clone()} />
                     <NavButton label="策略绩效" target={Page::Performance} page={page.clone()} />
                     <NavButton label="回测" target={Page::Backtest} page={page.clone()} />
+                    <NavButton label="交易成本" target={Page::ExecutionCosts} page={page.clone()} />
                     <NavButton label="均线策略向导" target={Page::MovingAverageWizard} page={page.clone()} />
                     <NavButton label="Paper 验证" target={Page::PaperValidation} page={page.clone()} />
                     <NavButton label="订单与成交" target={Page::Orders} page={page.clone()} />
@@ -213,6 +216,7 @@ fn page_title(page: Page) -> &'static str {
         Page::StrategyStatus => "策略运行状态",
         Page::Performance => "策略绩效",
         Page::Backtest => "策略回测",
+        Page::ExecutionCosts => "交易成本",
         Page::MovingAverageWizard => "均线策略向导",
         Page::PaperValidation => "Paper 策略验证",
         Page::Orders => "订单与成交",
@@ -262,6 +266,12 @@ fn render_page(
             },
             Page::Backtest => html! {
                 <BacktestPage
+                    endpoint={(*endpoint).clone()}
+                    strategies={data.strategies.clone()}
+                />
+            },
+            Page::ExecutionCosts => html! {
+                <ExecutionCostPage
                     endpoint={(*endpoint).clone()}
                     strategies={data.strategies.clone()}
                 />

@@ -48,6 +48,21 @@ pub fn paper_validation_page(props: &PaperValidationPageProps) -> Html {
     let busy = use_state(|| false);
     let busy_action = use_state(String::new);
     let notice = use_state(|| None::<Result<String, String>>);
+    {
+        let managed_account = props
+            .system
+            .pointer("/ibkr/managed_accounts/0")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let account = account.clone();
+        use_effect_with(managed_account.clone(), move |_| {
+            if account.trim().is_empty() && !managed_account.is_empty() {
+                account.set(managed_account);
+            }
+            || ()
+        });
+    }
 
     let subscribe = rpc_button(
         props.endpoint.clone(),

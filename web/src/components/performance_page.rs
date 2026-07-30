@@ -63,6 +63,21 @@ pub fn performance_page(props: &PerformancePageProps) -> Html {
     let parsed_capital = capital.parse::<f64>().ok().filter(|value| *value > 0.0);
 
     {
+        let strategy_ids = strategies
+            .iter()
+            .map(|strategy| text(strategy, "strategy_id"))
+            .filter(|id| id != "—")
+            .collect::<Vec<_>>();
+        let selected = selected.clone();
+        use_effect_with(strategy_ids.clone(), move |_| {
+            if !strategy_ids.iter().any(|id| id == selected.as_str()) {
+                selected.set(strategy_ids.first().cloned().unwrap_or_default());
+            }
+            || ()
+        });
+    }
+
+    {
         let state = state.clone();
         let endpoint = props.endpoint.clone();
         let strategy_id = (*selected).clone();

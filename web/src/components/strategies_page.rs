@@ -211,12 +211,16 @@ pub fn strategies_page(props: &StrategiesPageProps) -> Html {
                         <thead><tr>
                             <th>{"时间（本地）"}</th><th>{"策略 ID"}</th><th>{"证券及交易所"}</th><th>{"信号"}</th>
                             <th class="text-end">{"请求数量"}</th><th>{"状态"}</th>
+                            <th class="text-end">{"信号强度(bps)"}</th>
+                            <th class="text-end">{"成本门槛(bps)"}</th>
+                            <th class="text-end">{"预计往返成本"}</th>
+                            <th>{"成本门控结果"}</th>
                             <th>{"Broker Order ID"}</th><th>{"详情"}</th>
                         </tr></thead>
                         <tbody>
                         {
                             if actions.is_empty() {
-                                html! { <tr><td colspan="8" class="text-center text-secondary py-4">{"暂无执行动作"}</td></tr> }
+                                html! { <tr><td colspan="12" class="text-center text-secondary py-4">{"暂无执行动作"}</td></tr> }
                             } else {
                                 actions.iter().map(|row| html! {
                                     <tr>
@@ -226,6 +230,10 @@ pub fn strategies_page(props: &StrategiesPageProps) -> Html {
                                         <td>{text(row, "signal")}</td>
                                         <td class="text-end">{number(row, "requested_quantity")}</td>
                                         <td><span class="badge bg-secondary">{text(row, "state")}</span></td>
+                                        <td class="text-end">{number(row, "signal_edge_bps")}</td>
+                                        <td class="text-end">{number(row, "required_edge_bps")}</td>
+                                        <td class="text-end">{number(row, "estimated_round_trip_cost")}</td>
+                                        <td>{cost_gate_result(row)}</td>
                                         <td>{integer(row, "broker_order_id")}</td>
                                         <td>{text(row, "detail")}</td>
                                     </tr>
@@ -286,6 +294,35 @@ fn load_actions(
         }
         loading.set(false);
     });
+}
+
+fn cost_gate_result(action: &Value) -> Html {
+    let result = action
+        .get("cost_gate_result")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let (label, class, explanation) = match result {
+        "passed" => ("通过", "bg-success", "信号收益已达到配置的成本门槛"),
+        "blocked" => (
+            "已拦截",
+            "bg-danger",
+            "信号收益、费用模型币种或其他成本条件未通过",
+        ),
+        "auto_paused" => (
+            "自动暂停",
+            "bg-warning text-dark",
+            "历史佣金与毛利润比例超过配置上限",
+        ),
+        _ => ("未执行", "bg-secondary", "该动作没有进入成本门控"),
+    };
+    html! {
+        <div class="text-nowrap">
+            <span class={classes!("badge", class)} title={explanation}>{label}</span>
+            {(!result.is_empty()).then(|| html! {
+                <div class="small text-secondary mt-1"><code>{result}</code></div>
+            }).unwrap_or_default()}
+        </div>
+    }
 }
 
 fn action_securities(action: &serde_json::Value) -> Html {
