@@ -2,6 +2,7 @@ use paper_round_trip_model::{KIND, PaperRoundTripConfig};
 use serde_json::{Value, json};
 use strategy_api::{
     BackendStrategyRegistration, Strategy, StrategyBar, StrategyOutput, StrategySignal,
+    StrategyTransition,
 };
 
 pub struct PaperRoundTrip {
@@ -57,6 +58,36 @@ impl Strategy for PaperRoundTrip {
             }),
         })
     }
+
+    fn initial_state(&self) -> Value {
+        json!({"evaluation_count": 0})
+    }
+
+    fn evaluate_with_state(
+        &self,
+        bars: &[StrategyBar],
+        state: &Value,
+    ) -> Result<StrategyTransition, String> {
+        let output = self.evaluate(bars)?;
+        let evaluation_count = state
+            .get("evaluation_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| "paper_round_trip evaluation_count overflow".to_string())?;
+        let bar_time = bars
+            .last()
+            .ok_or_else(|| "paper_round_trip requires one finalized bar".to_string())?
+            .time;
+        Ok(StrategyTransition {
+            next_state: json!({
+                "evaluation_count": evaluation_count,
+                "last_bar_time": bar_time,
+                "last_signal": output.signal.as_str(),
+            }),
+            output,
+        })
+    }
 }
 
 fn build(config: Value) -> Result<Box<dyn Strategy>, String> {
@@ -100,5 +131,24 @@ mod tests {
             strategy.evaluate(&[bar(2)]).unwrap().signal,
             StrategySignal::Sell
         );
+    }
+
+    #[test]
+    fn state_transition_counts_evaluations_without_changing_signals() {
+        let strategy = PaperRoundTrip::new(PaperRoundTripConfig {
+            conid: 1,
+            phase_bars: 1,
+        })
+        .unwrap();
+        let first = strategy
+            .evaluate_with_state(&[bar(0)], &strategy.initial_state())
+            .unwrap();
+        assert_eq!(first.output.signal, StrategySignal::Buy);
+        assert_eq!(first.next_state["evaluation_count"], 1);
+        let second = strategy
+            .evaluate_with_state(&[bar(1)], &first.next_state)
+            .unwrap();
+        assert_eq!(second.output.signal, StrategySignal::Sell);
+        assert_eq!(second.next_state["evaluation_count"], 2);
     }
 }

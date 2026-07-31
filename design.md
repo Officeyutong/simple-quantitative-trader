@@ -23,10 +23,11 @@ Web 各自通过 Catalog 注册策略，因此平台运行器不再按策略 `ki
 平台掌握，策略 crate 无法绕过这些边界。
 
 DuckDB 当前由进程内互斥保护的 `Storage` 统一访问，而不是下文概念图中的独立
-Storage Writer actor。数据库最新 schema 为 25：除账户、行情、策略、订单、成交、
+Storage Writer actor。数据库最新 schema 为 26：除账户、行情、策略、订单、成交、
 风控和绩效数据外，还包含 5 秒 Bar、订单剩余数量/最近成交价/`why_held`/
 market-cap price、`broker_order_events` 状态事件审计，以及支持正常/扩展和单日多
-区间的 IBKR 交易日历缓存。
+区间的 IBKR 交易日历缓存。`strategy_runtime_states` 按策略保存带版本的 JSON
+运行状态、修订号和最后转换 Bar；状态与策略 evaluation 在同一事务提交。
 
 当前回测是多头、下一根 Bar 开盘撮合，佣金参数是每笔固定金额；它不会自动计算
 不同市场的阶梯佣金、最低收费、税费或平台费。实时绩效则使用 IBKR 实际

@@ -47,7 +47,26 @@ quant strategy kinds
 四个标量指标用于高效 SQL 查询，`details` 用于审计信号原因及计算上下文。策略仅
 生成方向信号，不决定下单数量，也不直接访问 IBKR、数据库、网络或系统时间。
 
-### 2.3 实时与回测语义
+### 2.3 持久化运行状态
+
+有状态策略通过 `Strategy::initial_state()` 提供初始 JSON，通过
+`evaluate_with_state(bars, state)` 返回 `StrategyTransition`：
+
+- `output`：本次可审计信号和指标；
+- `next_state`：处理本 Bar 后应持久化的完整状态；
+- `state_version()`：状态 schema 版本，默认是 1。
+
+平台将状态保存在 `strategy_runtime_states`，包含 `state_json`、`state_version`、
+单调递增的 `revision` 和 `last_transition_bar`。evaluation、`last_evaluated_bar`
+和下一状态在同一个 DuckDB 事务中提交，因此不会出现信号已保存但状态未前进，或
+状态已前进但信号丢失的情况。daemon 重启后从该表恢复状态。
+
+状态默认最大 1 MiB。版本与当前 engine 不匹配时策略会失败关闭并把原因写入
+`last_error`，不会静默丢弃或错误解释旧状态。升级有状态策略时必须先提供明确的状态
+迁移或重置流程。普通无状态策略无需改动：默认状态为 `{}`，默认状态转换保持其原值。
+回测使用相同的状态转换接口，但状态只存在于该次回测内，不写入实时策略状态表。
+
+### 2.4 实时与回测语义
 
 实时运行和回测都通过 `strategy::build` 创建策略并调用 `evaluate()`。回测采用
 “当前 Bar 收盘后产生信号，最早在下一根 Bar 开盘成交”，并计入配置的滑点和佣金。
@@ -506,6 +525,8 @@ quant strategy execution configure \
 - 相同配置与 Bar 必须产生相同输出；
 - `minimum_history()` 准确声明所需最少 Bar；
 - `bar_timeframe()` 只能返回实时运行器支持的 `"1m"` 或 `"5s"`。
+- 有内部状态时，覆盖 `initial_state()`、`state_version()` 和
+  `evaluate_with_state()`；不得在策略对象或全局变量中隐藏跨 Bar 状态。
 
 每个策略族的目录约定如下：
 

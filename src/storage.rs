@@ -661,7 +661,26 @@ SELECT exchange, 'regular', trading_date, opens_at, closes_at, state, source, up
 FROM market_sessions;
 "#,
     ),
+    (
+        26,
+        r#"
+CREATE TABLE strategy_runtime_states (
+    strategy_id UUID PRIMARY KEY,
+    state_version BIGINT NOT NULL,
+    state_json JSON NOT NULL,
+    revision BIGINT NOT NULL,
+    last_transition_bar TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL
+);
+INSERT INTO strategy_runtime_states
+SELECT strategy_id, 1, '{}', 0, NULL, created_at, updated_at
+FROM strategies;
+"#,
+    ),
 ];
+
+const MAX_STRATEGY_STATE_BYTES: usize = 1024 * 1024;
 
 pub struct Storage {
     connection: Connection,
@@ -1127,10 +1146,21 @@ impl Storage {
         if name.trim().is_empty() {
             return Err(AppError::Storage("strategy name cannot be empty".into()));
         }
-        crate::strategy::build(kind, config.clone()).map_err(AppError::Storage)?;
+        let strategy = crate::strategy::build(kind, config.clone()).map_err(AppError::Storage)?;
+        let state_version = i64::from(strategy.state_version());
+        if state_version <= 0 {
+            return Err(AppError::Storage(
+                "strategy state version must be greater than zero".into(),
+            ));
+        }
+        let initial_state = serialize_strategy_state(&strategy.initial_state())?;
         let strategy_id = uuid::Uuid::now_v7();
         let now = Utc::now();
-        self.connection
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        transaction
             .execute(
                 "INSERT INTO strategies VALUES
                  (?, ?, ?, 'stopped', ?, NULL, NULL, ?, ?)",
@@ -1143,6 +1173,18 @@ impl Storage {
                     now
                 ],
             )
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        transaction
+            .execute(
+                "INSERT INTO strategy_runtime_states
+                 (strategy_id, state_version, state_json, revision,
+                  last_transition_bar, created_at, updated_at)
+                 VALUES (?, ?, ?, 0, NULL, ?, ?)",
+                params![strategy_id, state_version, initial_state, now, now],
+            )
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        transaction
+            .commit()
             .map_err(|error| AppError::Storage(error.to_string()))?;
         Ok(strategy_id)
     }
@@ -1234,6 +1276,7 @@ impl Storage {
             "strategy_cost_controls",
             "strategy_performance_snapshots",
             "strategy_evaluations",
+            "strategy_runtime_states",
         ] {
             transaction
                 .execute(
@@ -2325,13 +2368,47 @@ impl Storage {
         if last_evaluated.is_some_and(|time| time >= bar_time) {
             return Ok(false);
         }
-        let output = strategy.evaluate(&bars).map_err(AppError::Storage)?;
+        let (stored_state_version, state_json, state_revision) = self
+            .connection
+            .query_row(
+                "SELECT state_version, state_json::VARCHAR, revision
+                 FROM strategy_runtime_states WHERE strategy_id = ?",
+                params![strategy_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| AppError::Storage(error.to_string()))?
+            .ok_or_else(|| {
+                AppError::Storage(format!(
+                    "persisted runtime state is missing for strategy {strategy_id}"
+                ))
+            })?;
+        let expected_state_version = i64::from(strategy.state_version());
+        if stored_state_version != expected_state_version {
+            return Err(AppError::Storage(format!(
+                "strategy {strategy_id} runtime state version {stored_state_version} does not \
+                 match engine version {expected_state_version}; migrate or reset the state before \
+                 resuming"
+            )));
+        }
+        let current_state: serde_json::Value = serde_json::from_str(&state_json)?;
+        let transition = strategy
+            .evaluate_with_state(&bars, &current_state)
+            .map_err(AppError::Storage)?;
+        let next_state = serialize_strategy_state(&transition.next_state)?;
+        let output = transition.output;
         let now = Utc::now();
         let transaction = self
             .connection
             .transaction()
             .map_err(|error| AppError::Storage(error.to_string()))?;
-        transaction
+        let inserted = transaction
             .execute(
                 "INSERT INTO strategy_evaluations
                      (evaluation_id, strategy_id, conid, bar_time, short_value, long_value,
@@ -2353,6 +2430,12 @@ impl Storage {
                 ],
             )
             .map_err(|error| AppError::Storage(error.to_string()))?;
+        if inserted == 0 {
+            transaction
+                .commit()
+                .map_err(|error| AppError::Storage(error.to_string()))?;
+            return Ok(false);
+        }
         transaction
             .execute(
                 "UPDATE strategies SET last_evaluated_bar = ?, last_error = NULL, updated_at = ?
@@ -2360,6 +2443,27 @@ impl Storage {
                 params![bar_time, now, strategy_id],
             )
             .map_err(|error| AppError::Storage(error.to_string()))?;
+        let state_updated = transaction
+            .execute(
+                "UPDATE strategy_runtime_states
+                 SET state_json = ?, revision = revision + 1,
+                     last_transition_bar = ?, updated_at = ?
+                 WHERE strategy_id = ? AND state_version = ? AND revision = ?",
+                params![
+                    next_state,
+                    bar_time,
+                    now,
+                    strategy_id,
+                    expected_state_version,
+                    state_revision
+                ],
+            )
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        if state_updated != 1 {
+            return Err(AppError::Storage(format!(
+                "strategy {strategy_id} runtime state changed concurrently; evaluation was rolled back"
+            )));
+        }
         transaction
             .commit()
             .map_err(|error| AppError::Storage(error.to_string()))?;
@@ -6573,6 +6677,18 @@ fn timeframe_duration(timeframe: &str) -> Result<chrono::Duration> {
     }
 }
 
+fn serialize_strategy_state(state: &serde_json::Value) -> Result<String> {
+    let serialized = serde_json::to_string(state)?;
+    if serialized.len() > MAX_STRATEGY_STATE_BYTES {
+        return Err(AppError::Storage(format!(
+            "strategy runtime state is {} bytes; maximum is {} bytes",
+            serialized.len(),
+            MAX_STRATEGY_STATE_BYTES
+        )));
+    }
+    Ok(serialized)
+}
+
 fn validate_backtest_request(request: &BacktestRequest) -> Result<()> {
     if request.conid <= 0
         || request.end <= request.start
@@ -6633,6 +6749,7 @@ fn simulate_strategy(
     let mut equity = Vec::new();
     let mut pending: Option<(&'static str, DateTime<Utc>)> = None;
     let mut history = Vec::with_capacity(bars.len());
+    let mut strategy_state = strategy.initial_state();
     for bar in bars {
         if let Some((side, signal_time)) = pending.take() {
             let direction = if side == "buy" { 1.0 } else { -1.0 };
@@ -6696,9 +6813,11 @@ fn simulate_strategy(
             // bars. Match that contract here so an expanding backtest does not
             // repeatedly copy and scan its entire history on every bar.
             let evaluation_start = history.len() - strategy.minimum_history();
-            let output = strategy
-                .evaluate(&history[evaluation_start..])
+            let transition = strategy
+                .evaluate_with_state(&history[evaluation_start..], &strategy_state)
                 .map_err(AppError::Storage)?;
+            strategy_state = transition.next_state;
+            let output = transition.output;
             if output.signal == crate::strategy::StrategySignal::Buy && position == 0.0 {
                 pending = Some(("buy", bar.open_time));
             } else if output.signal == crate::strategy::StrategySignal::Sell && position > 0.0 {
@@ -7366,6 +7485,127 @@ mod tests {
         assert_eq!(evaluations.len(), 1);
         assert_eq!(evaluations[0]["signal"], "buy");
         assert_eq!(evaluations[0]["output"]["short_window"], 2);
+    }
+
+    #[test]
+    fn strategy_runtime_state_survives_database_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("state.duckdb");
+        let strategy_id;
+        {
+            let mut storage = Storage::open(&database).unwrap();
+            strategy_id = storage
+                .create_strategy(
+                    "stateful paper strategy",
+                    "paper_round_trip",
+                    &serde_json::json!({"conid": 12087792, "phase_bars": 1}),
+                )
+                .unwrap();
+            storage.set_strategy_state(strategy_id, "running").unwrap();
+            let time = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+            storage
+                .connection
+                .execute(
+                    "INSERT INTO market_minute_bars
+                     VALUES (12087792, ?, 1, 1, 1, 1, 1, true, ?)",
+                    params![time, time],
+                )
+                .unwrap();
+            assert_eq!(storage.evaluate_running_strategies().unwrap(), 1);
+        }
+
+        let mut storage = Storage::open(&database).unwrap();
+        let next_time = DateTime::from_timestamp(1_700_000_060, 0).unwrap();
+        storage
+            .connection
+            .execute(
+                "INSERT INTO market_minute_bars
+                 VALUES (12087792, ?, 1, 1, 1, 1, 1, true, ?)",
+                params![next_time, next_time],
+            )
+            .unwrap();
+        assert_eq!(storage.evaluate_running_strategies().unwrap(), 1);
+        let (state, version, revision, last_bar): (String, i64, i64, DateTime<Utc>) = storage
+            .connection
+            .query_row(
+                "SELECT state_json::VARCHAR, state_version, revision, last_transition_bar
+                 FROM strategy_runtime_states WHERE strategy_id = ?",
+                params![strategy_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        let state: serde_json::Value = serde_json::from_str(&state).unwrap();
+        assert_eq!(version, 1);
+        assert_eq!(revision, 2);
+        assert_eq!(state["evaluation_count"], 2);
+        assert_eq!(last_bar, next_time);
+        assert_eq!(
+            storage
+                .list_strategy_evaluations(strategy_id, 10)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn strategy_runtime_state_version_mismatch_fails_without_advancing_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(&directory.path().join("state.duckdb")).unwrap();
+        let strategy_id = storage
+            .create_strategy(
+                "incompatible state",
+                "paper_round_trip",
+                &serde_json::json!({"conid": 12087792, "phase_bars": 1}),
+            )
+            .unwrap();
+        storage.set_strategy_state(strategy_id, "running").unwrap();
+        storage
+            .connection
+            .execute(
+                "UPDATE strategy_runtime_states SET state_version = 999
+                 WHERE strategy_id = ?",
+                params![strategy_id],
+            )
+            .unwrap();
+        let time = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        storage
+            .connection
+            .execute(
+                "INSERT INTO market_minute_bars
+                 VALUES (12087792, ?, 1, 1, 1, 1, 1, true, ?)",
+                params![time, time],
+            )
+            .unwrap();
+
+        assert_eq!(storage.evaluate_running_strategies().unwrap(), 0);
+        assert!(
+            storage
+                .list_strategy_evaluations(strategy_id, 10)
+                .unwrap()
+                .is_empty()
+        );
+        let revision: i64 = storage
+            .connection
+            .query_row(
+                "SELECT revision FROM strategy_runtime_states WHERE strategy_id = ?",
+                params![strategy_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(revision, 0);
+        let strategy = storage
+            .list_strategies()
+            .unwrap()
+            .into_iter()
+            .find(|strategy| strategy["strategy_id"] == strategy_id.to_string())
+            .unwrap();
+        assert!(
+            strategy["last_error"]
+                .as_str()
+                .unwrap()
+                .contains("does not match engine version")
+        );
     }
 
     #[test]

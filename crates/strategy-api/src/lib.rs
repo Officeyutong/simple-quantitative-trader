@@ -40,6 +40,12 @@ pub struct StrategyOutput {
     pub details: Value,
 }
 
+#[derive(Clone, Debug)]
+pub struct StrategyTransition {
+    pub output: StrategyOutput,
+    pub next_state: Value,
+}
+
 /// Deterministic strategy algorithm shared by live evaluation and backtests.
 ///
 /// Broker access, storage, cost controls, risk and order submission deliberately
@@ -52,6 +58,31 @@ pub trait Strategy: Send + Sync {
         "1m"
     }
     fn evaluate(&self, bars: &[StrategyBar]) -> Result<StrategyOutput, String>;
+
+    /// Version of the persisted runtime-state schema owned by this strategy.
+    ///
+    /// Incrementing this requires an explicit state migration before the
+    /// strategy can resume. The platform fails closed on a version mismatch.
+    fn state_version(&self) -> u32 {
+        1
+    }
+
+    fn initial_state(&self) -> Value {
+        serde_json::json!({})
+    }
+
+    /// Evaluate one finalized Bar and return the state to commit atomically
+    /// with the evaluation. Stateless strategies inherit this implementation.
+    fn evaluate_with_state(
+        &self,
+        bars: &[StrategyBar],
+        state: &Value,
+    ) -> Result<StrategyTransition, String> {
+        Ok(StrategyTransition {
+            output: self.evaluate(bars)?,
+            next_state: state.clone(),
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
