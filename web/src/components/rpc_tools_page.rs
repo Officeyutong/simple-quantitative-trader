@@ -213,6 +213,7 @@ fn is_mutation(method: &str) -> bool {
             | "fx.list"
             | "calendar.list"
             | "calendar.status"
+            | "calendar.refresh"
             | "monitor.alerts"
             | "monitor.metrics"
             | "backtest.list"
@@ -253,12 +254,13 @@ fn parameter_template(method: &str) -> Value {
             "kind": "paper_round_trip",
             "config": {"conid": 0, "phase_bars": 1}
         }),
+        "strategy.rename" => json!({"strategy_id": "", "name": "new-strategy-name"}),
         "strategy.start" | "strategy.pause" | "strategy.stop" => json!({"strategy_id": ""}),
         "strategy.delete" => json!({"strategy_id": "", "confirm": true}),
         "strategy.signals" => json!({"strategy_id": "", "limit": 100}),
         "strategy.execution.configure" => json!({
             "strategy_id": "", "account": "", "target_quantity": 1.0,
-            "short_target_quantity": 0.0, "allow_short": false,
+            "short_target_quantity": 0.0, "allow_short": false, "outside_rth": false,
             "order_type": "market", "paper_only": true, "contract": contract_template()
         }),
         "strategy.execution.configure_portfolio" => json!({
@@ -282,8 +284,14 @@ fn parameter_template(method: &str) -> Value {
             "opens_at": "2026-01-02T14:30:00Z", "closes_at": "2026-01-02T21:00:00Z",
             "state": "open", "source": "manual"
         }),
+        "calendar.refresh" => json!({"contract": {
+            "conid": 272093, "symbol": "MSFT", "security_type": "STK",
+            "currency": "USD", "exchange": "SMART", "primary_exchange": "NASDAQ",
+            "local_symbol": "MSFT", "description": "MICROSOFT CORP",
+            "derivative_security_types": []
+        }}),
         "calendar.list" => json!({"exchange": null, "limit": 100}),
-        "calendar.status" => json!({"exchange": "NYSE"}),
+        "calendar.status" => json!({"exchange": "NYSE", "outside_rth": false}),
         "monitor.alerts" => json!({"active_only": true, "limit": 100}),
         "monitor.acknowledge" => json!({"alert_id": "", "note": ""}),
         "backtest.run" => json!({

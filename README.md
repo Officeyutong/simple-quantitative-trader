@@ -126,6 +126,8 @@ live 自动执行始终被程序硬性禁止。
 项目是包含后端、`quant-rpc-types` 和 `quant-web` 的 Cargo workspace。构建后端和
 Web：
 
+首次安装、局域网访问、后台运行和故障排查的完整步骤见 [setup.md](setup.md)。
+
 ```bash
 cargo build --workspace --release
 cd web
@@ -395,6 +397,9 @@ Sharpe、Sortino、每日权益和可选基准超额收益。启用策略会按 
 历史实际 `CommissionReport` 的单边有效费率 P90（如果存在）与配置估算取更保守者。
 不满足条件的 action 记为 `skipped`，并保存名义金额、预计往返成本、信号强度和所需
 强度。达到配置的最少平仓交易数后，若佣金/毛利润超过上限，执行配置会自动停用。
+策略执行配置关闭期间产生的买卖信号也会保存为 `skipped` action，并标记
+`execution_disabled`，避免出现“有信号但没有动作记录”的审计空白；这类历史信号在
+重新启用后不会补单。
 
 非账户基础币种必须有新鲜 FX 汇率。IBKR Account Summary 的 ExchangeRate 会自动
 写入，也可人工维护：
@@ -404,15 +409,24 @@ quant fx set --base USD --quote HKD --rate 7.84 --source manual
 quant fx list
 ```
 
-交易日历统一使用 UTC。一旦为交易所录入过 session，自动执行会在没有开放 session
-时拒绝下单：
+自动执行通过 IBKR `ContractDetails` 获取并缓存证券的交易日历。正常订单使用
+`liquidHours`，开启盘前盘后时使用 `tradingHours`；IBKR 返回的交易所本地时间会按
+`timeZoneId`（包括夏令时）转换为 UTC。日历缓存每 6 小时按需刷新，支持同一天多个
+交易区间。日历缺失、刷新失败或当前不在对应交易区间时均拒绝自动下单，不再因
+`outside_rth=true` 绕过交易时段检查。
+
+人工 session 仍可用于诊断或 IBKR 不支持的合约：
 
 ```bash
 quant calendar add --exchange SEHK --date 2026-07-28 \
   --opens-at 2026-07-28T01:30:00Z --closes-at 2026-07-28T08:00:00Z
 quant calendar status --exchange SEHK
+quant calendar status --exchange SEHK --outside-rth
 quant calendar list --exchange SEHK
 ```
+
+Web 的“交易日历”页面可从策略执行配置选择证券，立即调用 IBKR 刷新日历，分别查看
+正常/扩展时段当前状态和缓存区间，也可按浏览器本地时间人工补录正常时段。
 
 ## 长期 Paper 运行与盈利能力评估
 

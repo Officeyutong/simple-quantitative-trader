@@ -1051,7 +1051,8 @@ quant safety status/set/live-approve/live-revoke ...
 - buy/sell；
 - market/limit；
 - 人工订单可按参数选择常规/盘前盘后及路由；
-- 策略自动执行固定使用市价单、`SMART`/配置的交易所且 `outside_rth=false`；
+- 策略自动执行默认使用市价单；允许盘前盘后时使用最新 Bid/Ask 定价的限价单并
+  设置 `outside_rth=true`；
 - 整股数量。
 
 ## 21. 当前已知风险和技术债
@@ -1189,3 +1190,10 @@ deploy/screen-stop.sh config/paper.toml
 
 schema 23 继续为费用模型增加买入和卖出每股费用，单边费用统一按
 `max(最低费, 每笔固定费 + 数量×每股费 + 名义金额×比例费率)` 计算。
+
+schema 24 为策略执行配置增加 `outside_rth`；常规时段模式继续使用市价单，盘前
+盘后模式使用最新 Bid/Ask 作为限价并把 `outside_rth=true` 传给 IBKR。
+
+schema 25 增加可保存单日多个区间的交易日历缓存。自动执行按需读取 IBKR
+`ContractDetails`，分别缓存 `liquidHours` 和 `tradingHours`，并按合约时区转换为
+UTC；正常和盘前盘后订单都必须命中对应时段。

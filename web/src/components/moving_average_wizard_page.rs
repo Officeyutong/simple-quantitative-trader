@@ -57,6 +57,7 @@ pub fn moving_average_wizard_page(props: &MovingAverageWizardPageProps) -> Html 
     let long_target = use_state(|| "1".to_owned());
     let short_target = use_state(|| "0".to_owned());
     let allow_short = use_state(|| false);
+    let outside_rth = use_state(|| false);
     let execution_configured = use_state(|| false);
     let execution_confirmed = use_state(|| false);
     let busy_action = use_state(String::new);
@@ -277,6 +278,7 @@ pub fn moving_average_wizard_page(props: &MovingAverageWizardPageProps) -> Html 
         let long_target = long_target.clone();
         let short_target = short_target.clone();
         let allow_short = allow_short.clone();
+        let outside_rth = outside_rth.clone();
         let execution_configured = execution_configured.clone();
         let busy_action = busy_action.clone();
         let notice = notice.clone();
@@ -320,7 +322,8 @@ pub fn moving_average_wizard_page(props: &MovingAverageWizardPageProps) -> Html 
                 "target_quantity": long_quantity,
                 "short_target_quantity": short_quantity,
                 "allow_short": *allow_short,
-                "order_type": "market",
+                "outside_rth": *outside_rth,
+                "order_type": if *outside_rth { "limit" } else { "market" },
                 "paper_only": true,
                 "contract": contract
             });
@@ -590,12 +593,28 @@ pub fn moving_average_wizard_page(props: &MovingAverageWizardPageProps) -> Html 
                         }} />
                         <label class="form-check-label" for="ma-allow-short">{"允许做空"}</label>
                     </div></div>
+                    <div class="col-6 col-lg-2"><div class="form-check mb-2">
+                        <input id="ma-outside-rth" class="form-check-input" type="checkbox"
+                            checked={*outside_rth} onchange={{
+                                let outside_rth = outside_rth.clone();
+                                Callback::from(move |event: Event| {
+                                    let input: web_sys::HtmlInputElement = event.target_unchecked_into();
+                                    outside_rth.set(input.checked());
+                                })
+                            }} />
+                        <label class="form-check-label" for="ma-outside-rth">{"允许盘前盘后"}</label>
+                    </div></div>
                     <div class="col-12 col-lg-2">
                         <button class="btn btn-outline-primary w-100" disabled={strategy_id.is_empty() || busy} onclick={configure_execution}>
                             {button_content(&busy_action, "configure", "保存执行配置")}
                         </button>
                     </div>
                 </div>
+                {(*outside_rth).then(|| html! {
+                    <div class="alert alert-warning mt-3 mb-0">
+                        {"盘前盘后自动执行使用最新 Ask（买入）或 Bid（卖出）作为限价；流动性较低时可能不会立即成交。"}
+                    </div>
+                }).unwrap_or_default()}
             </div></section>
 
             <section class="card shadow-sm"><div class="card-body">

@@ -18,6 +18,7 @@ pub struct DashboardData {
     pub positions: Value,
     pub strategies: Value,
     pub execution_configs: Value,
+    pub reconciliation_differences: Value,
     pub alerts: Value,
     pub metrics: Value,
 }
@@ -39,6 +40,7 @@ pub async fn load_dashboard(endpoint: &str) -> Result<DashboardData, String> {
         positions: call(&client, "portfolio.positions", Map::new()).await?,
         strategies: call(&client, "strategy.list", Map::new()).await?,
         execution_configs: call(&client, "strategy.execution.list", Map::new()).await?,
+        reconciliation_differences: call(&client, "reconcile.differences", Map::new()).await?,
         alerts: call(
             &client,
             "monitor.alerts",

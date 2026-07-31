@@ -136,7 +136,15 @@ pub fn performance_page(props: &PerformancePageProps) -> Html {
                         >
                             {strategies.iter().map(|strategy| {
                                 let id = text(strategy, "strategy_id");
-                                html! { <option value={id.clone()}>{format!("{} · {}", text(strategy, "name"), id)}</option> }
+                                html! {
+                                    <option
+                                        key={id.clone()}
+                                        value={id.clone()}
+                                        selected={id == *selected}
+                                    >
+                                        {text(strategy, "name")}
+                                    </option>
+                                }
                             }).collect::<Html>()}
                         </select>
                     </div>

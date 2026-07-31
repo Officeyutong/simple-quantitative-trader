@@ -635,6 +635,32 @@ ALTER TABLE execution_cost_models ADD COLUMN buy_per_share_fee DOUBLE DEFAULT 0;
 ALTER TABLE execution_cost_models ADD COLUMN sell_per_share_fee DOUBLE DEFAULT 0;
 "#,
     ),
+    (
+        24,
+        r#"
+ALTER TABLE strategy_execution_configs
+    ADD COLUMN outside_rth BOOLEAN DEFAULT false;
+"#,
+    ),
+    (
+        25,
+        r#"
+CREATE TABLE market_session_intervals (
+    exchange VARCHAR NOT NULL,
+    session_kind VARCHAR NOT NULL,
+    trading_date DATE NOT NULL,
+    opens_at TIMESTAMPTZ NOT NULL,
+    closes_at TIMESTAMPTZ NOT NULL,
+    state VARCHAR NOT NULL,
+    source VARCHAR NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (exchange, session_kind, opens_at, closes_at)
+);
+INSERT INTO market_session_intervals
+SELECT exchange, 'regular', trading_date, opens_at, closes_at, state, source, updated_at
+FROM market_sessions;
+"#,
+    ),
 ];
 
 pub struct Storage {
@@ -800,6 +826,8 @@ pub struct StrategyExecutionConfig {
     pub order_type: String,
     #[serde(default = "default_true")]
     pub paper_only: bool,
+    #[serde(default)]
+    pub outside_rth: bool,
     pub contract: crate::ibkr::ContractCandidate,
 }
 
@@ -868,6 +896,8 @@ pub struct StrategyPortfolioExecutionConfig {
     pub order_type: String,
     #[serde(default = "default_true")]
     pub paper_only: bool,
+    #[serde(default)]
+    pub outside_rth: bool,
     pub legs: Vec<StrategyExecutionLegConfig>,
 }
 
@@ -891,6 +921,7 @@ pub struct ClaimedStrategyAction {
     pub quantity: f64,
     pub order_type: String,
     pub paper_only: bool,
+    pub outside_rth: bool,
     pub contract: crate::ibkr::ContractCandidate,
     pub idempotency_key: String,
     pub legs: Vec<ClaimedStrategyLeg>,
@@ -1130,6 +1161,32 @@ impl Storage {
             .map_err(|error| AppError::Storage(error.to_string()))
     }
 
+    pub fn rename_strategy(&mut self, strategy_id: uuid::Uuid, name: &str) -> Result<bool> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(AppError::Storage("strategy name cannot be empty".into()));
+        }
+        let duplicate: bool = self
+            .connection
+            .query_row(
+                "SELECT count(*) > 0 FROM strategies
+                 WHERE name = ? AND strategy_id <> ?",
+                params![name, strategy_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        if duplicate {
+            return Err(AppError::Storage("strategy name already exists".into()));
+        }
+        self.connection
+            .execute(
+                "UPDATE strategies SET name = ?, updated_at = ? WHERE strategy_id = ?",
+                params![name, Utc::now(), strategy_id],
+            )
+            .map(|changed| changed > 0)
+            .map_err(|error| AppError::Storage(error.to_string()))
+    }
+
     pub fn delete_strategy(&mut self, strategy_id: uuid::Uuid) -> Result<bool> {
         let current = self
             .connection
@@ -1205,12 +1262,15 @@ impl Storage {
             || !config.short_target_quantity.is_finite()
             || config.short_target_quantity > 0.0
             || (!config.allow_short && config.short_target_quantity < 0.0)
-            || config.order_type != "market"
+            || !matches!(config.order_type.as_str(), "market" | "limit")
+            || (config.outside_rth && config.order_type != "limit")
             || !config.paper_only
             || config.contract.conid <= 0
         {
             return Err(AppError::Storage(
-                "execution requires account, target_quantity > 0, market order, paper_only=true and a valid contract".into(),
+                "execution requires account, target_quantity > 0, a supported order type, \
+                 limit orders for outside-RTH execution, paper_only=true and a valid contract"
+                    .into(),
             ));
         }
         let (kind, config_json): (String, String) = self
@@ -1236,8 +1296,8 @@ impl Storage {
                 "INSERT INTO strategy_execution_configs
                  (strategy_id, enabled, paper_only, account_id, target_quantity,
                   order_type, contract_json, enabled_at, created_at, updated_at,
-                  short_target_quantity, allow_short)
-                 VALUES (?, false, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
+                  short_target_quantity, allow_short, outside_rth)
+                 VALUES (?, false, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
                  ON CONFLICT (strategy_id) DO UPDATE SET
                    enabled = false, paper_only = excluded.paper_only,
                    account_id = excluded.account_id,
@@ -1246,6 +1306,7 @@ impl Storage {
                    contract_json = excluded.contract_json,
                    short_target_quantity = excluded.short_target_quantity,
                    allow_short = excluded.allow_short,
+                   outside_rth = excluded.outside_rth,
                    enabled_at = NULL, updated_at = excluded.updated_at",
                 params![
                     config.strategy_id,
@@ -1257,7 +1318,8 @@ impl Storage {
                     now,
                     now,
                     config.short_target_quantity,
-                    config.allow_short
+                    config.allow_short,
+                    config.outside_rth
                 ],
             )
             .map(|_| ())
@@ -1292,6 +1354,7 @@ impl Storage {
             allow_short: first.sell_target_quantity < 0.0,
             order_type: config.order_type.clone(),
             paper_only: config.paper_only,
+            outside_rth: config.outside_rth,
             contract: first.contract.clone(),
         })?;
         let transaction = self
@@ -1348,7 +1411,7 @@ impl Storage {
             .prepare(
                 "SELECT strategy_id, enabled, paper_only, account_id, target_quantity,
                     order_type, contract_json::VARCHAR, enabled_at, created_at, updated_at,
-                    short_target_quantity, allow_short
+                    short_target_quantity, allow_short, outside_rth
              FROM strategy_execution_configs ORDER BY created_at",
             )
             .map_err(|error| AppError::Storage(error.to_string()))?;
@@ -1367,6 +1430,7 @@ impl Storage {
                 "updated_at": row.get::<_, DateTime<Utc>>(9)?
                 ,"short_target_quantity": row.get::<_, f64>(10)?
                 ,"allow_short": row.get::<_, bool>(11)?
+                ,"outside_rth": row.get::<_, bool>(12)?
             }))
         }).map_err(|error| AppError::Storage(error.to_string()))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -1391,6 +1455,7 @@ impl Storage {
     }
 
     pub fn claim_strategy_action(&mut self) -> Result<Option<ClaimedStrategyAction>> {
+        self.record_disabled_strategy_actions()?;
         let candidate = self
             .connection
             .query_row(
@@ -1398,7 +1463,7 @@ impl Storage {
                     c.account_id, c.target_quantity, c.order_type,
                     c.paper_only, c.contract_json::VARCHAR,
                     c.short_target_quantity, c.allow_short, e.output_json::VARCHAR,
-                    e.short_value, e.long_value, s.kind
+                    e.short_value, e.long_value, s.kind, c.outside_rth
              FROM strategy_evaluations e
              JOIN strategy_execution_configs c ON c.strategy_id = e.strategy_id
              JOIN strategies s ON s.strategy_id = e.strategy_id
@@ -1424,6 +1489,7 @@ impl Storage {
                         row.get::<_, f64>(11)?,
                         row.get::<_, f64>(12)?,
                         row.get::<_, String>(13)?,
+                        row.get::<_, bool>(14)?,
                     ))
                 },
             )
@@ -1444,6 +1510,7 @@ impl Storage {
             indicator_a,
             indicator_b,
             strategy_kind,
+            outside_rth,
         )) = candidate
         else {
             return Ok(None);
@@ -1795,12 +1862,77 @@ impl Storage {
             quantity,
             order_type,
             paper_only,
+            outside_rth,
             contract: first.contract.clone(),
             idempotency_key,
             legs,
             signal_edge_bps,
             cost_control,
         }))
+    }
+
+    fn record_disabled_strategy_actions(&mut self) -> Result<usize> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT e.evaluation_id, e.strategy_id, e.signal
+                 FROM strategy_evaluations e
+                 JOIN strategy_execution_configs c USING (strategy_id)
+                 LEFT JOIN strategy_execution_actions a USING (evaluation_id)
+                 WHERE c.enabled = false
+                   AND e.created_at >= c.updated_at
+                   AND e.signal IN ('buy', 'sell')
+                   AND a.evaluation_id IS NULL
+                 ORDER BY e.created_at",
+            )
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        let evaluations = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, uuid::Uuid>(0)?,
+                    row.get::<_, uuid::Uuid>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|error| AppError::Storage(error.to_string()))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        drop(statement);
+        if evaluations.is_empty() {
+            return Ok(0);
+        }
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        let now = Utc::now();
+        for (evaluation_id, strategy_id, signal) in &evaluations {
+            transaction
+                .execute(
+                    "INSERT INTO strategy_execution_actions
+                     (action_id, strategy_id, evaluation_id, idempotency_key, signal,
+                      requested_quantity, state, detail, created_at, updated_at,
+                      cost_gate_result)
+                     VALUES (?, ?, ?, ?, ?, NULL, 'skipped', ?, ?, ?,
+                             'execution_disabled')",
+                    params![
+                        uuid::Uuid::now_v7(),
+                        strategy_id,
+                        evaluation_id,
+                        format!("strategy:{strategy_id}:{evaluation_id}"),
+                        signal,
+                        "automatic execution skipped: strategy execution is disabled; enable \
+                         Paper execution to process future signals",
+                        now,
+                        now
+                    ],
+                )
+                .map_err(|error| AppError::Storage(error.to_string()))?;
+        }
+        transaction
+            .commit()
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        Ok(evaluations.len())
     }
 
     pub fn record_strategy_cost_gate(
@@ -3821,7 +3953,8 @@ impl Storage {
         let failed_subscriptions: i64 = self
             .connection
             .query_row(
-                "SELECT count(*) FROM market_data_status WHERE state = 'failed'",
+                "SELECT count(*) FROM market_data_status
+                 WHERE state IN ('failed', 'retrying')",
                 [],
                 |row| row.get(0),
             )
@@ -3845,11 +3978,31 @@ impl Storage {
         let failed_market_data: i64 = self
             .connection
             .query_row(
-                "SELECT count(*) FROM market_data_status WHERE state = 'failed'",
+                "SELECT count(*) FROM market_data_status
+                 WHERE state IN ('failed', 'retrying')",
                 [],
                 |row| row.get(0),
             )
             .map_err(|error| AppError::Storage(error.to_string()))?;
+        let competing_live_session_conids = {
+            let mut statement = self
+                .connection
+                .prepare(
+                    "SELECT conid FROM market_data_status
+                     WHERE state IN ('failed', 'retrying')
+                       AND (
+                         last_error LIKE '%10197%'
+                         OR lower(last_error) LIKE '%competing live session%'
+                       )
+                     ORDER BY conid",
+                )
+                .map_err(|error| AppError::Storage(error.to_string()))?;
+            statement
+                .query_map([], |row| row.get::<_, i64>(0))
+                .map_err(|error| AppError::Storage(error.to_string()))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|error| AppError::Storage(error.to_string()))?
+        };
         let delayed_market_data: i64 = self
             .connection
             .query_row(
@@ -3881,6 +4034,8 @@ impl Storage {
             .map_err(|error| AppError::Storage(error.to_string()))?;
         Ok(serde_json::json!({
             "failed_market_data": failed_market_data,
+            "competing_live_session_count": competing_live_session_conids.len(),
+            "competing_live_session_conids": competing_live_session_conids,
             "delayed_market_data": delayed_market_data,
             "uncertain_orders": uncertain_orders,
             "failed_strategy_actions": failed_actions,
@@ -4007,35 +4162,39 @@ impl Storage {
                 "no active Parquet files cover the requested backtest range".into(),
             ));
         }
-        let mut bars = Vec::new();
-        for (_, relative_path) in &files {
-            let path = lake_dir.join(relative_path);
-            let sql = format!(
-                "SELECT open_time, open, high, low, close, volume FROM read_parquet('{}')
-                 WHERE open_time >= ? AND open_time < ? ORDER BY open_time",
-                sql_path(&path)
-            );
-            let mut statement = self
-                .connection
-                .prepare(&sql)
-                .map_err(|error| AppError::Storage(error.to_string()))?;
-            let loaded = statement
-                .query_map(params![request.start, request.end], |row| {
-                    Ok(BacktestBar {
-                        open_time: row.get(0)?,
-                        open: row.get(1)?,
-                        high: row.get(2)?,
-                        low: row.get(3)?,
-                        close: row.get(4)?,
-                        volume: row.get(5)?,
-                    })
+        // Let DuckDB plan and scan every selected Parquet fragment together.
+        // Preparing and executing one query per small backfill file adds
+        // substantial fixed overhead as the lake becomes fragmented.
+        let parquet_files = files
+            .iter()
+            .map(|(_, relative_path)| format!("'{}'", sql_path(&lake_dir.join(relative_path))))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT open_time, open, high, low, close, volume
+             FROM read_parquet([{parquet_files}])
+             WHERE open_time >= ? AND open_time < ?
+             ORDER BY open_time"
+        );
+        let mut statement = self
+            .connection
+            .prepare(&sql)
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        let mut bars = statement
+            .query_map(params![request.start, request.end], |row| {
+                Ok(BacktestBar {
+                    open_time: row.get(0)?,
+                    open: row.get(1)?,
+                    high: row.get(2)?,
+                    low: row.get(3)?,
+                    close: row.get(4)?,
+                    volume: row.get(5)?,
                 })
-                .map_err(|error| AppError::Storage(error.to_string()))?
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|error| AppError::Storage(error.to_string()))?;
-            bars.extend(loaded);
-        }
-        bars.sort_by_key(|bar| bar.open_time);
+            })
+            .map_err(|error| AppError::Storage(error.to_string()))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        drop(statement);
         bars.dedup_by_key(|bar| bar.open_time);
         let backtest_id = uuid::Uuid::now_v7();
         let started_at = Utc::now();
@@ -4086,11 +4245,13 @@ impl Storage {
                 ],
             )
             .map_err(|error| AppError::Storage(error.to_string()))?;
-        for trade in &trades {
-            transaction
-                .execute(
-                    "INSERT INTO backtest_trades VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    params![
+        {
+            let mut appender = transaction
+                .appender("backtest_trades")
+                .map_err(|error| AppError::Storage(error.to_string()))?;
+            for trade in &trades {
+                appender
+                    .append_row(params![
                         uuid::Uuid::now_v7(),
                         backtest_id,
                         request.conid,
@@ -4101,23 +4262,31 @@ impl Storage {
                         trade.price,
                         trade.commission,
                         trade.slippage
-                    ],
-                )
+                    ])
+                    .map_err(|error| AppError::Storage(error.to_string()))?;
+            }
+            appender
+                .flush()
                 .map_err(|error| AppError::Storage(error.to_string()))?;
         }
-        for point in &equity {
-            transaction
-                .execute(
-                    "INSERT INTO backtest_equity VALUES (?, ?, ?, ?, ?, ?)",
-                    params![
+        {
+            let mut appender = transaction
+                .appender("backtest_equity")
+                .map_err(|error| AppError::Storage(error.to_string()))?;
+            for point in &equity {
+                appender
+                    .append_row(params![
                         backtest_id,
                         point.observed_at,
                         point.cash,
                         point.position,
                         point.close,
                         point.equity
-                    ],
-                )
+                    ])
+                    .map_err(|error| AppError::Storage(error.to_string()))?;
+            }
+            appender
+                .flush()
                 .map_err(|error| AppError::Storage(error.to_string()))?;
         }
         transaction
@@ -5259,13 +5428,21 @@ impl Storage {
                     .into(),
             ));
         }
-        self.connection
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        transaction
             .execute(
-                "INSERT INTO market_sessions VALUES (?, ?, ?, ?, ?, ?, ?)
-                 ON CONFLICT (exchange, trading_date) DO UPDATE SET
-                   opens_at = excluded.opens_at, closes_at = excluded.closes_at,
-                   state = excluded.state, source = excluded.source,
-                   updated_at = excluded.updated_at",
+                "DELETE FROM market_session_intervals
+                 WHERE exchange = ? AND session_kind = 'regular' AND trading_date = ?",
+                params![exchange, input.trading_date],
+            )
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        transaction
+            .execute(
+                "INSERT INTO market_session_intervals
+                 VALUES (?, 'regular', ?, ?, ?, ?, ?, ?)",
                 params![
                     exchange,
                     input.trading_date,
@@ -5276,8 +5453,94 @@ impl Storage {
                     Utc::now()
                 ],
             )
-            .map(|_| ())
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        transaction
+            .commit()
             .map_err(|error| AppError::Storage(error.to_string()))
+    }
+
+    pub fn replace_ibkr_market_sessions(
+        &mut self,
+        schedule: &crate::ibkr::ContractSchedule,
+    ) -> Result<usize> {
+        if schedule.exchange.trim().is_empty() || schedule.regular_sessions.is_empty() {
+            return Err(AppError::Storage(
+                "IBKR market schedule requires an exchange and regular sessions".into(),
+            ));
+        }
+        let exchange = schedule.exchange.trim().to_ascii_uppercase();
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        transaction
+            .execute(
+                "DELETE FROM market_session_intervals
+                 WHERE exchange = ? AND source LIKE 'ibkr_contract_details:%'",
+                params![exchange],
+            )
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        for (kind, sessions) in [
+            ("regular", schedule.regular_sessions.as_slice()),
+            ("extended", schedule.extended_sessions.as_slice()),
+        ] {
+            let dates = sessions
+                .iter()
+                .map(|session| session.trading_date)
+                .collect::<std::collections::BTreeSet<_>>();
+            for date in dates {
+                transaction
+                    .execute(
+                        "DELETE FROM market_session_intervals
+                         WHERE exchange = ? AND session_kind = ? AND trading_date = ?",
+                        params![exchange, kind, date],
+                    )
+                    .map_err(|error| AppError::Storage(error.to_string()))?;
+            }
+            for session in sessions {
+                transaction
+                    .execute(
+                        "INSERT INTO market_session_intervals
+                         VALUES (?, ?, ?, ?, ?, 'open', ?, ?)",
+                        params![
+                            exchange,
+                            kind,
+                            session.trading_date,
+                            session.opens_at,
+                            session.closes_at,
+                            format!(
+                                "ibkr_contract_details:{}:{}",
+                                schedule.conid, schedule.time_zone_id
+                            ),
+                            schedule.fetched_at
+                        ],
+                    )
+                    .map_err(|error| AppError::Storage(error.to_string()))?;
+            }
+        }
+        transaction
+            .commit()
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        Ok(schedule.regular_sessions.len() + schedule.extended_sessions.len())
+    }
+
+    pub fn market_calendar_needs_refresh(
+        &self,
+        exchange: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let last_update = self
+            .connection
+            .query_row(
+                "SELECT max(updated_at) FROM market_session_intervals
+                 WHERE exchange = ? AND source LIKE 'ibkr_contract_details:%'",
+                params![exchange.trim().to_ascii_uppercase()],
+                |row| row.get::<_, Option<DateTime<Utc>>>(0),
+            )
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        Ok(last_update
+            .map(|updated_at| now - updated_at >= chrono::Duration::hours(6))
+            .unwrap_or(true))
     }
 
     pub fn list_market_sessions(
@@ -5289,10 +5552,11 @@ impl Storage {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT exchange, trading_date, opens_at, closes_at, state, source, updated_at
-                 FROM market_sessions
+                "SELECT exchange, trading_date, opens_at, closes_at, state, source, updated_at,
+                        session_kind
+                 FROM market_session_intervals
                  WHERE (? IS NULL OR exchange = ?)
-                 ORDER BY trading_date DESC, exchange LIMIT ?",
+                 ORDER BY trading_date DESC, exchange, session_kind, opens_at LIMIT ?",
             )
             .map_err(|error| AppError::Storage(error.to_string()))?;
         let rows = statement
@@ -5307,6 +5571,7 @@ impl Storage {
                         "state": row.get::<_, String>(4)?,
                         "source": row.get::<_, String>(5)?,
                         "updated_at": row.get::<_, DateTime<Utc>>(6)?,
+                        "session_kind": row.get::<_, String>(7)?,
                     }))
                 },
             )
@@ -5316,17 +5581,29 @@ impl Storage {
     }
 
     /// Returns `None` when no calendar has been loaded for the exchange.
+    #[cfg(test)]
     pub fn market_session_is_open(
         &self,
         exchange: &str,
         now: DateTime<Utc>,
     ) -> Result<Option<bool>> {
+        self.market_session_is_open_for(exchange, now, false)
+    }
+
+    pub fn market_session_is_open_for(
+        &self,
+        exchange: &str,
+        now: DateTime<Utc>,
+        outside_rth: bool,
+    ) -> Result<Option<bool>> {
         let exchange = exchange.trim().to_ascii_uppercase();
+        let session_kind = if outside_rth { "extended" } else { "regular" };
         let configured: i64 = self
             .connection
             .query_row(
-                "SELECT count(*) FROM market_sessions WHERE exchange = ?",
-                params![exchange],
+                "SELECT count(*) FROM market_session_intervals
+                 WHERE exchange = ? AND session_kind = ?",
+                params![exchange, session_kind],
                 |row| row.get(0),
             )
             .map_err(|error| AppError::Storage(error.to_string()))?;
@@ -5336,10 +5613,10 @@ impl Storage {
         let open: i64 = self
             .connection
             .query_row(
-                "SELECT count(*) FROM market_sessions
-                 WHERE exchange = ? AND state = 'open'
+                "SELECT count(*) FROM market_session_intervals
+                 WHERE exchange = ? AND session_kind = ? AND state = 'open'
                    AND opens_at <= ? AND closes_at > ?",
-                params![exchange, now, now],
+                params![exchange, session_kind, now, now],
                 |row| row.get(0),
             )
             .map_err(|error| AppError::Storage(error.to_string()))?;
@@ -5360,10 +5637,24 @@ impl Storage {
                     "INSERT INTO monitoring_alerts VALUES
                      (?, ?, ?, 'active', ?, ?, ?, NULL, NULL)
                      ON CONFLICT (alert_key) DO UPDATE SET
-                       severity = excluded.severity, state = 'active',
+                       severity = excluded.severity,
+                       state = CASE
+                         WHEN monitoring_alerts.state = 'acknowledged'
+                         THEN 'acknowledged'
+                         ELSE 'active'
+                       END,
                        message = excluded.message,
                        last_observed_at = excluded.last_observed_at,
-                       acknowledged_at = NULL, acknowledged_note = NULL",
+                       acknowledged_at = CASE
+                         WHEN monitoring_alerts.state = 'acknowledged'
+                         THEN monitoring_alerts.acknowledged_at
+                         ELSE NULL
+                       END,
+                       acknowledged_note = CASE
+                         WHEN monitoring_alerts.state = 'acknowledged'
+                         THEN monitoring_alerts.acknowledged_note
+                         ELSE NULL
+                       END",
                     params![uuid::Uuid::now_v7(), alert_key, severity, message, now, now],
                 )
                 .map(|_| ())
@@ -5372,7 +5663,8 @@ impl Storage {
             self.connection
                 .execute(
                     "UPDATE monitoring_alerts SET state = 'resolved',
-                     last_observed_at = ? WHERE alert_key = ? AND state = 'active'",
+                     last_observed_at = ? WHERE alert_key = ?
+                     AND state IN ('active', 'acknowledged')",
                     params![now, alert_key],
                 )
                 .map(|_| ())
@@ -6400,7 +6692,13 @@ fn simulate_strategy(
             volume: bar.volume,
         });
         if history.len() >= strategy.minimum_history() {
-            let output = strategy.evaluate(&history).map_err(AppError::Storage)?;
+            // Live evaluation intentionally supplies exactly minimum_history
+            // bars. Match that contract here so an expanding backtest does not
+            // repeatedly copy and scan its entire history on every bar.
+            let evaluation_start = history.len() - strategy.minimum_history();
+            let output = strategy
+                .evaluate(&history[evaluation_start..])
+                .map_err(AppError::Storage)?;
             if output.signal == crate::strategy::StrategySignal::Buy && position == 0.0 {
                 pending = Some(("buy", bar.open_time));
             } else if output.signal == crate::strategy::StrategySignal::Sell && position > 0.0 {
@@ -6670,6 +6968,53 @@ mod tests {
         assert_eq!(details["state"], "failed");
         assert_eq!(details["trades"], serde_json::json!([]));
         assert_eq!(details["equity"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn successful_backtest_bulk_persists_trades_and_equity() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(&directory.path().join("state.duckdb")).unwrap();
+        let lake = directory.path().join("lake");
+        let staging = directory.path().join("staging");
+        let start = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let bars = [3.0, 2.0, 1.0, 4.0, 5.0]
+            .into_iter()
+            .enumerate()
+            .map(|(index, close)| test_bar(start + chrono::Duration::days(index as i64), close))
+            .collect::<Vec<_>>();
+        // Two fragments exercise the combined read_parquet([...]) scan.
+        storage
+            .write_historical_bars(&lake, &staging, &bars[..3])
+            .unwrap();
+        storage
+            .write_historical_bars(&lake, &staging, &bars[3..])
+            .unwrap();
+        let request = BacktestRequest {
+            strategy_id: None,
+            conid: 756733,
+            timeframe: "1d".into(),
+            start,
+            end: start + chrono::Duration::days(5),
+            short_window: Some(2),
+            long_window: Some(3),
+            strategy_kind: "moving_average_cross".into(),
+            strategy_config: None,
+            quantity: 1.0,
+            initial_cash: 100.0,
+            slippage_bps: 0.0,
+            commission_per_order: 1.0,
+            seed: 1,
+        };
+
+        let result = storage
+            .run_moving_average_backtest(&lake, &request)
+            .unwrap();
+        let backtest_id = uuid::Uuid::parse_str(result["backtest_id"].as_str().unwrap()).unwrap();
+        let details = storage.backtest_details(backtest_id).unwrap().unwrap();
+        assert_eq!(details["state"], "completed");
+        assert_eq!(details["metrics"]["bar_count"], 5);
+        assert_eq!(details["equity"].as_array().unwrap().len(), 5);
+        assert_eq!(details["trades"].as_array().unwrap().len(), 1);
     }
 
     #[test]
@@ -6948,6 +7293,47 @@ mod tests {
     }
 
     #[test]
+    fn strategy_rename_preserves_identity_and_requires_a_unique_non_empty_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(&directory.path().join("state.duckdb")).unwrap();
+        let config = serde_json::json!({
+            "conid": 756733,
+            "short_window": 2,
+            "long_window": 3
+        });
+        let strategy_id = storage
+            .create_strategy("original name", "moving_average_cross", &config)
+            .unwrap();
+        storage
+            .create_strategy("existing name", "moving_average_cross", &config)
+            .unwrap();
+
+        assert!(
+            storage
+                .rename_strategy(strategy_id, "  renamed strategy  ")
+                .unwrap()
+        );
+        let renamed = storage
+            .list_strategies()
+            .unwrap()
+            .into_iter()
+            .find(|strategy| strategy["strategy_id"] == strategy_id.to_string())
+            .unwrap();
+        assert_eq!(renamed["name"], "renamed strategy");
+        assert!(storage.rename_strategy(strategy_id, " ").is_err());
+        assert!(
+            storage
+                .rename_strategy(strategy_id, "existing name")
+                .is_err()
+        );
+        assert!(
+            !storage
+                .rename_strategy(uuid::Uuid::now_v7(), "missing strategy")
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn moving_average_strategy_persists_once_per_final_bar() {
         let directory = tempfile::tempdir().unwrap();
         let mut storage = Storage::open(&directory.path().join("state.duckdb")).unwrap();
@@ -7057,6 +7443,7 @@ mod tests {
                 allow_short: false,
                 order_type: "market".into(),
                 paper_only: true,
+                outside_rth: false,
                 contract: crate::ibkr::ContractCandidate {
                     conid: 756733,
                     symbol: "SPY".into(),
@@ -7106,6 +7493,78 @@ mod tests {
     }
 
     #[test]
+    fn disabled_strategy_execution_persists_skipped_signal_actions() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(&directory.path().join("state.duckdb")).unwrap();
+        let strategy_id = storage
+            .create_strategy(
+                "disabled execution audit",
+                "close_threshold",
+                &serde_json::json!({
+                    "conid": 756733,
+                    "buy_below": 100.0,
+                    "sell_above": 200.0
+                }),
+            )
+            .unwrap();
+        storage
+            .configure_strategy_execution(&StrategyExecutionConfig {
+                strategy_id,
+                account: "DU123".into(),
+                target_quantity: 3.0,
+                short_target_quantity: 0.0,
+                allow_short: false,
+                order_type: "market".into(),
+                paper_only: true,
+                outside_rth: false,
+                contract: crate::ibkr::ContractCandidate {
+                    conid: 756733,
+                    symbol: "SPY".into(),
+                    security_type: "STK".into(),
+                    currency: "USD".into(),
+                    exchange: "SMART".into(),
+                    primary_exchange: "ARCA".into(),
+                    local_symbol: "SPY".into(),
+                    description: String::new(),
+                    derivative_security_types: Vec::new(),
+                },
+            })
+            .unwrap();
+        let evaluation_id = uuid::Uuid::now_v7();
+        let now = Utc::now() + chrono::Duration::milliseconds(1);
+        storage
+            .connection
+            .execute(
+                "INSERT INTO strategy_evaluations
+                 VALUES (?, ?, 756733, ?, 90, 100, 90, 200, 'buy', ?, '{}')",
+                params![evaluation_id, strategy_id, now, now],
+            )
+            .unwrap();
+
+        assert!(storage.claim_strategy_action().unwrap().is_none());
+        let actions = storage.list_strategy_execution_actions(10).unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(
+            actions[0]["evaluation_id"],
+            serde_json::json!(evaluation_id)
+        );
+        assert_eq!(actions[0]["state"], "skipped");
+        assert_eq!(actions[0]["cost_gate_result"], "execution_disabled");
+        assert!(
+            actions[0]["detail"]
+                .as_str()
+                .unwrap()
+                .contains("strategy execution is disabled")
+        );
+
+        assert!(storage.claim_strategy_action().unwrap().is_none());
+        assert_eq!(
+            storage.list_strategy_execution_actions(10).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
     fn strategy_skip_identifies_the_blocking_active_order() {
         let directory = tempfile::tempdir().unwrap();
         let mut storage = Storage::open(&directory.path().join("state.duckdb")).unwrap();
@@ -7136,6 +7595,7 @@ mod tests {
                 allow_short: false,
                 order_type: "market".into(),
                 paper_only: true,
+                outside_rth: false,
                 contract: contract.clone(),
             })
             .unwrap();
@@ -8140,6 +8600,52 @@ mod tests {
     }
 
     #[test]
+    fn ibkr_calendar_keeps_regular_and_extended_sessions_separate() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(&directory.path().join("state.duckdb")).unwrap();
+        let now = "2026-07-31T10:30:00Z".parse::<DateTime<Utc>>().unwrap();
+        storage
+            .replace_ibkr_market_sessions(&crate::ibkr::ContractSchedule {
+                conid: 29612116,
+                exchange: "SBF".into(),
+                time_zone_id: "MET".into(),
+                regular_sessions: vec![crate::ibkr::ContractSession {
+                    trading_date: now.date_naive(),
+                    opens_at: "2026-07-31T07:00:00Z".parse().unwrap(),
+                    closes_at: "2026-07-31T15:30:00Z".parse().unwrap(),
+                }],
+                extended_sessions: vec![crate::ibkr::ContractSession {
+                    trading_date: now.date_naive(),
+                    opens_at: "2026-07-31T05:30:00Z".parse().unwrap(),
+                    closes_at: "2026-07-31T18:00:00Z".parse().unwrap(),
+                }],
+                fetched_at: now,
+            })
+            .unwrap();
+        let before_regular = "2026-07-31T06:00:00Z".parse().unwrap();
+        assert_eq!(
+            storage
+                .market_session_is_open_for("SBF", before_regular, false)
+                .unwrap(),
+            Some(false)
+        );
+        assert_eq!(
+            storage
+                .market_session_is_open_for("SBF", before_regular, true)
+                .unwrap(),
+            Some(true)
+        );
+        assert!(!storage.market_calendar_needs_refresh("SBF", now).unwrap());
+        assert!(
+            storage
+                .market_calendar_needs_refresh("SBF", now + chrono::Duration::hours(6))
+                .unwrap()
+        );
+        let sessions = storage.list_market_sessions(Some("SBF"), 10).unwrap();
+        assert_eq!(sessions.len(), 2);
+    }
+
+    #[test]
     fn automatic_execution_can_target_a_short_position() {
         let directory = tempfile::tempdir().unwrap();
         let mut storage = Storage::open(&directory.path().join("state.duckdb")).unwrap();
@@ -8161,8 +8667,9 @@ mod tests {
                 target_quantity: 10.0,
                 short_target_quantity: -4.0,
                 allow_short: true,
-                order_type: "market".into(),
+                order_type: "limit".into(),
                 paper_only: true,
+                outside_rth: true,
                 contract: crate::ibkr::ContractCandidate {
                     conid: 756733,
                     symbol: "SPY".into(),
@@ -8192,5 +8699,83 @@ mod tests {
         assert_eq!(action.side, "sell");
         assert_eq!(action.quantity, 4.0);
         assert_eq!(action.legs[0].target_quantity, -4.0);
+        assert_eq!(action.order_type, "limit");
+        assert!(action.outside_rth);
+    }
+
+    #[test]
+    fn acknowledged_monitoring_alert_stays_acknowledged_until_resolved() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(&directory.path().join("state.duckdb")).unwrap();
+        storage
+            .upsert_monitoring_alert("test_alert", "critical", "requires review", true)
+            .unwrap();
+        let alert = storage.list_monitoring_alerts(false, 10).unwrap().remove(0);
+        let alert_id = uuid::Uuid::parse_str(alert["alert_id"].as_str().unwrap()).unwrap();
+        assert!(
+            storage
+                .acknowledge_monitoring_alert(alert_id, "reviewed")
+                .unwrap()
+        );
+
+        storage
+            .upsert_monitoring_alert("test_alert", "critical", "still present", true)
+            .unwrap();
+        let alert = storage.list_monitoring_alerts(false, 10).unwrap().remove(0);
+        assert_eq!(alert["state"], "acknowledged");
+        assert_eq!(alert["acknowledged_note"], "reviewed");
+        assert!(storage.list_monitoring_alerts(true, 10).unwrap().is_empty());
+
+        storage
+            .upsert_monitoring_alert("test_alert", "critical", "resolved", false)
+            .unwrap();
+        assert_eq!(
+            storage.list_monitoring_alerts(false, 10).unwrap()[0]["state"],
+            "resolved"
+        );
+
+        storage
+            .upsert_monitoring_alert("test_alert", "critical", "recurred", true)
+            .unwrap();
+        let alert = storage.list_monitoring_alerts(false, 10).unwrap().remove(0);
+        assert_eq!(alert["state"], "active");
+        assert!(alert["acknowledged_at"].is_null());
+    }
+
+    #[test]
+    fn monitoring_identifies_competing_live_market_data_session_while_retrying() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(&directory.path().join("state.duckdb")).unwrap();
+        let observed_at = Utc::now();
+        storage
+            .apply_broker_event(&crate::ibkr::BrokerEvent::MarketDataStatus {
+                conid: 29_612_116,
+                state: "retrying".into(),
+                error: Some("[10197] No market data during competing live session".into()),
+                observed_at,
+            })
+            .unwrap();
+
+        let facts = storage.monitoring_facts(observed_at).unwrap();
+        assert_eq!(facts["failed_market_data"], 1);
+        assert_eq!(facts["competing_live_session_count"], 1);
+        assert_eq!(
+            facts["competing_live_session_conids"],
+            serde_json::json!([29_612_116])
+        );
+
+        storage
+            .apply_broker_event(&crate::ibkr::BrokerEvent::MarketDataStatus {
+                conid: 29_612_116,
+                state: "active".into(),
+                error: None,
+                observed_at: observed_at + chrono::Duration::seconds(1),
+            })
+            .unwrap();
+        let recovered = storage
+            .monitoring_facts(observed_at + chrono::Duration::seconds(1))
+            .unwrap();
+        assert_eq!(recovered["failed_market_data"], 0);
+        assert_eq!(recovered["competing_live_session_count"], 0);
     }
 }

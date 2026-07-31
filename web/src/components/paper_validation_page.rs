@@ -202,6 +202,7 @@ pub fn paper_validation_page(props: &PaperValidationPageProps) -> Html {
                 "short_target_quantity": 0.0,
                 "allow_short": false,
                 "order_type": "market",
+                "outside_rth": false,
                 "paper_only": true,
                 "contract": contract
             });

@@ -13,6 +13,7 @@ use super::{
     delete_strategy_button::DeleteStrategyButton,
     error_modal::ErrorModal,
     pagination::{Pagination, load_saved_page, save_page},
+    rename_strategy_button::RenameStrategyButton,
     value::{
         array, boolean, integer, local_time, number, official_security_name, security_exchange,
         text,
@@ -120,6 +121,10 @@ pub fn strategies_page(props: &StrategiesPageProps) -> Html {
                                             <td><span class={classes!("badge", execution_class)}>{execution_label}</span></td>
                                             <td class="strategy-id"><code>{id.clone()}</code></td>
                                             <td><div class="d-flex flex-wrap gap-2">
+                                                <RenameStrategyButton
+                                                    strategy_id={id.clone()}
+                                                    strategy_name={name.clone()}
+                                                    on_mutation={props.on_mutation.clone()} />
                                                 <ActionButton label="启动信号" class="btn-outline-success"
                                                     disabled={state == "running"}
                                                     method="strategy.start" strategy_id={id.clone()}
@@ -157,21 +162,36 @@ pub fn strategies_page(props: &StrategiesPageProps) -> Html {
             </section>
             <section class="mb-4">
                 <h2 class="h5">{"策略执行配置"}</h2>
+                <p class="text-secondary">
+                    {"切换盘前盘后会重新保存执行配置并关闭自动执行；核对限价模式后需要重新启用 Paper 执行。"}
+                </p>
                 <div class="card shadow-sm table-responsive">
                     <table class="table table-hover align-middle mb-0">
                         <thead><tr>
                             <th>{"策略 ID"}</th><th>{"账户"}</th><th>{"证券（官方名称）"}</th><th>{"所属交易所"}</th><th>{"Conid"}</th>
                             <th class="text-end">{"多头目标"}</th><th class="text-end">{"空头目标"}</th>
-                            <th>{"订单类型"}</th><th>{"Paper Only"}</th><th>{"允许做空"}</th><th>{"启用"}</th>
-                            <th>{"更新时间（本地）"}</th>
+                            <th>{"订单类型"}</th><th>{"盘前盘后"}</th><th>{"Paper Only"}</th><th>{"允许做空"}</th><th>{"启用"}</th>
+                            <th>{"更新时间（本地）"}</th><th>{"操作"}</th>
                         </tr></thead>
                         <tbody>
                         {
                             if configs.is_empty() {
-                                html! { <tr><td colspan="12" class="text-center text-secondary py-4">{"暂无执行配置"}</td></tr> }
+                                html! { <tr><td colspan="14" class="text-center text-secondary py-4">{"暂无执行配置"}</td></tr> }
                             } else {
                                 configs.iter().map(|row| {
                                     let contract = row.get("contract").unwrap_or(&serde_json::Value::Null);
+                                    let outside_rth = boolean(row, "outside_rth");
+                                    let params = json!({
+                                        "strategy_id": text(row, "strategy_id"),
+                                        "account": text(row, "account"),
+                                        "target_quantity": row.get("target_quantity").cloned().unwrap_or(Value::Null),
+                                        "short_target_quantity": row.get("short_target_quantity").cloned().unwrap_or(Value::Null),
+                                        "allow_short": boolean(row, "allow_short"),
+                                        "outside_rth": !outside_rth,
+                                        "order_type": if outside_rth { "market" } else { "limit" },
+                                        "paper_only": boolean(row, "paper_only"),
+                                        "contract": contract.clone()
+                                    });
                                     html! { <tr>
                                         <td class="strategy-id"><code>{text(row, "strategy_id")}</code></td>
                                         <td>{text(row, "account")}</td>
@@ -184,10 +204,21 @@ pub fn strategies_page(props: &StrategiesPageProps) -> Html {
                                         <td class="text-end">{number(row, "target_quantity")}</td>
                                         <td class="text-end">{number(row, "short_target_quantity")}</td>
                                         <td>{text(row, "order_type")}</td>
+                                        <td><BoolBadge value={boolean(row, "outside_rth")} /></td>
                                         <td><BoolBadge value={boolean(row, "paper_only")} /></td>
                                         <td><BoolBadge value={boolean(row, "allow_short")} /></td>
                                         <td><BoolBadge value={boolean(row, "enabled")} /></td>
                                         <td class="text-nowrap">{local_time(row, "updated_at")}</td>
+                                        <td><button class="btn btn-sm btn-outline-primary text-nowrap" onclick={{
+                                            let callback = props.on_mutation.clone();
+                                            Callback::from(move |_| callback.emit(MutationRequest {
+                                                method: "strategy.execution.configure".into(),
+                                                params: params.clone(),
+                                                on_complete: Callback::noop(),
+                                            }))
+                                        }}>
+                                            {if outside_rth { "关闭盘前盘后" } else { "开启盘前盘后" }}
+                                        </button></td>
                                     </tr> }
                                 }).collect::<Html>()
                             }
@@ -206,10 +237,10 @@ pub fn strategies_page(props: &StrategiesPageProps) -> Html {
                                 save_page("quant-trader.strategy-actions-page", next);
                                 page.set(next);
                             })
-                        }} />
+                    }} />
                     <table class="table table-hover align-middle mb-0">
                         <thead><tr>
-                            <th>{"时间（本地）"}</th><th>{"策略 ID"}</th><th>{"证券及交易所"}</th><th>{"信号"}</th>
+                            <th>{"时间（本地）"}</th><th>{"策略名称"}</th><th>{"策略 ID"}</th><th>{"证券及交易所"}</th><th>{"信号"}</th>
                             <th class="text-end">{"请求数量"}</th><th>{"状态"}</th>
                             <th class="text-end">{"信号强度(bps)"}</th>
                             <th class="text-end">{"成本门槛(bps)"}</th>
@@ -220,23 +251,32 @@ pub fn strategies_page(props: &StrategiesPageProps) -> Html {
                         <tbody>
                         {
                             if actions.is_empty() {
-                                html! { <tr><td colspan="12" class="text-center text-secondary py-4">{"暂无执行动作"}</td></tr> }
+                                html! { <tr><td colspan="13" class="text-center text-secondary py-4">{"暂无执行动作"}</td></tr> }
                             } else {
-                                actions.iter().map(|row| html! {
-                                    <tr>
-                                        <td class="text-nowrap">{local_time(row, "created_at")}</td>
-                                        <td class="strategy-id"><code>{text(row, "strategy_id")}</code></td>
-                                        <td>{action_securities(row)}</td>
-                                        <td>{text(row, "signal")}</td>
-                                        <td class="text-end">{number(row, "requested_quantity")}</td>
-                                        <td><span class="badge bg-secondary">{text(row, "state")}</span></td>
-                                        <td class="text-end">{number(row, "signal_edge_bps")}</td>
-                                        <td class="text-end">{number(row, "required_edge_bps")}</td>
-                                        <td class="text-end">{number(row, "estimated_round_trip_cost")}</td>
-                                        <td>{cost_gate_result(row)}</td>
-                                        <td>{integer(row, "broker_order_id")}</td>
-                                        <td>{text(row, "detail")}</td>
-                                    </tr>
+                                actions.iter().map(|row| {
+                                    let strategy_id = text(row, "strategy_id");
+                                    let strategy_name = strategies
+                                        .iter()
+                                        .find(|strategy| text(strategy, "strategy_id") == strategy_id)
+                                        .map(|strategy| text(strategy, "name"))
+                                        .unwrap_or_else(|| "—".into());
+                                    html! {
+                                        <tr>
+                                            <td class="text-nowrap">{local_time(row, "created_at")}</td>
+                                            <td>{strategy_name}</td>
+                                            <td class="strategy-id"><code>{strategy_id}</code></td>
+                                            <td>{action_securities(row)}</td>
+                                            <td>{text(row, "signal")}</td>
+                                            <td class="text-end">{number(row, "requested_quantity")}</td>
+                                            <td><span class="badge bg-secondary">{text(row, "state")}</span></td>
+                                            <td class="text-end">{number(row, "signal_edge_bps")}</td>
+                                            <td class="text-end">{number(row, "required_edge_bps")}</td>
+                                            <td class="text-end">{number(row, "estimated_round_trip_cost")}</td>
+                                            <td>{cost_gate_result(row)}</td>
+                                            <td>{integer(row, "broker_order_id")}</td>
+                                            <td>{text(row, "detail")}</td>
+                                        </tr>
+                                    }
                                 }).collect::<Html>()
                             }
                         }
@@ -312,6 +352,11 @@ fn cost_gate_result(action: &Value) -> Html {
             "自动暂停",
             "bg-warning text-dark",
             "历史佣金与毛利润比例超过配置上限",
+        ),
+        "execution_disabled" => (
+            "执行关闭",
+            "bg-secondary",
+            "信号产生时该策略的 Paper 自动执行配置未启用",
         ),
         _ => ("未执行", "bg-secondary", "该动作没有进入成本门控"),
     };

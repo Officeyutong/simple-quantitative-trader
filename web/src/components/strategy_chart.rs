@@ -40,7 +40,10 @@ pub fn strategy_chart(props: &StrategyChartProps) -> Html {
 
     use_effect_with(
         (bars, evaluations, symbol, view_key),
-        move |(bars, evaluations, symbol, _)| {
+        move |(bars, evaluations, symbol, view_key)| {
+            let chart_view_key = view_key.clone();
+            #[cfg(not(target_arch = "wasm32"))]
+            let _ = &chart_view_key;
             let mut ordered_bars = bars.clone();
             ordered_bars.sort_by_key(|bar| {
                 bar.get("bar_time")
@@ -109,7 +112,6 @@ pub fn strategy_chart(props: &StrategyChartProps) -> Html {
 
             #[cfg(target_arch = "wasm32")]
             spawn_local({
-                let view_key = view_key.clone();
                 async move {
                     let plot_object = plot.to_js_object();
                     let layout = js_sys::Reflect::get(&plot_object, &JsValue::from_str("layout"))
@@ -117,7 +119,7 @@ pub fn strategy_chart(props: &StrategyChartProps) -> Html {
                     js_sys::Reflect::set(
                         &layout,
                         &JsValue::from_str("uirevision"),
-                        &JsValue::from_str(&view_key),
+                        &JsValue::from_str(&chart_view_key),
                     )
                     .expect("Plotly uirevision must be writable");
                     plotly_react(CHART_ID, &plot_object)

@@ -35,6 +35,7 @@ pub const ALL_METHODS: &[&str] = &[
     "strategy.create",
     "strategy.kinds",
     "strategy.list",
+    "strategy.rename",
     "strategy.start",
     "strategy.pause",
     "strategy.stop",
@@ -56,6 +57,7 @@ pub const ALL_METHODS: &[&str] = &[
     "fx.set",
     "fx.list",
     "calendar.add",
+    "calendar.refresh",
     "calendar.list",
     "calendar.status",
     "monitor.metrics",
@@ -160,6 +162,12 @@ pub struct StrategyCreateParams {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StrategyRenameParams {
+    pub strategy_id: uuid::Uuid,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StrategySignalsParams {
     pub strategy_id: uuid::Uuid,
     #[serde(default = "default_limit")]
@@ -216,6 +224,8 @@ pub struct CalendarListParams {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CalendarStatusParams {
     pub exchange: String,
+    #[serde(default)]
+    pub outside_rth: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

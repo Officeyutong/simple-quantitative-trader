@@ -6,7 +6,7 @@ use crate::api::call_method;
 
 use super::{
     error_modal::ErrorModal,
-    value::{array, number, text},
+    value::{array, boolean, number, text},
 };
 
 #[derive(Properties, PartialEq)]
@@ -60,27 +60,79 @@ pub fn execution_cost_page(props: &ExecutionCostPageProps) -> Html {
             .map(|value| text(value, "strategy_id"))
             .filter(|value| value != "—")
             .collect::<Vec<_>>();
-        let model_options = models
-            .iter()
-            .map(|value| text(value, "cost_model_id"))
-            .filter(|value| value != "—")
-            .collect::<Vec<_>>();
-        let key = (strategy_options.clone(), model_options.clone());
         let strategy_id = strategy_id.clone();
-        let control_model_id = control_model_id.clone();
-        use_effect_with(key, move |_| {
+        use_effect_with(strategy_options.clone(), move |_| {
             if !strategy_options.iter().any(|id| id == strategy_id.as_str()) {
                 strategy_id.set(strategy_options.first().cloned().unwrap_or_default());
-            }
-            if !model_options
-                .iter()
-                .any(|id| id == control_model_id.as_str())
-            {
-                control_model_id.set(model_options.first().cloned().unwrap_or_default());
             }
             || ()
         });
     }
+    {
+        let selected_strategy_id = (*strategy_id).clone();
+        let strategies = strategies.clone();
+        let models_snapshot = (*models).clone();
+        let controls_snapshot = (*controls).clone();
+        let control_model_id = control_model_id.clone();
+        let multiple = multiple.clone();
+        let ratio = ratio.clone();
+        let minimum_trades = minimum_trades.clone();
+        let enabled = enabled.clone();
+        use_effect_with(
+            (
+                selected_strategy_id.clone(),
+                strategies.clone(),
+                models_snapshot.clone(),
+                controls_snapshot.clone(),
+            ),
+            move |_| {
+                if let Some(control) = controls_snapshot
+                    .iter()
+                    .find(|control| text(control, "strategy_id") == selected_strategy_id)
+                {
+                    control_model_id.set(text(control, "cost_model_id"));
+                    multiple.set(number(control, "minimum_cost_multiple"));
+                    ratio.set(number(control, "maximum_commission_to_gross_profit_ratio"));
+                    minimum_trades.set(number(control, "minimum_completed_trades"));
+                    enabled.set(boolean(control, "enabled"));
+                } else {
+                    let strategy_currency = strategies
+                        .iter()
+                        .find(|strategy| text(strategy, "strategy_id") == selected_strategy_id)
+                        .map(|strategy| text(strategy, "currency"));
+                    let matching_model = strategy_currency.and_then(|currency| {
+                        models_snapshot
+                            .iter()
+                            .find(|model| text(model, "currency").eq_ignore_ascii_case(&currency))
+                    });
+                    control_model_id.set(
+                        matching_model
+                            .map(|model| text(model, "cost_model_id"))
+                            .unwrap_or_default(),
+                    );
+                    multiple.set("2".into());
+                    ratio.set("0.5".into());
+                    minimum_trades.set("5".into());
+                    enabled.set(true);
+                }
+                || ()
+            },
+        );
+    }
+
+    let selected_strategy_currency = strategies
+        .iter()
+        .find(|strategy| text(strategy, "strategy_id") == *strategy_id)
+        .map(|strategy| text(strategy, "currency"))
+        .unwrap_or_default();
+    let selected_model_currency = models
+        .iter()
+        .find(|model| text(model, "cost_model_id") == *control_model_id)
+        .map(|model| text(model, "currency"))
+        .unwrap_or_default();
+    let currency_mismatch = !selected_strategy_currency.is_empty()
+        && !selected_model_currency.is_empty()
+        && !selected_strategy_currency.eq_ignore_ascii_case(&selected_model_currency);
 
     let save_model = {
         let endpoint = props.endpoint.clone();
@@ -178,15 +230,31 @@ pub fn execution_cost_page(props: &ExecutionCostPageProps) -> Html {
                 <p class="text-secondary">{"模型保存在 DuckDB。bps 为万分之一；固定费、比例费和最低费可以同时使用。"}</p>
                 <form onsubmit={save_model}>
                     <div class="row g-3">
-                        <TextField label="名称" value={name.clone()} />
-                        <TextField label="币种" value={currency.clone()} />
+                        <TextField
+                            label="名称"
+                            help="费用模型的唯一名称，仅用于识别和选择，例如 france-stock；不参与费用计算。"
+                            value={name.clone()}
+                        />
+                        <TextField
+                            label="币种"
+                            help="费用金额使用的 ISO 货币代码，例如 EUR、USD、HKD。必须与策略交易证券的合约币种一致，否则成本门控会阻止交易。"
+                            value={currency.clone()}
+                        />
                         {[
-                            "买入固定费/笔", "买入每股费", "买入比例(bps)", "买入最低费",
-                            "卖出固定费/笔", "卖出每股费", "卖出比例(bps)", "卖出最低费",
-                            "卖出税费(bps)", "预计点差(bps)", "单边预计滑点(bps)"
-                        ].into_iter().enumerate().map(|(index, label)| {
+                            ("买入固定费/笔", "每一笔买单固定收取的金额，与股数和成交金额无关。填 0 表示没有固定费。"),
+                            ("买入每股费", "买入每股收取的金额。该项费用等于买入数量 × 此值；它不是每笔费用。"),
+                            ("买入比例(bps)", "按买入名义金额收取的费率。1 bps = 0.01%，5 bps = 0.05%；费用等于名义金额 × bps ÷ 10000。"),
+                            ("买入最低费", "单笔买入佣金的最低金额。系统先合计固定费、每股费和比例费，再与此值取较大者。"),
+                            ("卖出固定费/笔", "每一笔卖单固定收取的金额，与股数和成交金额无关。填 0 表示没有固定费。"),
+                            ("卖出每股费", "卖出每股收取的金额。该项费用等于卖出数量 × 此值；它不是每笔费用。"),
+                            ("卖出比例(bps)", "按卖出名义金额收取的费率。1 bps = 0.01%，5 bps = 0.05%；费用等于名义金额 × bps ÷ 10000。"),
+                            ("卖出最低费", "单笔卖出佣金的最低金额。系统先合计固定费、每股费、比例费和卖出税，再与此值取较大者。"),
+                            ("卖出税费(bps)", "仅在卖出一侧按名义金额估算的税费或监管费，单位 bps。它会与卖出比例费相加。"),
+                            ("预计点差(bps)", "预计完整买卖价差占名义金额的比例，单位 bps。往返成本中计算一次完整点差；填 0 表示忽略点差。"),
+                            ("单边预计滑点(bps)", "每次买入或卖出相对参考价的不利偏移，单位 bps。往返成本会计算两次，即买入一次、卖出一次。")
+                        ].into_iter().enumerate().map(|(index, (label, help))| {
                             let value = fees[index].clone();
-                            html! { <div class="col-6 col-lg-3"><label class="form-label">{label}</label>
+                            html! { <div class="col-6 col-lg-3"><HelpLabel label={label} help={help} />
                                 <input class="form-control" type="number" min="0" step="any" value={value}
                                     oninput={{ let fees = fees.clone(); Callback::from(move |event: InputEvent| {
                                         let mut next = (*fees).clone();
@@ -231,20 +299,47 @@ pub fn execution_cost_page(props: &ExecutionCostPageProps) -> Html {
                 <form onsubmit={save_control}><div class="row g-3">
                     <SelectField label="策略" value={strategy_id.clone()} options={strategies.iter().map(|v| (text(v, "strategy_id"), text(v, "name"))).collect::<Vec<_>>()} />
                     <SelectField label="费用模型" value={control_model_id.clone()} options={models.iter().map(|v| (text(v, "cost_model_id"), text(v, "name"))).collect::<Vec<_>>()} />
-                    <TextField label="成本安全倍数" value={multiple.clone()} />
-                    <TextField label="最大佣金/毛利润" value={ratio.clone()} />
-                    <TextField label="熔断最少交易数" value={minimum_trades.clone()} />
+                    <TextField
+                        label="成本安全倍数"
+                        help="信号必须覆盖预计往返成本的倍数，最小为 1。例如预计成本为 10 bps、倍数为 2，则信号强度至少需要 20 bps。"
+                        value={multiple.clone()}
+                    />
+                    <TextField
+                        label="最大佣金/毛利润"
+                        help="累计佣金相对于累计毛利润的允许上限。0.5 表示 50%；达到最少交易数后若实际比例超过此值，系统会自动暂停策略执行。"
+                        value={ratio.clone()}
+                    />
+                    <TextField
+                        label="熔断最少交易数"
+                        help="至少完成这么多笔已实现交易后，才根据实际佣金/毛利润比例触发自动暂停，避免样本过少时误判。"
+                        value={minimum_trades.clone()}
+                    />
                     <div class="col-6 col-lg-3 form-check mt-5"><input class="form-check-input" type="checkbox" checked={*enabled}
                         onchange={{ let enabled = enabled.clone(); Callback::from(move |event: Event| {
                             let input: web_sys::HtmlInputElement = event.target_unchecked_into(); enabled.set(input.checked());
                         }) }} /><label class="form-check-label">{"启用成本门控"}</label></div>
-                    <div class="col-12"><button class="btn btn-primary" disabled={*busy || strategy_id.is_empty() || control_model_id.is_empty()}>{"保存策略控制"}</button></div>
+                    {
+                        currency_mismatch.then(|| html! {
+                            <div class="col-12">
+                                <div class="alert alert-danger mb-0">
+                                    {format!(
+                                        "费用模型币种 {} 与策略证券币种 {} 不匹配，请选择相同币种的模型。",
+                                        selected_model_currency, selected_strategy_currency
+                                    )}
+                                </div>
+                            </div>
+                        }).unwrap_or_default()
+                    }
+                    <div class="col-12"><button class="btn btn-primary"
+                        disabled={*busy || strategy_id.is_empty() || control_model_id.is_empty() || currency_mismatch}>
+                        {"保存策略控制"}
+                    </button></div>
                 </div></form>
                 <div class="table-responsive mt-4"><table class="table table-sm"><thead><tr>
                     <th>{"策略"}</th><th>{"模型"}</th><th>{"启用"}</th><th>{"安全倍数"}</th><th>{"佣金比例上限"}</th><th>{"最少交易数"}</th>
                 </tr></thead><tbody>{controls.iter().map(|row| html! { <tr>
                     <td>{text(row, "strategy_name")}</td><td>{text(row, "cost_model_name")}</td>
-                    <td>{text(row, "enabled")}</td><td>{number(row, "minimum_cost_multiple")}</td>
+                    <td>{if boolean(row, "enabled") { "已启用" } else { "已停用" }}</td><td>{number(row, "minimum_cost_multiple")}</td>
                     <td>{number(row, "maximum_commission_to_gross_profit_ratio")}</td>
                     <td>{number(row, "minimum_completed_trades")}</td>
                 </tr> }).collect::<Html>()}</tbody></table></div>
@@ -274,16 +369,40 @@ fn load(
 #[derive(Properties, PartialEq)]
 struct TextFieldProps {
     label: &'static str,
+    help: &'static str,
     value: UseStateHandle<String>,
 }
 #[function_component(TextField)]
 fn text_field(props: &TextFieldProps) -> Html {
-    html! { <div class="col-6 col-lg-3"><label class="form-label">{props.label}</label>
+    html! { <div class="col-6 col-lg-3"><HelpLabel label={props.label} help={props.help} />
     <input class="form-control" value={(*props.value).clone()} oninput={{
         let value = props.value.clone(); Callback::from(move |event: InputEvent| {
             let input: web_sys::HtmlInputElement = event.target_unchecked_into(); value.set(input.value());
         })
     }} /></div> }
+}
+
+#[derive(Properties, PartialEq)]
+struct HelpLabelProps {
+    label: &'static str,
+    help: &'static str,
+}
+
+#[function_component(HelpLabel)]
+fn help_label(props: &HelpLabelProps) -> Html {
+    html! {
+        <label class="form-label d-flex align-items-center gap-1">
+            <span>{props.label}</span>
+            <span
+                class="field-help"
+                tabindex="0"
+                aria-label={format!("{}说明：{}", props.label, props.help)}
+            >
+                {"?"}
+                <span class="field-help-popup" role="tooltip">{props.help}</span>
+            </span>
+        </label>
+    }
 }
 
 #[derive(Properties, PartialEq)]
@@ -299,6 +418,16 @@ fn select_field(props: &SelectFieldProps) -> Html {
         let value = props.value.clone(); Callback::from(move |event: Event| {
             let input: web_sys::HtmlSelectElement = event.target_unchecked_into(); value.set(input.value());
         })
-    }}><option value="">{"请选择"}</option>{props.options.iter().map(|(id, label)|
-        html! { <option value={id.clone()}>{label}</option> }).collect::<Html>()}</select></div> }
+    }}>
+        <option value="" selected={props.value.is_empty()}>{"请选择"}</option>
+        {props.options.iter().map(|(id, label)| html! {
+            <option
+                key={id.clone()}
+                value={id.clone()}
+                selected={id == props.value.as_str()}
+            >
+                {label}
+            </option>
+        }).collect::<Html>()}
+    </select></div> }
 }

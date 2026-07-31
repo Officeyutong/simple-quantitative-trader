@@ -317,6 +317,12 @@ enum StrategyCommand {
     List,
     /// List strategy kinds compiled into this binary.
     Kinds,
+    /// Rename a strategy without changing its stable UUID or history.
+    Rename {
+        strategy_id: uuid::Uuid,
+        #[arg(long)]
+        name: String,
+    },
     /// Start evaluating a strategy.
     Start { strategy_id: uuid::Uuid },
     /// Pause a strategy without losing its cursor.
@@ -356,6 +362,9 @@ enum StrategyExecutionCommand {
         short_target_quantity: f64,
         #[arg(long)]
         allow_short: bool,
+        /// Permit execution outside regular trading hours using limit orders.
+        #[arg(long)]
+        outside_rth: bool,
         #[arg(long)]
         conid: i32,
         #[arg(long)]
@@ -377,6 +386,9 @@ enum StrategyExecutionCommand {
         strategy_id: uuid::Uuid,
         #[arg(long)]
         account: String,
+        /// Permit execution outside regular trading hours using limit orders.
+        #[arg(long)]
+        outside_rth: bool,
         /// JSON array of {contract,buy_target_quantity,sell_target_quantity}.
         #[arg(long)]
         legs_json: String,
@@ -541,6 +553,8 @@ enum CalendarCommand {
     Status {
         #[arg(long)]
         exchange: String,
+        #[arg(long)]
+        outside_rth: bool,
     },
 }
 
@@ -878,6 +892,10 @@ async fn run() -> Result<()> {
                 ),
                 StrategyCommand::List => ("strategy.list", json!({})),
                 StrategyCommand::Kinds => ("strategy.kinds", json!({})),
+                StrategyCommand::Rename { strategy_id, name } => (
+                    "strategy.rename",
+                    json!({"strategy_id": strategy_id, "name": name}),
+                ),
                 StrategyCommand::Start { strategy_id } => {
                     ("strategy.start", json!({"strategy_id": strategy_id}))
                 }
@@ -905,6 +923,7 @@ async fn run() -> Result<()> {
                         target_quantity,
                         short_target_quantity,
                         allow_short,
+                        outside_rth,
                         conid,
                         symbol,
                         security_type,
@@ -920,7 +939,8 @@ async fn run() -> Result<()> {
                             "target_quantity": target_quantity,
                             "short_target_quantity": short_target_quantity,
                             "allow_short": allow_short,
-                            "order_type": "market",
+                            "outside_rth": outside_rth,
+                            "order_type": if outside_rth { "limit" } else { "market" },
                             "paper_only": true,
                             "contract": {
                                 "conid": conid,
@@ -938,14 +958,16 @@ async fn run() -> Result<()> {
                     StrategyExecutionCommand::ConfigurePortfolio {
                         strategy_id,
                         account,
+                        outside_rth,
                         legs_json,
                     } => (
                         "strategy.execution.configure_portfolio",
                         json!({
                             "strategy_id": strategy_id,
                             "account": account,
-                            "order_type": "market",
+                            "order_type": if outside_rth { "limit" } else { "market" },
                             "paper_only": true,
+                            "outside_rth": outside_rth,
                             "legs": serde_json::from_str::<Value>(&legs_json)?
                         }),
                     ),
@@ -1193,9 +1215,13 @@ async fn run() -> Result<()> {
                     "calendar.list",
                     json!({"exchange": exchange, "limit": limit}),
                 ),
-                CalendarCommand::Status { exchange } => {
-                    ("calendar.status", json!({"exchange": exchange}))
-                }
+                CalendarCommand::Status {
+                    exchange,
+                    outside_rth,
+                } => (
+                    "calendar.status",
+                    json!({"exchange": exchange, "outside_rth": outside_rth}),
+                ),
             };
             let value = rpc_call_with_params(&config, method, params).await?;
             print_value(&value, cli.json);
@@ -1368,6 +1394,7 @@ async fn run_daemon(config: Config) -> Result<()> {
         },
     );
     let execution_storage = storage.clone();
+    let execution_ibkr = ibkr.clone();
     let execution_cancellation = cancellation.clone();
     let execution_rpc_address = config.rpc.http_listen;
     let execution_timeout = Duration::from_secs(config.rpc.request_timeout_seconds);
@@ -1428,15 +1455,87 @@ async fn run_daemon(config: Config) -> Result<()> {
                                 ));
                                 break;
                             }
+                            let calendar_exchange =
+                                strategy_calendar_exchange(&leg.contract).to_owned();
+                            let calendar_now = Utc::now();
+                            let refresh_calendar = execution_storage
+                                .lock_safe()
+                                .market_calendar_needs_refresh(
+                                    &calendar_exchange,
+                                    calendar_now,
+                                );
+                            match refresh_calendar {
+                                Ok(true) => {
+                                    match execution_ibkr
+                                        .contract_schedule(leg.contract.clone())
+                                        .await
+                                    {
+                                        Ok(schedule) => {
+                                            match execution_storage
+                                                .lock_safe()
+                                                .replace_ibkr_market_sessions(&schedule)
+                                            {
+                                                Ok(intervals) => tracing::info!(
+                                                    conid = schedule.conid,
+                                                    exchange = %schedule.exchange,
+                                                    intervals,
+                                                    timezone = %schedule.time_zone_id,
+                                                    "refreshed IBKR trading calendar"
+                                                ),
+                                                Err(error) => {
+                                                    preflight_error = Some(format!(
+                                                        "regular-hours order skipped locally: \
+                                                         failed to persist IBKR trading calendar \
+                                                         for {calendar_exchange}: {error}"
+                                                    ));
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        Err(error) => {
+                                            preflight_error = Some(format!(
+                                                "regular-hours order skipped locally: failed to \
+                                                 refresh IBKR trading calendar for \
+                                                 {calendar_exchange}: {error}"
+                                            ));
+                                            break;
+                                        }
+                                    }
+                                }
+                                Ok(false) => {}
+                                Err(error) => {
+                                    preflight_error = Some(format!(
+                                        "regular-hours order skipped locally: failed to inspect \
+                                         trading calendar for {calendar_exchange}: {error}"
+                                    ));
+                                    break;
+                                }
+                            }
                             let session_open = execution_storage
                                 .lock_safe()
-                                .market_session_is_open(&leg.contract.exchange, Utc::now());
-                            if matches!(session_open, Ok(Some(false))) {
-                                preflight_error = Some(format!(
-                                    "configured trading calendar reports {} closed",
-                                    leg.contract.exchange
-                                ));
-                                break;
+                                .market_session_is_open_for(
+                                    &calendar_exchange,
+                                    calendar_now,
+                                    action.outside_rth,
+                                );
+                            match session_open {
+                                Ok(status) => {
+                                    if let Some(detail) = strategy_session_rejection(
+                                        action.outside_rth,
+                                        &calendar_exchange,
+                                        status,
+                                    ) {
+                                        preflight_error = Some(detail);
+                                        break;
+                                    }
+                                }
+                                Err(error) => {
+                                    preflight_error = Some(format!(
+                                        "regular-hours order skipped locally: failed to check \
+                                         trading calendar for {calendar_exchange}: {error}"
+                                    ));
+                                    break;
+                                }
                             }
                             prepared_legs.push((leg.clone(), estimated_price));
                         }
@@ -1574,8 +1673,12 @@ async fn run_daemon(config: Config) -> Result<()> {
                                 "side": leg.side,
                                 "quantity": leg.quantity,
                                 "order_type": action.order_type.clone(),
-                                "limit_price": null,
-                                "outside_rth": false,
+                                "limit_price": if action.order_type == "limit" {
+                                    estimated_price
+                                } else {
+                                    None
+                                },
+                                "outside_rth": action.outside_rth,
                                 "estimated_price": estimated_price
                             });
                             match rpc::call(
@@ -1617,7 +1720,7 @@ async fn run_daemon(config: Config) -> Result<()> {
                                         &error,
                                         crate::error::AppError::DaemonUnavailable { .. }
                                     );
-                                    let state = if uncertain { "failed" } else { "rejected" };
+                                    let state = strategy_submission_error_state(uncertain);
                                     let detail = if uncertain {
                                         format!(
                                             "portfolio leg outcome uncertain: {error}; manual \
@@ -1637,13 +1740,13 @@ async fn run_daemon(config: Config) -> Result<()> {
                                             None,
                                             Some(&detail),
                                         );
-                                    batch_error = Some(detail);
+                                    batch_error = Some((detail, state));
                                     break;
                                 }
                             }
                         }
                         let (state, detail) = match batch_error {
-                            Some(detail) => ("failed", Some(detail)),
+                            Some((detail, state)) => (state, Some(detail)),
                             None => ("submitted", None),
                         };
                         let _ = execution_storage
@@ -1704,6 +1807,22 @@ async fn run_daemon(config: Config) -> Result<()> {
                             if let Ok(facts) = guard.monitoring_facts(Utc::now()) {
                                 let failed_market_data =
                                     facts["failed_market_data"].as_i64().unwrap_or(0);
+                                let competing_live_session_count = facts
+                                    ["competing_live_session_count"]
+                                    .as_u64()
+                                    .unwrap_or(0);
+                                let competing_live_session_conids = facts
+                                    ["competing_live_session_conids"]
+                                    .as_array()
+                                    .map(|items| {
+                                        items
+                                            .iter()
+                                            .filter_map(serde_json::Value::as_i64)
+                                            .map(|conid| conid.to_string())
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    })
+                                    .unwrap_or_default();
                                 let delayed_market_data =
                                     facts["delayed_market_data"].as_i64().unwrap_or(0);
                                 let uncertain_orders =
@@ -1715,6 +1834,17 @@ async fn run_daemon(config: Config) -> Result<()> {
                                     "critical",
                                     &format!("{failed_market_data} market-data subscriptions failed"),
                                     failed_market_data > 0,
+                                );
+                                let _ = guard.upsert_monitoring_alert(
+                                    "market_data_competing_live_session",
+                                    "critical",
+                                    &format!(
+                                        "IBKR error 10197: another live session owns market data \
+                                         for conid(s) {competing_live_session_conids}. Close or \
+                                         disable market data in the competing TWS/IB Gateway \
+                                         session; this daemon will keep retrying automatically."
+                                    ),
+                                    competing_live_session_count > 0,
                                 );
                                 let _ = guard.upsert_monitoring_alert(
                                     "market_data_delayed",
@@ -2029,6 +2159,41 @@ fn strategy_execution_price(quote: &Value, side: &str) -> Option<f64> {
     })
 }
 
+fn strategy_submission_error_state(uncertain: bool) -> &'static str {
+    if uncertain { "failed" } else { "rejected" }
+}
+
+fn strategy_calendar_exchange(contract: &crate::ibkr::ContractCandidate) -> &str {
+    let primary = contract.primary_exchange.trim();
+    if !primary.is_empty() && !primary.eq_ignore_ascii_case("SMART") {
+        primary
+    } else {
+        contract.exchange.trim()
+    }
+}
+
+fn strategy_session_rejection(
+    outside_rth: bool,
+    exchange: &str,
+    session_open: Option<bool>,
+) -> Option<String> {
+    let session_kind = if outside_rth {
+        "IBKR extended-hours"
+    } else {
+        "IBKR regular-hours"
+    };
+    match session_open {
+        Some(true) => None,
+        Some(false) => Some(format!(
+            "order skipped locally: configured {session_kind} calendar reports {exchange} closed"
+        )),
+        None => Some(format!(
+            "order skipped locally: no {session_kind} calendar is configured for {exchange}; \
+             automatic execution fails closed"
+        )),
+    }
+}
+
 fn estimate_round_trip_cost(
     cost: &crate::storage::ClaimedCostControl,
     notional: f64,
@@ -2181,5 +2346,36 @@ mod execution_tests {
         assert!(!position_change_is_risk_reducing(0.0, 10.0));
         assert!(!position_change_is_risk_reducing(4.0, 10.0));
         assert!(!position_change_is_risk_reducing(10.0, -4.0));
+    }
+
+    #[test]
+    fn deterministic_strategy_submission_errors_are_rejected_not_failed() {
+        assert_eq!(strategy_submission_error_state(false), "rejected");
+        assert_eq!(strategy_submission_error_state(true), "failed");
+    }
+
+    #[test]
+    fn automatic_execution_checks_the_primary_exchange_calendar() {
+        let contract = crate::ibkr::ContractCandidate {
+            conid: 272093,
+            symbol: "MSFT".into(),
+            security_type: "STK".into(),
+            currency: "USD".into(),
+            exchange: "SMART".into(),
+            primary_exchange: "NASDAQ".into(),
+            local_symbol: "MSFT".into(),
+            description: String::new(),
+            derivative_security_types: Vec::new(),
+        };
+        assert_eq!(strategy_calendar_exchange(&contract), "NASDAQ");
+
+        let mut routing_only = contract;
+        routing_only.primary_exchange.clear();
+        assert_eq!(strategy_calendar_exchange(&routing_only), "SMART");
+
+        assert!(strategy_session_rejection(false, "NASDAQ", Some(true)).is_none());
+        assert!(strategy_session_rejection(false, "NASDAQ", Some(false)).is_some());
+        assert!(strategy_session_rejection(false, "NASDAQ", None).is_some());
+        assert!(strategy_session_rejection(true, "NASDAQ", None).is_some());
     }
 }

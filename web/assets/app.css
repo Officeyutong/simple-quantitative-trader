@@ -44,6 +44,52 @@ code {
   word-break: break-word;
 }
 
+.field-help {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.1rem;
+  height: 1.1rem;
+  border: 1px solid #6c757d;
+  border-radius: 50%;
+  color: #52606d;
+  font-size: .75rem;
+  font-weight: 700;
+  line-height: 1;
+  cursor: help;
+}
+
+.field-help-popup {
+  position: absolute;
+  z-index: 1080;
+  left: 50%;
+  bottom: calc(100% + .55rem);
+  width: min(22rem, 75vw);
+  padding: .6rem .75rem;
+  border-radius: .4rem;
+  background: #17212b;
+  color: #fff;
+  font-size: .82rem;
+  font-weight: 400;
+  line-height: 1.45;
+  text-align: left;
+  box-shadow: 0 .25rem .75rem rgb(0 0 0 / 20%);
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transform: translate(-50%, .2rem);
+  transition: opacity .12s ease, transform .12s ease;
+}
+
+.field-help:hover .field-help-popup,
+.field-help:focus .field-help-popup,
+.field-help:focus-visible .field-help-popup {
+  opacity: 1;
+  visibility: visible;
+  transform: translate(-50%, 0);
+}
+
 .strategy-id {
   width: 12rem;
   max-width: 12rem;

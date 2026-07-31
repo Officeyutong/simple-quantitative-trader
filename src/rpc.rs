@@ -21,7 +21,7 @@ use quant_rpc_types::{
     MonitoringAcknowledgeParams, MonitoringAlertsParams, PaginationParams, PerformanceReportParams,
     PerformanceSnapshotsParams, SafetyModeParams, SafetyNoteParams, StrategyCreateParams,
     StrategyDeleteParams, StrategyExecutionActionsParams, StrategyExecutionToggleParams,
-    StrategyIdParams, StrategySignalsParams,
+    StrategyIdParams, StrategyRenameParams, StrategySignalsParams,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -632,6 +632,25 @@ async fn dispatch(
             Ok(strategies) => success(request.id, json!({"strategies": strategies})),
             Err(error) => failure(request.id, -32030, &error.to_string()),
         },
+        "strategy.rename" => {
+            let params = match serde_json::from_value::<StrategyRenameParams>(request.params) {
+                Ok(params) => params,
+                Err(error) => {
+                    return failure(request.id, -32602, &format!("invalid parameters: {error}"));
+                }
+            };
+            match storage
+                .lock_safe()
+                .rename_strategy(params.strategy_id, &params.name)
+            {
+                Ok(true) => success(
+                    request.id,
+                    json!({"strategy_id": params.strategy_id, "name": params.name.trim()}),
+                ),
+                Ok(false) => failure(request.id, -32044, "strategy not found"),
+                Err(error) => failure(request.id, -32030, &error.to_string()),
+            }
+        }
         "strategy.start" | "strategy.pause" | "strategy.stop" => {
             let params = match serde_json::from_value::<StrategyIdParams>(request.params) {
                 Ok(params) => params,
@@ -944,6 +963,38 @@ async fn dispatch(
                 Err(error) => failure(request.id, -32030, &error.to_string()),
             }
         }
+        "calendar.refresh" => {
+            #[derive(serde::Deserialize)]
+            struct Params {
+                contract: crate::ibkr::ContractCandidate,
+            }
+            let params = match serde_json::from_value::<Params>(request.params) {
+                Ok(params) if params.contract.conid > 0 => params,
+                Ok(_) => return failure(request.id, -32602, "contract conid must be positive"),
+                Err(error) => {
+                    return failure(request.id, -32602, &format!("invalid parameters: {error}"));
+                }
+            };
+            match ibkr.contract_schedule(params.contract).await {
+                Ok(schedule) => match storage.lock_safe().replace_ibkr_market_sessions(&schedule) {
+                    Ok(intervals) => success(
+                        request.id,
+                        json!({
+                            "updated": true,
+                            "conid": schedule.conid,
+                            "exchange": schedule.exchange,
+                            "time_zone_id": schedule.time_zone_id,
+                            "regular_intervals": schedule.regular_sessions.len(),
+                            "extended_intervals": schedule.extended_sessions.len(),
+                            "intervals": intervals,
+                            "fetched_at": schedule.fetched_at
+                        }),
+                    ),
+                    Err(error) => failure(request.id, -32030, &error.to_string()),
+                },
+                Err(error) => failure(request.id, -32024, &error),
+            }
+        }
         "calendar.list" => {
             let params = match serde_json::from_value::<CalendarListParams>(request.params) {
                 Ok(params) if params.limit > 0 => params,
@@ -967,13 +1018,19 @@ async fn dispatch(
                     return failure(request.id, -32602, &format!("invalid parameters: {error}"));
                 }
             };
-            match storage
-                .lock_safe()
-                .market_session_is_open(&params.exchange, Utc::now())
-            {
+            match storage.lock_safe().market_session_is_open_for(
+                &params.exchange,
+                Utc::now(),
+                params.outside_rth,
+            ) {
                 Ok(open) => success(
                     request.id,
-                    json!({"exchange": params.exchange, "open": open, "configured": open.is_some()}),
+                    json!({
+                        "exchange": params.exchange,
+                        "session_kind": if params.outside_rth { "extended" } else { "regular" },
+                        "open": open,
+                        "configured": open.is_some()
+                    }),
                 ),
                 Err(error) => failure(request.id, -32030, &error.to_string()),
             }

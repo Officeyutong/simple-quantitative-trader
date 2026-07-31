@@ -9,8 +9,8 @@ use yew_bootstrap::{
 use crate::api::{DashboardData, call_method, load_dashboard, load_rpc_endpoint};
 
 use super::{
-    MutationRequest, backtest_page::BacktestPage, dashboard_page::DashboardPage,
-    error_modal::ErrorModal, execution_cost_page::ExecutionCostPage,
+    MutationRequest, backtest_page::BacktestPage, calendar_page::CalendarPage,
+    dashboard_page::DashboardPage, error_modal::ErrorModal, execution_cost_page::ExecutionCostPage,
     instruments_page::InstrumentsPage, logs_page::LogsPage,
     moving_average_wizard_page::MovingAverageWizardPage, nav_button::NavButton,
     operations_page::OperationsPage, orders_page::OrdersPage,
@@ -30,6 +30,7 @@ pub enum Page {
     Performance,
     Backtest,
     ExecutionCosts,
+    Calendar,
     MovingAverageWizard,
     PaperValidation,
     Orders,
@@ -113,13 +114,13 @@ pub fn app() -> Html {
         .and_then(|data| data.alerts.get("alerts"))
         .and_then(|value| value.as_array())
         .map_or(0, Vec::len);
-    let displayed_error = (*modal_error).clone().or_else(|| match &*state {
-        LoadState::Error(error) => Some(format!(
-            "无法连接 daemon：{error}\n当前 RPC 地址：{}",
-            *rpc_endpoint
-        )),
+    // Connection failures must not use the blocking modal: a first-time user
+    // with a wrong default endpoint still needs to reach RPC Settings.
+    let displayed_error = (*modal_error).clone();
+    let connection_error = match &*state {
+        LoadState::Error(error) => Some(error.clone()),
         _ => None,
-    });
+    };
 
     html! {
         <>
@@ -154,6 +155,7 @@ pub fn app() -> Html {
                     <NavButton label="策略绩效" target={Page::Performance} page={page.clone()} />
                     <NavButton label="回测" target={Page::Backtest} page={page.clone()} />
                     <NavButton label="交易成本" target={Page::ExecutionCosts} page={page.clone()} />
+                    <NavButton label="交易日历" target={Page::Calendar} page={page.clone()} />
                     <NavButton label="均线策略向导" target={Page::MovingAverageWizard} page={page.clone()} />
                     <NavButton label="Paper 验证" target={Page::PaperValidation} page={page.clone()} />
                     <NavButton label="订单与成交" target={Page::Orders} page={page.clone()} />
@@ -194,6 +196,24 @@ pub fn app() -> Html {
                             }
                         </Button>
                     </div>
+                    {connection_error.map(|error| html! {
+                        <div class="alert alert-danger d-flex flex-wrap justify-content-between align-items-center gap-3" role="alert">
+                            <div>
+                                <div class="fw-semibold">{"无法连接 daemon"}</div>
+                                <div>{error}</div>
+                                <div class="small mt-1">
+                                    {"当前 RPC 地址："}
+                                    <code>{(*rpc_endpoint).clone()}</code>
+                                </div>
+                            </div>
+                            <button class="btn btn-light border text-nowrap" onclick={{
+                                let page = page.clone();
+                                Callback::from(move |_| page.set(Page::Settings))
+                            }}>
+                                {"配置 RPC 地址"}
+                            </button>
+                        </div>
+                    }).unwrap_or_default()}
                     {render_page(*page, &state, rpc_endpoint.clone(), on_mutation, on_refresh)}
                 </main>
             </div></div>
@@ -217,6 +237,7 @@ fn page_title(page: Page) -> &'static str {
         Page::Performance => "策略绩效",
         Page::Backtest => "策略回测",
         Page::ExecutionCosts => "交易成本",
+        Page::Calendar => "交易日历",
         Page::MovingAverageWizard => "均线策略向导",
         Page::PaperValidation => "Paper 策略验证",
         Page::Orders => "订单与成交",
@@ -256,7 +277,11 @@ fn render_page(
                 <StrategiesPage endpoint={(*endpoint).clone()} data={data.clone()} on_mutation={on_mutation} />
             },
             Page::StrategyStatus => html! {
-                <StrategyStatusPage endpoint={(*endpoint).clone()} strategies={data.strategies.clone()} />
+                <StrategyStatusPage
+                    endpoint={(*endpoint).clone()}
+                    strategies={data.strategies.clone()}
+                    execution_configs={data.execution_configs.clone()}
+                />
             },
             Page::Performance => html! {
                 <PerformancePage
@@ -274,6 +299,12 @@ fn render_page(
                 <ExecutionCostPage
                     endpoint={(*endpoint).clone()}
                     strategies={data.strategies.clone()}
+                />
+            },
+            Page::Calendar => html! {
+                <CalendarPage
+                    endpoint={(*endpoint).clone()}
+                    execution_configs={data.execution_configs.clone()}
                 />
             },
             Page::MovingAverageWizard => {

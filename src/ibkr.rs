@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::{sync::Arc, time::Duration};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use futures::StreamExt;
 use ibapi::Client;
 use ibapi::{
@@ -77,6 +77,10 @@ enum Command {
     SearchContracts {
         pattern: String,
         response: oneshot::Sender<CommandResult<Vec<ContractCandidate>>>,
+    },
+    ContractSchedule {
+        contract: ContractCandidate,
+        response: oneshot::Sender<CommandResult<ContractSchedule>>,
     },
     HistoricalBars {
         request: HistoricalBarsRequest,
@@ -227,6 +231,23 @@ pub struct ContractCandidate {
     pub derivative_security_types: Vec<String>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct ContractSchedule {
+    pub conid: i32,
+    pub exchange: String,
+    pub time_zone_id: String,
+    pub regular_sessions: Vec<ContractSession>,
+    pub extended_sessions: Vec<ContractSession>,
+    pub fetched_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ContractSession {
+    pub trading_date: NaiveDate,
+    pub opens_at: DateTime<Utc>,
+    pub closes_at: DateTime<Utc>,
+}
+
 impl ContractCandidate {
     pub fn normalize_streaming_subscription(&mut self) {
         self.symbol = self.symbol.trim().to_string();
@@ -355,6 +376,20 @@ impl Handle {
         let (response, receiver) = oneshot::channel();
         self.commands
             .send(Command::SearchContracts { pattern, response })
+            .await
+            .map_err(|_| "IBKR actor is not running".to_string())?;
+        receiver
+            .await
+            .map_err(|_| "IBKR actor stopped before responding".to_string())?
+    }
+
+    pub async fn contract_schedule(
+        &self,
+        contract: ContractCandidate,
+    ) -> CommandResult<ContractSchedule> {
+        let (response, receiver) = oneshot::channel();
+        self.commands
+            .send(Command::ContractSchedule { contract, response })
             .await
             .map_err(|_| "IBKR actor is not running".to_string())?;
         receiver
@@ -576,6 +611,27 @@ impl Actor {
                 };
                 let _ = response.send(result);
             }
+            Command::ContractSchedule { contract, response } => {
+                let result = match self.ready_client() {
+                    Ok(client) => {
+                        let requested_conid = contract.conid;
+                        match client.contract_details(&candidate_contract(&contract)).await {
+                            Ok(details) => details
+                                .into_iter()
+                                .find(|detail| detail.contract.contract_id == requested_conid)
+                                .ok_or_else(|| {
+                                    format!(
+                                        "IBKR returned no contract details for conid {requested_conid}"
+                                    )
+                                })
+                                .and_then(|details| contract_schedule(&details)),
+                            Err(error) => Err(error.to_string()),
+                        }
+                    }
+                    Err(error) => Err(error),
+                };
+                let _ = response.send(result);
+            }
             Command::HistoricalBars { request, response } => {
                 let result = self.fetch_historical_bars(request).await;
                 let _ = response.send(result);
@@ -778,7 +834,17 @@ impl Actor {
                 });
                 Ok(order_id)
             }
-            Ok(Some(Err(error))) => Err(error.to_string()),
+            Ok(Some(Err(error))) => {
+                let detail = error.to_string();
+                if order_error_may_leave_order_active(&detail) {
+                    Err(format!(
+                        "{UNKNOWN_OUTCOME_PREFIX}{detail}; IBKR may be holding the order for the \
+                         next regular trading session"
+                    ))
+                } else {
+                    Err(detail)
+                }
+            }
             // The order was already transmitted; without an acknowledgement its
             // true state is unknown and must be resolved by reconciliation, not
             // by treating it as rejected.
@@ -1061,6 +1127,11 @@ impl Actor {
     }
 }
 
+fn order_error_may_leave_order_active(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    detail.contains("[399]") && detail.contains("will not be placed at the exchange until")
+}
+
 fn spawn_position_subscription(
     client: Arc<Client>,
     events: mpsc::Sender<BrokerEvent>,
@@ -1217,8 +1288,8 @@ fn spawn_market_data_subscription(
 ) {
     tokio::spawn(async move {
         let ib_contract = candidate_contract(&contract);
+        let _ = send_market_status(&events, contract.conid, "subscribing", None).await;
         'retry: loop {
-            let _ = send_market_status(&events, contract.conid, "subscribing", None).await;
             let mut subscription = match client
                 .market_data(&ib_contract)
                 .streaming()
@@ -1231,7 +1302,7 @@ fn spawn_market_data_subscription(
                     if !send_market_status(
                         &events,
                         contract.conid,
-                        "failed",
+                        "retrying",
                         Some(error.to_string()),
                     )
                     .await
@@ -1246,9 +1317,30 @@ fn spawn_market_data_subscription(
             };
             let _ = send_market_status(&events, contract.conid, "awaiting_data", None).await;
             let mut received_data = false;
+            let initial_data_timeout = tokio::time::sleep(Duration::from_secs(30));
+            tokio::pin!(initial_data_timeout);
             loop {
                 tokio::select! {
                     _ = cancellation.cancelled() => break 'retry,
+                    _ = &mut initial_data_timeout, if !received_data => {
+                        let detail = "IBKR market-data subscription produced no initial data \
+                                      within 30 seconds; retrying the subscription";
+                        tracing::warn!(
+                            conid = contract.conid,
+                            "IBKR market-data subscription timed out awaiting initial data"
+                        );
+                        if !send_market_status(
+                            &events,
+                            contract.conid,
+                            "retrying",
+                            Some(detail.into()),
+                        )
+                        .await
+                        {
+                            break 'retry;
+                        }
+                        break;
+                    }
                     item = subscription.next() => match item {
                     Some(Ok(SubscriptionItem::Data(tick))) => {
                         let observed_at = Utc::now();
@@ -1307,7 +1399,7 @@ fn spawn_market_data_subscription(
                         Some(Err(error)) => {
                             tracing::error!(%error, conid = contract.conid, "IBKR market-data subscription failed");
                             if !send_market_status(
-                                &events, contract.conid, "failed", Some(error.to_string())
+                                &events, contract.conid, "retrying", Some(error.to_string())
                             ).await {
                                 break 'retry;
                             }
@@ -1315,7 +1407,7 @@ fn spawn_market_data_subscription(
                         }
                         None => {
                             let _ = send_market_status(
-                                &events, contract.conid, "failed",
+                                &events, contract.conid, "retrying",
                                 Some("IBKR closed the market-data stream".into())
                             ).await;
                             break;
@@ -1397,6 +1489,119 @@ fn contract_candidate(contract: Contract) -> ContractCandidate {
         description: contract.description,
         derivative_security_types: Vec::new(),
     }
+}
+
+fn contract_schedule(
+    details: &ibapi::contracts::ContractDetails,
+) -> CommandResult<ContractSchedule> {
+    let exchange = {
+        let primary = details.contract.primary_exchange.to_string();
+        if primary.trim().is_empty() || primary.eq_ignore_ascii_case("SMART") {
+            details.contract.exchange.to_string()
+        } else {
+            primary
+        }
+    };
+    let regular_sessions = parse_contract_sessions(&details.liquid_hours, &details.time_zone_id)?;
+    if regular_sessions.is_empty() {
+        return Err(format!(
+            "IBKR returned no regular trading sessions for conid {} ({exchange})",
+            details.contract.contract_id
+        ));
+    }
+    Ok(ContractSchedule {
+        conid: details.contract.contract_id,
+        exchange: exchange.trim().to_ascii_uppercase(),
+        time_zone_id: details.time_zone_id.clone(),
+        regular_sessions,
+        extended_sessions: parse_contract_sessions(&details.trading_hours, &details.time_zone_id)?,
+        fetched_at: Utc::now(),
+    })
+}
+
+fn parse_contract_sessions(
+    values: &[String],
+    time_zone_id: &str,
+) -> CommandResult<Vec<ContractSession>> {
+    let timezone = ibkr_timezone(time_zone_id)?;
+    let mut sessions = Vec::new();
+    for entry in values.iter().flat_map(|value| value.split(';')) {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let (trading_date, hours) = entry
+            .split_once(':')
+            .ok_or_else(|| format!("invalid IBKR trading-hours entry: {entry}"))?;
+        let trading_date = NaiveDate::parse_from_str(trading_date, "%Y%m%d")
+            .map_err(|error| format!("invalid IBKR trading date {trading_date}: {error}"))?;
+        if hours.eq_ignore_ascii_case("CLOSED") {
+            continue;
+        }
+        for interval in hours.split(',') {
+            let (open, close) = interval
+                .split_once('-')
+                .ok_or_else(|| format!("invalid IBKR trading-hours interval: {interval}"))?;
+            let opens_at = parse_ibkr_local_datetime(open, trading_date, timezone, true)?;
+            let closes_at = parse_ibkr_local_datetime(close, trading_date, timezone, false)?;
+            if opens_at >= closes_at {
+                return Err(format!(
+                    "IBKR trading-hours interval does not increase: {interval}"
+                ));
+            }
+            sessions.push(ContractSession {
+                trading_date,
+                opens_at,
+                closes_at,
+            });
+        }
+    }
+    sessions.sort_by_key(|session| session.opens_at);
+    sessions.dedup();
+    Ok(sessions)
+}
+
+fn parse_ibkr_local_datetime(
+    value: &str,
+    default_date: NaiveDate,
+    timezone: chrono_tz::Tz,
+    opening: bool,
+) -> CommandResult<DateTime<Utc>> {
+    let value = value.trim();
+    let naive = if value.len() == 4 {
+        NaiveDateTime::parse_from_str(
+            &format!("{} {value}", default_date.format("%Y%m%d")),
+            "%Y%m%d %H%M",
+        )
+    } else {
+        NaiveDateTime::parse_from_str(value, "%Y%m%d:%H%M")
+    }
+    .map_err(|error| format!("invalid IBKR local session time {value}: {error}"))?;
+    let localized = timezone.from_local_datetime(&naive);
+    let datetime = if opening {
+        localized.earliest()
+    } else {
+        localized.latest()
+    }
+    .ok_or_else(|| format!("IBKR session time {value} does not exist in timezone {timezone}"))?;
+    Ok(datetime.with_timezone(&Utc))
+}
+
+fn ibkr_timezone(value: &str) -> CommandResult<chrono_tz::Tz> {
+    let canonical = match value.trim() {
+        "US/Eastern" | "EST" | "EST5EDT" => "America/New_York",
+        "US/Central" | "CST" | "CST6CDT" => "America/Chicago",
+        "US/Mountain" | "MST" | "MST7MDT" => "America/Denver",
+        "US/Pacific" | "PST" | "PST8PDT" => "America/Los_Angeles",
+        "MET" | "CET" => "Europe/Paris",
+        "GB-Eire" | "GMT" => "Europe/London",
+        "Hongkong" => "Asia/Hong_Kong",
+        "Japan" => "Asia/Tokyo",
+        other => other,
+    };
+    canonical
+        .parse()
+        .map_err(|_| format!("unsupported IBKR contract timezone: {value}"))
 }
 
 fn normalize_search_candidate(candidate: &mut ContractCandidate) {
@@ -1632,6 +1837,56 @@ mod tests {
             candidate.validate_streaming_subscription().unwrap_err(),
             "market-data contract requires an exchange; use SMART for STK routing"
         );
+    }
+
+    #[test]
+    fn ibkr_regular_sessions_are_converted_to_utc_and_keep_split_intervals() {
+        let sessions = parse_contract_sessions(
+            &[
+                "20260731:0900-20260731:1200,20260731:1300-20260731:1730".into(),
+                "20260801:CLOSED".into(),
+            ],
+            "MET",
+        )
+        .unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(
+            sessions[0].opens_at,
+            "2026-07-31T07:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
+        assert_eq!(
+            sessions[0].closes_at,
+            "2026-07-31T10:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
+        assert_eq!(
+            sessions[1].opens_at,
+            "2026-07-31T11:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
+    }
+
+    #[test]
+    fn ibkr_legacy_session_format_uses_the_trading_date() {
+        let sessions =
+            parse_contract_sessions(&["20260115:0930-1600".into()], "US/Eastern").unwrap();
+        assert_eq!(
+            sessions[0].opens_at,
+            "2026-01-15T14:30:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
+        assert_eq!(
+            sessions[0].closes_at,
+            "2026-01-15T21:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
+    }
+
+    #[test]
+    fn deferred_until_open_warning_has_an_uncertain_order_outcome() {
+        assert!(order_error_may_leave_order_active(
+            "[399] Order Message: BUY 10 MSFT Warning: your order will not be placed at the \
+             exchange until 2026-07-30 09:30:00 US/Eastern"
+        ));
+        assert!(!order_error_may_leave_order_active(
+            "[201] Order rejected - reason: insufficient buying power"
+        ));
     }
 
     #[tokio::test]

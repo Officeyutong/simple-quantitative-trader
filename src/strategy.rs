@@ -107,14 +107,14 @@ impl Strategy for MovingAverageCross {
                 bars.len()
             ));
         }
-        let closes: Vec<f64> = bars.iter().map(|bar| bar.close).collect();
-        let average = |slice: &[f64]| slice.iter().sum::<f64>() / slice.len() as f64;
-        let current_short = average(&closes[closes.len() - self.config.short_window..]);
-        let current_long = average(&closes[closes.len() - self.config.long_window..]);
-        let previous_short =
-            average(&closes[closes.len() - self.config.short_window - 1..closes.len() - 1]);
-        let previous_long =
-            average(&closes[closes.len() - self.config.long_window - 1..closes.len() - 1]);
+        let average = |start: usize, end: usize| {
+            bars[start..end].iter().map(|bar| bar.close).sum::<f64>() / (end - start) as f64
+        };
+        let end = bars.len();
+        let current_short = average(end - self.config.short_window, end);
+        let current_long = average(end - self.config.long_window, end);
+        let previous_short = average(end - self.config.short_window - 1, end - 1);
+        let previous_long = average(end - self.config.long_window - 1, end - 1);
         let signal = if previous_short <= previous_long && current_short > current_long {
             StrategySignal::Buy
         } else if previous_short >= previous_long && current_short < current_long {

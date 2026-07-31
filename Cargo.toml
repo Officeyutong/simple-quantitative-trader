@@ -11,6 +11,7 @@ edition = "2024"
 anyhow = "1"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
 clap = { version = "4", features = ["derive", "env"] }
 duckdb = { version = "1", features = ["bundled", "chrono", "uuid"] }
 fs2 = "0.4"

@@ -18,6 +18,7 @@ use super::{
 pub struct StrategyStatusPageProps {
     pub endpoint: String,
     pub strategies: Value,
+    pub execution_configs: Value,
 }
 
 #[function_component(StrategyStatusPage)]
@@ -33,6 +34,8 @@ pub fn strategy_status_page(props: &StrategyStatusPageProps) -> Html {
     let bars = use_state(Vec::<Value>::new);
     let cost_controls = use_state(Vec::<Value>::new);
     let cost_models = use_state(Vec::<Value>::new);
+    let calendar_sessions = use_state(Vec::<Value>::new);
+    let calendar_status = use_state(|| None::<Value>);
     let error = use_state(|| None::<String>);
     let busy = use_state(|| false);
 
@@ -58,6 +61,9 @@ pub fn strategy_status_page(props: &StrategyStatusPageProps) -> Html {
         let bars = bars.clone();
         let cost_controls = cost_controls.clone();
         let cost_models = cost_models.clone();
+        let execution_configs = array(&props.execution_configs, "configs");
+        let calendar_sessions = calendar_sessions.clone();
+        let calendar_status = calendar_status.clone();
         let error = error.clone();
         let busy = busy.clone();
         let current_selection = selected_id.clone();
@@ -70,6 +76,9 @@ pub fn strategy_status_page(props: &StrategyStatusPageProps) -> Html {
                 bars.clone(),
                 cost_controls.clone(),
                 cost_models.clone(),
+                execution_configs.clone(),
+                calendar_sessions.clone(),
+                calendar_status.clone(),
                 error.clone(),
                 busy.clone(),
                 current_selection.clone(),
@@ -83,6 +92,9 @@ pub fn strategy_status_page(props: &StrategyStatusPageProps) -> Html {
                     bars.clone(),
                     cost_controls.clone(),
                     cost_models.clone(),
+                    execution_configs.clone(),
+                    calendar_sessions.clone(),
+                    calendar_status.clone(),
                     error.clone(),
                     busy.clone(),
                     current_selection.clone(),
@@ -113,6 +125,13 @@ pub fn strategy_status_page(props: &StrategyStatusPageProps) -> Html {
             .iter()
             .find(|model| text(model, "cost_model_id") == cost_model_id)
     });
+    let execution_configs = array(&props.execution_configs, "configs");
+    let execution_config = execution_configs
+        .iter()
+        .find(|config| text(config, "strategy_id") == *selected_id);
+    let execution_contract =
+        execution_config.and_then(|config| config.get("contract").filter(|value| !value.is_null()));
+    let outside_rth = execution_config.is_some_and(|config| boolean(config, "outside_rth"));
     let progress = if required_bars == 0 {
         0
     } else {
@@ -133,17 +152,28 @@ pub fn strategy_status_page(props: &StrategyStatusPageProps) -> Html {
                             let selected_id = selected_id.clone();
                             let evaluations = evaluations.clone();
                             let bars = bars.clone();
+                            let calendar_sessions = calendar_sessions.clone();
+                            let calendar_status = calendar_status.clone();
                             Callback::from(move |event: Event| {
                                 let input: web_sys::HtmlSelectElement = event.target_unchecked_into();
                                 evaluations.set(Vec::new());
                                 bars.set(Vec::new());
+                                calendar_sessions.set(Vec::new());
+                                calendar_status.set(None);
                                 selected_id.set(input.value());
                             })
                         }}>
-                            {strategies.iter().map(|strategy| html! {
-                                <option value={text(strategy, "strategy_id")}>
-                                    {format!("{} · {}", text(strategy, "name"), text(strategy, "strategy_id"))}
-                                </option>
+                            {strategies.iter().map(|strategy| {
+                                let id = text(strategy, "strategy_id");
+                                html! {
+                                    <option
+                                        key={id.clone()}
+                                        value={id.clone()}
+                                        selected={id == *selected_id}
+                                    >
+                                        {text(strategy, "name")}
+                                    </option>
+                                }
                             }).collect::<Html>()}
                         </select>
                     </div>
@@ -180,6 +210,79 @@ pub fn strategy_status_page(props: &StrategyStatusPageProps) -> Html {
                                 }).unwrap_or_default()
                             }
                         </div>
+                    </div></section>
+                    <section class="card shadow-sm mb-4"><div class="card-body">
+                        <h2 class="h5">{"交易时间"}</h2>
+                        {execution_config.map(|config| {
+                            let status = (*calendar_status).clone();
+                            let configured = status.as_ref()
+                                .and_then(|value| value.get("configured"))
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false);
+                            let open = status.as_ref()
+                                .and_then(|value| value.get("open"))
+                                .and_then(Value::as_bool);
+                            let current_state = match (configured, open) {
+                                (true, Some(true)) => "当前可交易",
+                                (true, Some(false)) => "当前休市",
+                                _ => "日历尚未配置",
+                            };
+                            let source = calendar_sessions.first()
+                                .map(|session| text(session, "source"))
+                                .unwrap_or_else(|| "—".into());
+                            html! {
+                                <>
+                                    <div class="row g-3 mb-3">
+                                        <Status label="执行证券" value={execution_contract.map(official_security_name).unwrap_or_else(|| "—".into())} />
+                                        <Status label="交易所日历" value={execution_contract.map(security_exchange).unwrap_or_else(|| "—".into())} />
+                                        <Status label="检查的交易时段" value={if outside_rth { "扩展交易时段（tradingHours）" } else { "正常交易时段（liquidHours）" }} />
+                                        <Status label="当前状态" value={current_state} />
+                                        <Status label="盘前盘后" value={if outside_rth { "允许" } else { "不允许" }} />
+                                        <Status label="订单类型" value={text(config, "order_type")} />
+                                        <Status label="日历来源/时区" value={source} />
+                                        <Status label="缓存区间数" value={calendar_sessions.len().to_string()} />
+                                    </div>
+                                    {
+                                        if calendar_sessions.is_empty() {
+                                            html! {
+                                                <div class="alert alert-warning mb-0">
+                                                    {"当前没有该交易所对应类型的缓存时段。自动执行会在下单前尝试从 IBKR 更新；无法确认交易时间时会拒绝订单。"}
+                                                </div>
+                                            }
+                                        } else {
+                                            html! {
+                                                <div class="table-responsive">
+                                                    <table class="table table-sm table-hover align-middle mb-0">
+                                                        <thead><tr>
+                                                            <th>{"交易日期"}</th>
+                                                            <th>{"类型"}</th>
+                                                            <th>{"开市（本地）"}</th>
+                                                            <th>{"收市（本地）"}</th>
+                                                            <th>{"更新时间（本地）"}</th>
+                                                        </tr></thead>
+                                                        <tbody>
+                                                            {calendar_sessions.iter().take(10).map(|session| html! {
+                                                                <tr>
+                                                                    <td>{text(session, "trading_date")}</td>
+                                                                    <td>{if text(session, "session_kind") == "extended" { "扩展" } else { "正常" }}</td>
+                                                                    <td class="text-nowrap">{local_time(session, "opens_at")}</td>
+                                                                    <td class="text-nowrap">{local_time(session, "closes_at")}</td>
+                                                                    <td class="text-nowrap">{local_time(session, "updated_at")}</td>
+                                                                </tr>
+                                                            }).collect::<Html>()}
+                                                        </tbody>
+                                                    </table>
+                                                </div>
+                                            }
+                                        }
+                                    }
+                                </>
+                            }
+                        }).unwrap_or_else(|| html! {
+                            <div class="alert alert-secondary mb-0">
+                                {"该策略尚未配置自动执行，因此没有可关联的交易所日历和交易时间。"}
+                            </div>
+                        })}
                     </div></section>
                     <section class="card shadow-sm mb-4"><div class="card-body">
                         <h2 class="h5">{"成本控制"}</h2>
@@ -282,6 +385,9 @@ fn refresh_status(
     bars: UseStateHandle<Vec<Value>>,
     cost_controls: UseStateHandle<Vec<Value>>,
     cost_models: UseStateHandle<Vec<Value>>,
+    execution_configs: Vec<Value>,
+    calendar_sessions: UseStateHandle<Vec<Value>>,
+    calendar_status: UseStateHandle<Option<Value>>,
     error: UseStateHandle<Option<String>>,
     busy: UseStateHandle<bool>,
     current_selection: UseStateHandle<String>,
@@ -306,6 +412,14 @@ fn refresh_status(
         .map(strategy_required_bars)
         .unwrap_or(100)
         .max(200);
+    let execution_config = execution_configs
+        .iter()
+        .find(|config| text(config, "strategy_id") == strategy_id);
+    let calendar_exchange = execution_config
+        .and_then(|config| config.get("contract"))
+        .map(security_exchange)
+        .filter(|exchange| exchange != "—");
+    let outside_rth = execution_config.is_some_and(|config| boolean(config, "outside_rth"));
     busy.set(true);
     spawn_local(async move {
         let requested_strategy_id = strategy_id.clone();
@@ -335,6 +449,43 @@ fn refresh_status(
             }
             Ok(_) => return,
             Err(message) => error.set(Some(message)),
+        }
+        if let Some(exchange) = calendar_exchange {
+            match call_method(
+                &endpoint,
+                "calendar.status",
+                json!({"exchange": exchange, "outside_rth": outside_rth}),
+            )
+            .await
+            {
+                Ok(value) if *current_selection == requested_strategy_id => {
+                    calendar_status.set(Some(value))
+                }
+                Ok(_) => return,
+                Err(message) => error.set(Some(message)),
+            }
+            match call_method(
+                &endpoint,
+                "calendar.list",
+                json!({"exchange": exchange, "limit": 100}),
+            )
+            .await
+            {
+                Ok(value) if *current_selection == requested_strategy_id => {
+                    let expected_kind = if outside_rth { "extended" } else { "regular" };
+                    calendar_sessions.set(
+                        array(&value, "sessions")
+                            .into_iter()
+                            .filter(|session| text(session, "session_kind") == expected_kind)
+                            .collect(),
+                    );
+                }
+                Ok(_) => return,
+                Err(message) => error.set(Some(message)),
+            }
+        } else if *current_selection == requested_strategy_id {
+            calendar_status.set(None);
+            calendar_sessions.set(Vec::new());
         }
         if conid > 0 {
             match call_method(

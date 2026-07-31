@@ -440,7 +440,16 @@ quant strategy execution actions --limit 100
 quant strategy execution disable <STRATEGY_ID>
 ```
 
-自动执行当前只提交市价单，`outside_rth = false`。启用要求：
+自动执行默认提交市价单且 `outside_rth = false`。执行配置开启盘前盘后后，订单改用
+限价单并设置 `outside_rth = true`；买入限价取最新 Ask，卖出限价取最新 Bid。
+下单前会从 IBKR `ContractDetails` 自动维护交易日历：正常订单检查 `liquidHours`，
+盘前盘后订单检查 `tradingHours`。时段按 IBKR 的 `timeZoneId` 处理夏令时并转换为
+UTC，缓存每 6 小时按需刷新，同一交易日的分段交易会分别保存。日历无法获取或当前
+交易所不在相应时段时，自动执行保持关闭并记录具体原因。
+策略信号计算与自动执行开关相互独立。执行配置关闭期间仍会保存 `buy`/`sell` 信号，
+但系统会同时写入一条 `skipped` action，成本门控结果标记为
+`execution_disabled`，明确说明该信号没有进入下单流程；重新启用后不会补交历史信号。
+扩展时段流动性不足时订单可能不会立即成交。启用要求：
 
 - 运行环境为 `paper`；
 - `[risk].trading_enabled = true`；

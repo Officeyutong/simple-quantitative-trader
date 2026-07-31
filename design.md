@@ -14,12 +14,13 @@ loopback，但监听并非硬编码，外部监听需要额外的 TLS、认证�
 `moving_average_cross_5s`、`moving_average_cross_v2`、`close_threshold` 和
 `paper_round_trip`。实时与回测共享同步、确定性的 `Strategy::evaluate` 核心；
 自动执行仅限 paper，采用目标仓位语义，可配置空头和多腿，但当前策略订单只使用
-市价单且不允许盘前盘后。
+常规时段市价单；启用盘前盘后后改用最新 Bid/Ask 定价的限价单。
 
 DuckDB 当前由进程内互斥保护的 `Storage` 统一访问，而不是下文概念图中的独立
-Storage Writer actor。数据库最新 schema 为 23：除账户、行情、策略、订单、成交、
+Storage Writer actor。数据库最新 schema 为 25：除账户、行情、策略、订单、成交、
 风控和绩效数据外，还包含 5 秒 Bar、订单剩余数量/最近成交价/`why_held`/
-market-cap price，以及 `broker_order_events` 状态事件审计。
+market-cap price、`broker_order_events` 状态事件审计，以及支持正常/扩展和单日多
+区间的 IBKR 交易日历缓存。
 
 当前回测是多头、下一根 Bar 开盘撮合，佣金参数是每笔固定金额；它不会自动计算
 不同市场的阶梯佣金、最低收费、税费或平台费。实时绩效则使用 IBKR 实际
@@ -808,6 +809,8 @@ RPC 超时只表示客户端没有及时收到响应，不等于订单失败。�
 - 价格偏离最新可信行情的最大比例；
 - 行情陈旧检查；
 - 只允许配置的交易时段，是否允许盘前盘后；
+- 交易时段来自 IBKR `ContractDetails`：正常时段使用 `liquidHours`，扩展时段使用
+  `tradingHours`，按 `timeZoneId` 转换 UTC 并缓存；缺失或过期且刷新失败时拒绝下单；
 - 重复订单/idempotency 检查；
 - IBKR 未就绪、账户数据陈旧或对账未完成时禁止开仓；
 - 可配置只允许平仓模式。

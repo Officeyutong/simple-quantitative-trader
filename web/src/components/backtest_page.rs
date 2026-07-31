@@ -240,10 +240,17 @@ pub fn backtest_page(props: &BacktestPageProps) -> Html {
                                 }}>
                                 {strategies.iter().map(|strategy| {
                                     let id = text(strategy, "strategy_id");
-                                    html! { <option value={id.clone()}>{format!("{} · {} · {}", text(strategy, "name"), text(strategy, "kind"), id)}</option> }
+                                    html! {
+                                        <option
+                                            key={id.clone()}
+                                            value={id.clone()}
+                                            selected={id == *strategy_id}
+                                        >
+                                            {text(strategy, "name")}
+                                        </option>
+                                    }
                                 }).collect::<Html>()}
                             </select>
-                            <div class="form-text strategy-id">{format!("完整策略 UUID：{}", *strategy_id)}</div>
                         </div>
                         <div class="col-12">
                             <label class="form-label">{"2. 策略绑定的证券与周期"}</label>
