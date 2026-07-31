@@ -1,5 +1,22 @@
 [workspace]
-members = [".", "rpc-types", "web"]
+members = [
+    ".",
+    "rpc-types",
+    "web",
+    "crates/strategy-api",
+    "crates/strategy-web-kit",
+    "crates/strategy-catalog-backend",
+    "crates/strategy-catalog-web",
+    "strategies/moving-average/model",
+    "strategies/moving-average/engine",
+    "strategies/moving-average/web",
+    "strategies/close-threshold/model",
+    "strategies/close-threshold/engine",
+    "strategies/close-threshold/web",
+    "strategies/paper-round-trip/model",
+    "strategies/paper-round-trip/engine",
+    "strategies/paper-round-trip/web",
+]
 resolver = "3"
 
 [package]
@@ -33,6 +50,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 tower = "0.5"
 tower-http = { version = "0.7", features = ["validate-request"] }
 uuid = { version = "1", features = ["serde", "v7"] }
+strategy-api = { path = "crates/strategy-api" }
+strategy-catalog-backend = { path = "crates/strategy-catalog-backend" }
 
 [dev-dependencies]
 tempfile = "3"

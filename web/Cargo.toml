@@ -10,6 +10,8 @@ chrono = { version = "0.4", features = ["clock", "wasmbind"] }
 jsonrpsee = { version = "=0.26.0", features = ["wasm-client"] }
 plotly = "0.14.1"
 quant-rpc-types = { path = "../rpc-types" }
+strategy-catalog-web = { path = "../crates/strategy-catalog-web" }
+strategy-web-kit = { path = "../crates/strategy-web-kit" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 js-sys = "0.3"

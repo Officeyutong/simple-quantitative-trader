@@ -513,6 +513,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
+name = "close-threshold-engine"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "close-threshold-model",
+ "serde_json",
+ "strategy-api",
+]
+
+[[package]]
+name = "close-threshold-model"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "strategy-api",
+]
+
+[[package]]
+name = "close-threshold-web"
+version = "0.1.0"
+dependencies = [
+ "close-threshold-model",
+ "serde_json",
+ "strategy-web-kit",
+ "yew",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2008,6 +2036,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "moving-average-engine"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "moving-average-model",
+ "serde_json",
+ "strategy-api",
+]
+
+[[package]]
+name = "moving-average-model"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "strategy-api",
+]
+
+[[package]]
+name = "moving-average-web"
+version = "0.1.0"
+dependencies = [
+ "moving-average-model",
+ "serde_json",
+ "strategy-web-kit",
+ "yew",
+]
+
+[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2096,6 +2152,34 @@ name = "openssl-probe"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
+
+[[package]]
+name = "paper-round-trip-engine"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "paper-round-trip-model",
+ "serde_json",
+ "strategy-api",
+]
+
+[[package]]
+name = "paper-round-trip-model"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "strategy-api",
+]
+
+[[package]]
+name = "paper-round-trip-web"
+version = "0.1.0"
+dependencies = [
+ "paper-round-trip-model",
+ "serde_json",
+ "strategy-web-kit",
+ "yew",
+]
 
 [[package]]
 name = "parking_lot"
@@ -2429,6 +2513,8 @@ dependencies = [
  "quant-rpc-types",
  "serde",
  "serde_json",
+ "strategy-catalog-web",
+ "strategy-web-kit",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
@@ -3007,6 +3093,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "strategy-api",
+ "strategy-catalog-backend",
  "tempfile",
  "thiserror 2.0.19",
  "time",
@@ -3069,6 +3157,52 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "strategy-api"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "strategy-catalog-backend"
+version = "0.1.0"
+dependencies = [
+ "close-threshold-engine",
+ "close-threshold-model",
+ "moving-average-engine",
+ "moving-average-model",
+ "paper-round-trip-engine",
+ "paper-round-trip-model",
+ "serde_json",
+ "strategy-api",
+]
+
+[[package]]
+name = "strategy-catalog-web"
+version = "0.1.0"
+dependencies = [
+ "close-threshold-web",
+ "moving-average-web",
+ "paper-round-trip-web",
+ "serde_json",
+ "strategy-api",
+ "strategy-web-kit",
+ "yew",
+]
+
+[[package]]
+name = "strategy-web-kit"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "strategy-api",
+ "web-sys",
+ "yew",
+]
 
 [[package]]
 name = "strsim"

@@ -196,19 +196,10 @@ pub fn strategy_status_page(props: &StrategyStatusPageProps) -> Html {
                             <Status label="Conid" value={integer(strategy, "conid")} />
                             <Status label="最后处理 Bar（本地）" value={local_time(strategy, "last_evaluated_bar")} />
                             <Status label="最近错误" value={text(strategy, "last_error")} />
-                            {
-                                (text(strategy, "kind") == "moving_average_cross_v2").then(|| html! {
-                                    <>
-                                        <Status label="均线算法" value={text_at(strategy, "/config/average_type")} />
-                                        <Status label="最小均线差" value={format!("{}%", number_at(strategy, "/config/min_gap_percent"))} />
-                                        <Status label="连续确认 Bar" value={integer_at(strategy, "/config/confirmation_bars")} />
-                                        <Status label="信号冷却 Bar" value={integer_at(strategy, "/config/cooldown_bars")} />
-                                        <Status label="ATR 窗口" value={integer_at(strategy, "/config/atr_window")} />
-                                        <Status label="最小 ATR" value={format!("{}%", number_at(strategy, "/config/min_atr_percent"))} />
-                                        <Status label="趋势窗口" value={integer_at(strategy, "/config/trend_window")} />
-                                    </>
-                                }).unwrap_or_default()
-                            }
+                            {strategy_catalog_web::render_config(
+                                &text(strategy, "kind"),
+                                strategy.get("config").unwrap_or(&Value::Null),
+                            ).unwrap_or_default()}
                         </div>
                     </div></section>
                     <section class="card shadow-sm mb-4"><div class="card-body">
@@ -577,22 +568,6 @@ fn text_at(value: &Value, pointer: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or("—")
         .to_owned()
-}
-
-fn integer_at(value: &Value, pointer: &str) -> String {
-    value
-        .pointer(pointer)
-        .and_then(Value::as_u64)
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "—".into())
-}
-
-fn number_at(value: &Value, pointer: &str) -> String {
-    value
-        .pointer(pointer)
-        .and_then(Value::as_f64)
-        .map(|value| format!("{value:.4}"))
-        .unwrap_or_else(|| "—".into())
 }
 
 #[derive(Properties, PartialEq)]

@@ -1,0 +1,14 @@
+[package]
+name = "strategy-catalog-backend"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+close-threshold-engine = { path = "../../strategies/close-threshold/engine" }
+close-threshold-model = { path = "../../strategies/close-threshold/model" }
+moving-average-engine = { path = "../../strategies/moving-average/engine" }
+moving-average-model = { path = "../../strategies/moving-average/model" }
+paper-round-trip-engine = { path = "../../strategies/paper-round-trip/engine" }
+paper-round-trip-model = { path = "../../strategies/paper-round-trip/model" }
+serde_json = "1"
+strategy-api = { path = "../strategy-api" }

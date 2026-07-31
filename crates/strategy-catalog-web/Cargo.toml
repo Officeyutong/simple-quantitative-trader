@@ -1,0 +1,13 @@
+[package]
+name = "strategy-catalog-web"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+close-threshold-web = { path = "../../strategies/close-threshold/web" }
+moving-average-web = { path = "../../strategies/moving-average/web" }
+paper-round-trip-web = { path = "../../strategies/paper-round-trip/web" }
+serde_json = "1"
+strategy-api = { path = "../strategy-api" }
+strategy-web-kit = { path = "../strategy-web-kit" }
+yew = { version = "=0.22.0", features = ["csr"] }

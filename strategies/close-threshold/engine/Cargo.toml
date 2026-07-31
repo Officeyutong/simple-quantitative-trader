@@ -1,0 +1,12 @@
+[package]
+name = "close-threshold-engine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+close-threshold-model = { path = "../model" }
+serde_json = "1"
+strategy-api = { path = "../../../crates/strategy-api" }
+
+[dev-dependencies]
+chrono = "0.4"

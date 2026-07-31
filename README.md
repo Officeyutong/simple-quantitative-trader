@@ -234,7 +234,8 @@ cargo run -- --config config/local.toml strategy signals <STRATEGY_ID> --limit 1
 cargo run -- --config config/local.toml strategy pause <STRATEGY_ID>
 ```
 
-策略核心现在是可扩展的 Rust `Strategy` trait，实时运行器和回测共用同一实现。
+策略核心按 `model`、`engine`、`web` 三类 crate 拆分；实时运行器和回测通过
+`strategy-api` 的 `Strategy` trait 共用同一算法，前后端 Catalog 负责注册。
 完整扩展流程和 `close_threshold` 示例见
 [STRATEGIES.md](STRATEGIES.md)。通用创建接口：
 

@@ -626,7 +626,10 @@ async fn dispatch(
         }
         "strategy.kinds" => success(
             request.id,
-            json!({"kinds": crate::strategy::registered_kinds()}),
+            json!({
+                "kinds": crate::strategy::registered_kinds(),
+                "strategies": crate::strategy::metadata_json(),
+            }),
         ),
         "strategy.list" => match storage.lock_safe().list_strategies() {
             Ok(strategies) => success(request.id, json!({"strategies": strategies})),

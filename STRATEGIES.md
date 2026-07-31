@@ -1,8 +1,9 @@
 # 策略说明
 
-本文档按当前源码整理项目中所有已注册策略。策略实现和注册表位于
-`src/strategy.rs`；实时运行器与回测引擎通过同一个 `Strategy` trait 调用同一份
-信号逻辑。
+本文档按当前源码整理项目中所有已注册策略。公共接口位于
+`crates/strategy-api`，每个策略族分别拥有 `model`、`engine` 和 `web` crate；
+前后端 Catalog 负责静态注册。`src/strategy.rs` 仅是主程序兼容门面。实时运行器与
+回测引擎通过同一个 `Strategy` trait 调用同一份信号逻辑。
 
 ## 1. 策略总览
 
@@ -506,19 +507,43 @@ quant strategy execution configure \
 - `minimum_history()` 准确声明所需最少 Bar；
 - `bar_timeframe()` 只能返回实时运行器支持的 `"1m"` 或 `"5s"`。
 
+每个策略族的目录约定如下：
+
+```text
+strategies/<strategy>/
+├── model/   # 配置类型、字段 schema、显示名称和能力声明
+├── engine/  # Strategy trait 实现、参数校验和后端 factory
+└── web/     # 参数展示及可选的专用 Yew 表单/向导
+```
+
+共享边界：
+
+- `strategy-api` 只包含 Bar、信号、trait、配置字段 schema 和注册项，不依赖主程序；
+- `strategy-web-kit` 提供 schema 驱动的通用表单与参数展示；
+- `strategy-catalog-backend` 是 daemon/回测使用的后端注册表；
+- `strategy-catalog-web` 是 Yew 使用的前端注册表；
+- Broker、数据库、风险、成本门控和订单执行仍属于平台，不进入策略 crate。
+
 新增流程：
 
-1. 在 `src/strategy.rs` 定义可序列化配置并完成参数校验；
-2. 实现 `Strategy` trait；
-3. 在 `strategy::build` 增加 factory 分支；
-4. 将名称加入 `registered_kinds()`；
-5. 为参数边界、`buy`、`sell`、`hold` 和最少历史数据添加单元测试；
-6. 执行验证：
+1. 创建 `<strategy>-model`，定义可序列化配置、字段说明和 `StrategyMetadata`；
+2. 创建 `<strategy>-engine`，实现 `Strategy`、参数校验和
+   `BackendStrategyRegistration`；
+3. 创建 `<strategy>-web`，通常复用 `GenericStrategyForm` 和
+   `render_config_table`；有特殊交互时在该 crate 内提供专用组件；
+4. 分别向 `strategy-catalog-backend` 与 `strategy-catalog-web` 各增加一个注册项；
+5. 将三个 crate 加入 workspace。主程序、实时运行器、回测和策略状态页不需要再增加
+   `kind` 分支；
+6. 为参数边界、`buy`、`sell`、`hold` 和最少历史数据添加单元测试；
+7. 执行验证：
 
 ```bash
 cargo fmt --all
-cargo test
-cargo check
+cargo test --workspace
+cargo check --workspace
+cd web && trunk build --release
 ```
 
-注册完成后，daemon、JSON-RPC 实时运行器和通用回测引擎会自动共享该实现。
+注册完成后，daemon、JSON-RPC 实时运行器和通用回测引擎会自动共享 engine；
+`strategy.kinds` 会返回 `kinds` 兼容列表及带字段 schema/能力的 `strategies` 列表，
+Web 策略状态页会通过 Web Catalog 展示对应参数。

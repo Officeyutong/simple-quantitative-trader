@@ -1,0 +1,10 @@
+[package]
+name = "moving-average-web"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+moving-average-model = { path = "../model" }
+serde_json = "1"
+strategy-web-kit = { path = "../../../crates/strategy-web-kit" }
+yew = { version = "=0.22.0", features = ["csr"] }

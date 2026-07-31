@@ -1,0 +1,10 @@
+[package]
+name = "strategy-web-kit"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde_json = "1"
+strategy-api = { path = "../strategy-api" }
+web-sys = { version = "0.3", features = ["HtmlInputElement", "HtmlSelectElement"] }
+yew = { version = "=0.22.0", features = ["csr"] }
