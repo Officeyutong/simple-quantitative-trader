@@ -341,7 +341,7 @@ data/lake/bars/timeframe=1d/conid=265598/
 - cursor 和 completed slices 持久化；
 - daemon 中断时 running Job 自动恢复为 retrying；
 - `data jobs` 查询状态和错误；
-- `data coverage` 查询文件覆盖和 raw gaps；
+- `data coverage` 查询文件覆盖、成功抓取区间、未验证范围和 raw gaps；
 - Paper Job 成功写入 2 行 SPY 日线 Parquet；
 - 2026-07-20 至 2026-07-22 coverage 验收无 raw gap。
 
@@ -457,10 +457,13 @@ SPY Overnight 成交：
 - 进程级全局 order update stream；
 - 外部订单事件；
 - 部分成交专项测试；
-- commission 先于 execution 到达时的暂存处理；
 - execution correction；
 - 撤单最终状态持续确认；
 - 组合订单事件。
+
+已在后续增量中完成：commission 先于 execution 到达时暂存到
+`pending_commissions` 并在 execution 落库时应用（暂存、应用与清理在同一
+DuckDB 事务中提交）。
 
 ## 11. 阶段 8：启动、重连与状态对账
 
@@ -727,8 +730,10 @@ quant strategy signals <STRATEGY_ID> --limit 100
 - `strategy kinds` 列出当前二进制已注册策略；
 - `strategy create --kind --config-json` 创建任意注册策略；
 - `backtest run-strategy --kind --config-json` 回测同一份策略代码；
-- 当前注册五种策略：`moving_average_cross`、`moving_average_cross_5s`、
-  `moving_average_cross_v2`、`close_threshold` 和 `paper_round_trip`；
+- 当前注册六种策略：`moving_average_cross`、`moving_average_cross_5s`、
+  `moving_average_cross_v2`、`close_threshold`、`bollinger_rsi_mean_reversion` 和
+  `paper_round_trip`；布林带 + RSI 策略使用独立 model/engine/web crate，支持
+  1 分钟、5 秒、完整回测、Paper 执行和统一成本门控；
 - 完整开发说明见 [STRATEGIES.md](STRATEGIES.md)；
 - 通用策略完成创建、启动、停止及本地 Parquet 回测验收。
 
@@ -769,12 +774,11 @@ quant strategy signals <STRATEGY_ID> --limit 100
 - Parquet 数据读取；
 - 确定性事件时钟；
 - 下一 bar 成交规则；
-- 滑点；
-- 手续费；
+- 数据库费用模型驱动的佣金/税费、点差和滑点；
 - 资金和持仓；
 - 权益曲线；
 - 收益率、波动率、最大回撤和换手率；
-- 回测参数、固定 seed 和数据文件 ID 快照；
+- 回测参数、费用模型、固定 seed 和数据文件 ID 快照；
 - 固定随机 seed；
 - 防未来函数；
 - 回测 run、成交、权益和指标写入 DuckDB；
@@ -827,6 +831,8 @@ quant strategy signals <STRATEGY_ID> --limit 100
 - `dataset_snapshots` 固化 active file ID 集合，回测也绑定数据文件 ID；
 - `data snapshot create/list` 提供可复现实验的数据版本；
 - 历史任务具备切片、重试、游标、取消与 raw gap report；
+- 重叠活动 backfill 自动合并，任务列表提供真实运行状态、队列位置和前方任务数；
+- 历史请求主动规避夏令时结束时的歧义端点，并保留原始 UTC Bar 范围；
 - DuckDB SQL 承担 Parquet 读取、回测批量输入和统计分析；
 - 首版数据量无需 Polars/Arrow，继续遵循“必要时再引入”的设计约束。
 
@@ -906,6 +912,56 @@ compaction、retention、任意只读 SQL 和 Polars 属于容量扩展。首版
 - IBKR 重连退避加入 jitter；连接丢失立即发布 `Reconnecting` 状态；
 - 配置加载警告（live 交易开启、环境变量覆盖 `trading_enabled`）在 telemetry
   初始化后输出，不再丢失。
+
+### 可靠性修复增量（2026-08-01）
+
+围绕代码审查发现的重复下单链条和 fail-open 风控缺口完成以下修复：
+
+订单结果与幂等：
+
+- broker 已受单后的本地失败（连接会话丢失、`record_submitted_order` 存储
+  失败）不再返回可被误判为拒绝的错误码：intent 标记为 `unknown` 并返回
+  `-32026`，策略执行层按“结果不确定”处理；
+- daemon 在风险批准后、broker 确认前崩溃时，启动恢复会把无 orders 行的
+  `approved` intent 标记为 `unknown`；批次中断遗留的 `processing` action leg
+  同步转为 `failed`；
+- 新增 `order.intent.resolve` RPC：操作员在通过对账确认真实结果后，以
+  非空 note 和显式 confirm 人工解除 `unknown` intent，动作写入
+  `risk_decisions` 审计。
+
+风控收紧：
+
+- `approved`/`unknown` intent 计入活跃订单数与同合约持仓投影，并阻塞该合约
+  的自动执行认领，消除“in-flight 订单不可见 → 并发挤过限额/重复下单”窗口；
+- `apipending` 状态计入 `max_open_orders`；
+- 组合敞口折算 fail-closed：持仓币种缺失新鲜 FX 汇率时开仓以
+  `FX_RATE_UNAVAILABLE` 拒绝，不再按 0 低估敞口；
+- 订单事件终态保护：迟到/重放的非终态 `OrderStatus` 不再把已 Filled 订单打回
+  active、回退成交数量或将已学到的 perm ID 抹为 0；
+- `not_open` 计入对账终态，消除“previous-session 订单永久 missing → 永久
+  degraded”死角。
+
+策略执行：
+
+- IBKR 持仓快照 `syncing` 期间延迟认领信号（不消费、不跳过），消除同步清零
+  窗口内平仓信号永久丢失或按空仓超额建仓的风险；
+- 信号执行时效上限 15 分钟：停机期间积压的陈旧信号记录为 `skipped`
+  （`stale_signal`），永不补交。
+
+对账与数据：
+
+- 对账快照收集不再使用 500ms 空闲截断启发式：流读取到 IBKR End 消息为止，
+  整体超时即失败重试，杜绝以截断快照误判本地订单缺失或误标 `not_open`；
+- 自动对账在重连触发之外增加 10 分钟周期性运行；
+- execution 落库、pending commission 应用与清理合并为单一事务，崩溃不再
+  滞留佣金；Commission 事件的更新与暂存同样事务化；
+- 迟到乱序 tick 不再改写已 final Bar 的 OHLC；
+- 回测中买入因现金不足失败的 Bar 仍正常评估策略，不再整根跳过；
+- backfill cursor 推进失败时 job 转入重试而非永久卡在 `running`；IBKR
+  历史数据拉取增加 120 秒超时；
+- Parquet 发布前校验 staging 文件行数与时间范围，校验失败丢弃并重试；
+- 备份 manifest 增加数据库副本校验和，每个 Parquet 副本复制后校验，
+  不匹配即失败。
 
 ## 18. 阶段 15：实盘准入与渐进发布
 
@@ -1061,7 +1117,8 @@ quant safety status/set/live-approve/live-revoke ...
 
 1. IBKR Gateway 当前未监听 4002，在线验收需 Gateway 恢复后继续；
 2. paper 自动策略尚未完成数周连续运行证据，因此 live approval 保持关闭；
-3. 交易日历尚未用于 coverage gap 过滤；
+3. coverage 的回测就绪判断使用持久化 backfill 成功 cursor 区间；`raw_gaps` 仍是
+   未经过交易日历过滤的自然时间诊断，不参与回测放行；
 4. 撤单、部分成交和 execution correction 仍需更长时间 paper 故障注入；
 5. 存储使用进程内互斥串行写入（已具备锁中毒恢复与任务监督），回测、备份等
    长操作仍会阻塞其他请求；长查询未来可迁移到 StorageWriter actor；
@@ -1119,8 +1176,9 @@ IBKR 连接                已完成
   净 PnL、换手率、胜率、最大回撤、Sharpe、Sortino、每日权益和可选基准收益；
 - monitoring worker 周期保存启用策略的绩效快照，并检测 IBKR 未就绪、对账异常、
   行情失败/延迟、Unknown 订单、失败 action 和快照错误；
-- 风控统一使用配置的基础币种。非基础币种风险敞口必须通过新鲜 FX 汇率折算，
-  IBKR Account Summary 的 ExchangeRate 可自动写入；
+- 风控统一使用配置的基础币种。非基础币种风险敞口必须通过新鲜 FX 汇率折算；
+  daemon 周期从 IBKR Account Updates 获取 `ExchangeRate` 并写入 `fx_rates`，且
+  IBKR 账户基础币种必须与 `risk.base_currency` 一致；
 - 支持显式 UTC 交易 session。配置过某交易所日历后，闭市、休市或缺失当日 session
   会阻止该交易所的策略自动执行；
 - 自动执行严禁使用 IBKR delayed tick，只有实时 bid/ask 才可定价；人工严格减仓
@@ -1167,10 +1225,10 @@ deploy/screen-stop.sh config/paper.toml
 - 实时绩效佣金继续以 IBKR `CommissionReport` 为准，非基础币种在报告生成时按当前
   新鲜 FX 换算。
 
-仍未解决的成本建模限制：
+成本建模边界：
 
-- 回测 `commission_per_order` 只是每笔固定金额，不识别市场费率、最低收费、税费或
-  平台费；
+- 回测与实时成本门控已共享数据库费用模型；回测保存模型快照，实时成交后的绩效仍以
+  IBKR `CommissionReport` 为准；
 - `min_gap_percent` 是指标过滤条件，不代表预期收益覆盖费用；
 - 本阶段结束时自动执行尚无交易成本门槛；该限制已由下一阶段的数据库费用模型解决。
   5 秒等高换手策略仍需要长周期 paper 验证。
@@ -1190,6 +1248,10 @@ deploy/screen-stop.sh config/paper.toml
 
 schema 23 继续为费用模型增加买入和卖出每股费用，单边费用统一按
 `max(最低费, 每笔固定费 + 数量×每股费 + 名义金额×比例费率)` 计算。
+
+schema 29 将回测纳入同一费用模型：策略回测读取策略绑定，临时回测显式引用数据库
+`cost_model_id`；卖出税费在最低券商费之外追加，每一腿承担半边完整点差和一次单边
+滑点。运行参数保存模型快照，成交及指标分别保存佣金/税费、点差、滑点和总成本。
 
 schema 24 为策略执行配置增加 `outside_rth`；常规时段模式继续使用市价单，盘前
 盘后模式使用最新 Bid/Ask 作为限价并把 `outside_rth=true` 传给 IBKR。

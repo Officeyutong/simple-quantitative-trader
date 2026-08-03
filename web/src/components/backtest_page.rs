@@ -1,4 +1,5 @@
 use chrono::{Local, NaiveDateTime, TimeDelta, TimeZone, Utc};
+use gloo_timers::callback::Interval;
 use serde_json::{Value, json};
 use wasm_bindgen_futures::spawn_local;
 use yew::prelude::*;
@@ -10,7 +11,7 @@ use super::{
     backtest_data_panel::BacktestDataPanel,
     error_modal::ErrorModal,
     value::{
-        array, format_number, integer, local_time, number, official_security_name,
+        array, boolean, format_number, integer, local_time, number, official_security_name,
         security_exchange, text,
     },
 };
@@ -19,6 +20,7 @@ use super::{
 pub struct BacktestPageProps {
     pub endpoint: String,
     pub strategies: Value,
+    pub execution_configs: Value,
 }
 
 #[function_component(BacktestPage)]
@@ -35,8 +37,6 @@ pub fn backtest_page(props: &BacktestPageProps) -> Html {
     let end = use_state(|| local_datetime_value(0.0));
     let quantity = use_state(|| "1".to_owned());
     let initial_cash = use_state(|| "100000".to_owned());
-    let slippage_bps = use_state(|| "5".to_owned());
-    let commission = use_state(|| "1".to_owned());
     let seed = use_state(|| "42".to_owned());
     let busy = use_state(|| false);
     let data_ready = use_state(|| false);
@@ -44,6 +44,9 @@ pub fn backtest_page(props: &BacktestPageProps) -> Html {
     let runs = use_state(Vec::<Value>::new);
     let detail = use_state(|| None::<Value>);
     let detail_busy = use_state(|| None::<String>);
+    let cost_controls = use_state(Vec::<Value>::new);
+    let cost_models = use_state(Vec::<Value>::new);
+    let cost_loading = use_state(|| true);
     let notice = use_state(|| None::<Result<String, String>>);
     {
         let strategy_ids = strategies
@@ -70,6 +73,26 @@ pub fn backtest_page(props: &BacktestPageProps) -> Html {
         .as_ref()
         .map(strategy_timeframe)
         .unwrap_or_default();
+    let outside_rth = array(&props.execution_configs, "configs")
+        .iter()
+        .find(|config| text(config, "strategy_id") == *strategy_id)
+        .is_some_and(|config| boolean(config, "outside_rth"));
+    let cost_control = cost_controls
+        .iter()
+        .find(|control| text(control, "strategy_id") == *strategy_id);
+    let cost_model = cost_control.and_then(|control| {
+        let model_id = text(control, "cost_model_id");
+        cost_models
+            .iter()
+            .find(|model| text(model, "cost_model_id") == model_id)
+    });
+    let strategy_currency = selected_strategy
+        .as_ref()
+        .map(|strategy| text(strategy, "currency"))
+        .unwrap_or_default();
+    let cost_currency_matches = cost_model
+        .is_some_and(|model| text(model, "currency").eq_ignore_ascii_case(&strategy_currency));
+    let cost_model_ready = cost_model.is_some() && cost_currency_matches;
 
     {
         let endpoint = props.endpoint.clone();
@@ -81,6 +104,33 @@ pub fn backtest_page(props: &BacktestPageProps) -> Html {
             || ()
         });
     }
+    {
+        let endpoint = props.endpoint.clone();
+        let controls = cost_controls.clone();
+        let models = cost_models.clone();
+        let loading = cost_loading.clone();
+        let notice = notice.clone();
+        use_effect_with(endpoint.clone(), move |_| {
+            loading.set(true);
+            load_cost_configuration(
+                endpoint.clone(),
+                controls.clone(),
+                models.clone(),
+                loading.clone(),
+                notice.clone(),
+            );
+            let interval = Interval::new(5_000, move || {
+                load_cost_configuration(
+                    endpoint.clone(),
+                    controls.clone(),
+                    models.clone(),
+                    loading.clone(),
+                    notice.clone(),
+                )
+            });
+            move || drop(interval)
+        });
+    }
 
     let run = {
         let endpoint = props.endpoint.clone();
@@ -88,12 +138,12 @@ pub fn backtest_page(props: &BacktestPageProps) -> Html {
         let strategy_id = strategy_id.clone();
         let instrument = instrument.clone();
         let timeframe = timeframe.clone();
+        let outside_rth = outside_rth;
         let start = start.clone();
         let end = end.clone();
         let quantity = quantity.clone();
         let initial_cash = initial_cash.clone();
-        let slippage_bps = slippage_bps.clone();
-        let commission = commission.clone();
+        let cost_model_ready = cost_model_ready;
         let seed = seed.clone();
         let busy = busy.clone();
         let data_ready = data_ready.clone();
@@ -110,8 +160,14 @@ pub fn backtest_page(props: &BacktestPageProps) -> Html {
             };
             if !*data_ready {
                 notice.set(Some(Err(
-                    "所选证券、周期和时间范围尚无可用于回测的本地历史数据。请先在“准备本地历史数据”中完成下载。"
+                    "所选证券、周期和时间范围尚未通过完整下载验证。请先在“准备本地历史数据”中补齐未抓取范围。"
                         .into(),
+                )));
+                return;
+            }
+            if !cost_model_ready {
+                notice.set(Some(Err(
+                    "该策略没有可用且币种匹配的费用模型；请先在“交易成本”页面完成绑定。".into(),
                 )));
                 return;
             }
@@ -164,14 +220,13 @@ pub fn backtest_page(props: &BacktestPageProps) -> Html {
                 "strategy_id": *strategy_id,
                 "conid": conid,
                 "timeframe": timeframe.clone(),
+                "outside_rth": outside_rth,
                 "start": start_utc,
                 "end": end_utc,
                 "strategy_kind": text(strategy, "kind"),
                 "strategy_config": strategy.get("config").cloned().unwrap_or_else(|| json!({})),
                 "quantity": quantity_value,
                 "initial_cash": cash_value,
-                "slippage_bps": slippage_bps.parse::<f64>().unwrap_or(0.0),
-                "commission_per_order": commission.parse::<f64>().unwrap_or(0.0),
                 "seed": seed.parse::<i64>().unwrap_or(0)
             });
             let endpoint = endpoint.clone();
@@ -260,6 +315,7 @@ pub fn backtest_page(props: &BacktestPageProps) -> Html {
                                         official_security_name(value), text(value, "symbol"),
                                         security_exchange(value), integer(value, "conid"))}</div>
                                     <div class="small mt-1">{format!("Bar 周期：{}（由策略配置锁定）", timeframe)}</div>
+                                    <div class="small mt-1">{format!("下载及回测交易时段：{}", if outside_rth { "含盘前盘后" } else { "常规交易时段" })}</div>
                                 </div>
                             }).unwrap_or_else(|| html! {
                                 <div class="alert alert-danger mb-0">
@@ -280,10 +336,12 @@ pub fn backtest_page(props: &BacktestPageProps) -> Html {
                         } else { Html::default() }}
                         <BacktestDataPanel
                             endpoint={props.endpoint.clone()}
+                            strategy_id={(*strategy_id).clone()}
                             instrument={instrument.clone()}
                             timeframe={timeframe.clone()}
                             start={(*start).clone()}
                             end={(*end).clone()}
+                            outside_rth={outside_rth}
                             on_ready={{
                                 let data_ready = data_ready.clone();
                                 Callback::from(move |ready| data_ready.set(ready))
@@ -295,12 +353,13 @@ pub fn backtest_page(props: &BacktestPageProps) -> Html {
                         />
                         <Field label="每次交易数量" value={quantity.clone()} kind="number" />
                         <Field label="初始资金" value={initial_cash.clone()} kind="number" />
-                        <Field label="滑点（bps）" value={slippage_bps.clone()} kind="number" />
-                        <Field label="每单佣金" value={commission.clone()} kind="number" />
                         <Field label="随机种子" value={seed.clone()} kind="number" />
                         <div class="col-12">
+                            {cost_model_panel(cost_control, cost_model, &strategy_currency, *cost_loading)}
+                        </div>
+                        <div class="col-12">
                             <button class="btn btn-primary" type="submit"
-                                disabled={*busy || instrument.is_none() || strategy_id.is_empty() || !*data_ready}>
+                                disabled={*busy || *cost_loading || instrument.is_none() || strategy_id.is_empty() || !*data_ready || !cost_model_ready}>
                                 {if *busy {
                                     html! { <><span class="spinner-border spinner-border-sm me-2" />{"回测运行中…"}</> }
                                 } else { html! { "运行回测" } }}
@@ -361,7 +420,12 @@ pub fn backtest_page(props: &BacktestPageProps) -> Html {
                                             let notice = notice.clone();
                                             let id = id_for_request.clone();
                                             spawn_local(async move {
-                                                match call_method(&endpoint, "backtest.get", json!({"backtest_id": id})).await {
+                                                match call_method(&endpoint, "backtest.get", json!({
+                                                    "backtest_id": id,
+                                                    "trade_page": 1,
+                                                    "trade_page_size": 500,
+                                                    "max_equity_points": 2000
+                                                })).await {
                                                     Ok(value) => detail.set(Some(value)),
                                                     Err(error) => notice.set(Some(Err(error))),
                                                 }
@@ -463,8 +527,106 @@ fn load_runs(
     });
 }
 
+fn load_cost_configuration(
+    endpoint: String,
+    controls: UseStateHandle<Vec<Value>>,
+    models: UseStateHandle<Vec<Value>>,
+    loading: UseStateHandle<bool>,
+    notice: UseStateHandle<Option<Result<String, String>>>,
+) {
+    spawn_local(async move {
+        let controls_result =
+            call_method(&endpoint, "execution_cost.control.list", json!({})).await;
+        let models_result = call_method(&endpoint, "execution_cost.model.list", json!({})).await;
+        match (controls_result, models_result) {
+            (Ok(control_value), Ok(model_value)) => {
+                controls.set(array(&control_value, "controls"));
+                models.set(array(&model_value, "models"));
+            }
+            (Err(error), _) | (_, Err(error)) => notice.set(Some(Err(error))),
+        }
+        loading.set(false);
+    });
+}
+
+fn cost_model_panel(
+    control: Option<&Value>,
+    model: Option<&Value>,
+    strategy_currency: &str,
+    loading: bool,
+) -> Html {
+    if loading {
+        return html! {
+            <div class="alert alert-info mb-0">
+                <span class="spinner-border spinner-border-sm me-2" />
+                {"正在读取策略绑定的费用模型…"}
+            </div>
+        };
+    }
+    let (Some(control), Some(model)) = (control, model) else {
+        return html! {
+            <div class="alert alert-danger mb-0">
+                <div class="fw-semibold">{"尚未绑定费用模型，无法运行回测"}</div>
+                <div class="small mt-1">{"请先到“交易成本”页面为该策略保存费用模型。回测不再接受独立的手填佣金和滑点。"}</div>
+            </div>
+        };
+    };
+    let model_currency = text(model, "currency");
+    if !model_currency.eq_ignore_ascii_case(strategy_currency) {
+        return html! {
+            <div class="alert alert-danger mb-0">
+                <div class="fw-semibold">{"费用模型币种与证券币种不匹配"}</div>
+                <div class="small mt-1">{format!("模型币种：{model_currency}；证券币种：{strategy_currency}。请先修正绑定。")}</div>
+            </div>
+        };
+    }
+    html! {
+        <div class="card bg-light">
+            <div class="card-body">
+                <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-2">
+                    <div>
+                        <div class="fw-semibold">{format!("回测费用模型：{} ({model_currency})", text(model, "name"))}</div>
+                        <div class="small text-secondary">{"模型值会随本次回测保存，之后修改费用模型不会改写历史结果。"}</div>
+                    </div>
+                    <span class={classes!("badge", if boolean(control, "enabled") { "bg-success" } else { "bg-secondary" })}>
+                        {if boolean(control, "enabled") { "实时成本门控已启用" } else { "实时门控关闭，但回测仍计费" }}
+                    </span>
+                </div>
+                <div class="row g-2 small">
+                    <div class="col-12 col-lg-4">
+                        <span class="text-secondary">{"买入："}</span>
+                        {fee_model_summary(model, "buy")}
+                    </div>
+                    <div class="col-12 col-lg-4">
+                        <span class="text-secondary">{"卖出："}</span>
+                        {format!("{}；税费 {} bps", fee_model_summary(model, "sell"), number(model, "sell_tax_bps"))}
+                    </div>
+                    <div class="col-12 col-lg-4">
+                        <span class="text-secondary">{"价格冲击："}</span>
+                        {format!("点差 {} bps；单边滑点 {} bps", number(model, "estimated_spread_bps"), number(model, "estimated_slippage_bps"))}
+                    </div>
+                </div>
+            </div>
+        </div>
+    }
+}
+
+fn fee_model_summary(model: &Value, side: &str) -> String {
+    format!(
+        "固定 {} / 每股 {} / 比例 {} bps / 最低 {}",
+        number(model, &format!("{side}_fixed_fee")),
+        number(model, &format!("{side}_per_share_fee")),
+        number(model, &format!("{side}_rate_bps")),
+        number(model, &format!("{side}_min_fee")),
+    )
+}
+
 fn backtest_modal(run: &Value, on_close: Callback<MouseEvent>) -> Html {
     let trades = array(run, "trades");
+    let trade_total = run
+        .pointer("/trades_page/total_items")
+        .and_then(Value::as_u64)
+        .unwrap_or(trades.len() as u64);
     html! {
         <>
             <div class="modal fade show d-block" tabindex="-1" role="dialog" aria-modal="true">
@@ -486,23 +648,38 @@ fn backtest_modal(run: &Value, on_close: Callback<MouseEvent>) -> Html {
                                     ("交易次数", metric_integer(run, "trade_count")),
                                     ("换手率", metric_percent(run, "turnover")),
                                     ("持仓数量", metric_number(run, "open_position")),
+                                    ("佣金及税费", metric_number(run, "total_commission")),
+                                    ("点差成本", metric_number(run, "total_spread")),
+                                    ("滑点成本", metric_number(run, "total_slippage")),
+                                    ("总执行成本", metric_number(run, "total_execution_cost")),
                                 ].into_iter().map(|(label, value)| html! {
-                                    <div class="col-6 col-lg-2"><div class="card h-100"><div class="card-body">
+                                    <div class="col-6 col-lg-3"><div class="card h-100"><div class="card-body">
                                         <div class="small text-secondary">{label}</div><div class="fw-semibold">{value}</div>
                                     </div></div></div>
                                 }).collect::<Html>()}
                             </div>
+                            <div class="alert alert-light border">
+                                <span class="fw-semibold">{"费用模型快照："}</span>
+                                {run.pointer("/parameters/cost_model/name").and_then(Value::as_str).unwrap_or("历史回测未保存费用模型")}
+                                {run.pointer("/parameters/cost_model/currency").and_then(Value::as_str).map(|currency| format!(" ({currency})")).unwrap_or_default()}
+                            </div>
                             {equity_chart(run)}
                             <h3 class="h6 mt-4">{"成交记录"}</h3>
+                            {if trade_total > trades.len() as u64 {
+                                html! { <div class="alert alert-info py-2">
+                                    {format!("共有 {trade_total} 条成交，当前显示前 {} 条；可通过 backtest.get 的 trade_page 参数读取后续记录。", trades.len())}
+                                </div> }
+                            } else { Html::default() }}
                             <div class="table-responsive"><table class="table table-sm table-hover">
-                                <thead><tr><th>{"信号时间（本地）"}</th><th>{"成交时间（本地）"}</th><th>{"方向"}</th><th>{"数量"}</th><th>{"价格"}</th><th>{"佣金"}</th><th>{"滑点"}</th></tr></thead>
+                                <thead><tr><th>{"信号时间（本地）"}</th><th>{"成交时间（本地）"}</th><th>{"方向"}</th><th>{"数量"}</th><th>{"价格"}</th><th>{"佣金/税费"}</th><th>{"点差成本"}</th><th>{"滑点成本"}</th></tr></thead>
                                 <tbody>{if trades.is_empty() {
-                                    html! { <tr><td colspan="7" class="text-center text-secondary">{"没有成交"}</td></tr> }
+                                    html! { <tr><td colspan="8" class="text-center text-secondary">{"没有成交"}</td></tr> }
                                 } else {
                                     trades.iter().map(|trade| html! { <tr>
                                         <td>{local_time(trade, "signal_time")}</td><td>{local_time(trade, "fill_time")}</td>
                                         <td>{text(trade, "side")}</td><td>{number(trade, "quantity")}</td>
-                                        <td>{number(trade, "price")}</td><td>{number(trade, "commission")}</td><td>{number(trade, "slippage")}</td>
+                                        <td>{number(trade, "price")}</td><td>{number(trade, "commission")}</td>
+                                        <td>{number(trade, "spread")}</td><td>{number(trade, "slippage")}</td>
                                     </tr> }).collect::<Html>()
                                 }}</tbody>
                             </table></div>
@@ -541,9 +718,20 @@ fn equity_chart(run: &Value) -> Html {
         })
         .collect::<Vec<_>>()
         .join(" ");
+    let sampling = run.get("equity_sampling");
+    let downsampled = sampling.is_some_and(|value| boolean(value, "downsampled"));
+    let total_points = sampling
+        .and_then(|value| value.get("total_points"))
+        .and_then(Value::as_u64)
+        .unwrap_or(points.len() as u64);
     html! {
         <div>
             <h3 class="h6">{"权益曲线"}</h3>
+            {if downsampled {
+                html! { <div class="small text-secondary mb-2">
+                    {format!("为控制响应大小，曲线已从 {total_points} 个权益点均匀抽样为 {} 个点；收益指标仍基于完整数据。", points.len())}
+                </div> }
+            } else { Html::default() }}
             <svg viewBox="0 0 1000 240" class="w-100 border rounded bg-light" role="img" aria-label="回测权益曲线">
                 <polyline points={polyline} fill="none" stroke="#0d6efd" stroke-width="3" />
             </svg>

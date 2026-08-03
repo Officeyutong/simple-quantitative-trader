@@ -8,6 +8,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use duckdb::{Connection, OptionalExt, params};
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::error::{AppError, Result};
 
@@ -678,9 +679,74 @@ SELECT strategy_id, 1, '{}', 0, NULL, created_at, updated_at
 FROM strategies;
 "#,
     ),
+    (
+        27,
+        r#"
+CREATE TABLE pending_broker_executions (
+    broker_execution_id VARCHAR PRIMARY KEY,
+    connection_session_id UUID,
+    broker_order_id BIGINT NOT NULL,
+    broker_perm_id BIGINT NOT NULL,
+    conid BIGINT NOT NULL,
+    side VARCHAR NOT NULL,
+    quantity DOUBLE NOT NULL,
+    price DOUBLE NOT NULL,
+    executed_at TIMESTAMPTZ NOT NULL,
+    received_at TIMESTAMPTZ NOT NULL
+);
+
+-- Older binaries could persist a terminal broker event before the local order
+-- row existed and then leave the newly inserted order permanently submitted.
+UPDATE orders AS o SET
+  status = json_extract_string(b.payload_json, '$.status'),
+  broker_perm_id = CASE WHEN b.broker_perm_id <> 0 THEN b.broker_perm_id
+                        ELSE o.broker_perm_id END,
+  updated_at = greatest(o.updated_at, b.received_at)
+FROM broker_order_events AS b
+WHERE b.connection_session_id = o.connection_session_id
+  AND b.broker_order_id = o.broker_order_id
+  AND b.event_type = 'open_order'
+  AND lower(json_extract_string(b.payload_json, '$.status')) IN
+      ('filled','cancelled','canceled','inactive','rejected')
+  AND lower(o.status) NOT IN
+      ('filled','cancelled','canceled','inactive','rejected')
+  AND b.received_at = (
+    SELECT max(latest.received_at)
+    FROM broker_order_events AS latest
+    WHERE latest.connection_session_id = o.connection_session_id
+      AND latest.broker_order_id = o.broker_order_id
+      AND latest.event_type = 'open_order'
+  );
+"#,
+    ),
+    (
+        28,
+        r#"
+-- Historical bars requested for regular and extended sessions must not share
+-- one manifest namespace: otherwise a later backfill can retire files from the
+-- other session scope and a backtest can silently mix both data sets.  The Web
+-- client historically requested regular-hours data, so existing files retain
+-- that interpretation during migration.
+ALTER TABLE dataset_files ADD COLUMN session_kind VARCHAR DEFAULT 'regular';
+"#,
+    ),
+    (
+        29,
+        r#"
+-- Keep bid/ask spread impact separate from post-quote slippage in backtests.
+-- Existing runs used one manually configured slippage value and therefore
+-- have no separately attributable spread cost.
+ALTER TABLE backtest_trades ADD COLUMN spread DOUBLE DEFAULT 0;
+"#,
+    ),
 ];
 
 const MAX_STRATEGY_STATE_BYTES: usize = 1024 * 1024;
+
+/// Maximum age of a buy/sell evaluation that automatic execution will still
+/// act on. Older signals (typically accumulated while the daemon was stopped)
+/// are recorded as skipped and never executed late.
+pub const MAX_EXECUTABLE_SIGNAL_AGE_SECONDS: i64 = 900;
 
 pub struct Storage {
     connection: Connection,
@@ -763,7 +829,27 @@ pub struct BackfillJobRequest {
     pub timeframe: String,
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
+    #[serde(default)]
     pub outside_rth: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct BackfillJobCreation {
+    pub job_id: uuid::Uuid,
+    /// True when the request was folded into an existing active job instead of
+    /// inserting another queue entry.
+    pub reused: bool,
+    /// True when reusing the job expanded its requested time range.
+    pub range_expanded: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveBackfillJob {
+    job_id: uuid::Uuid,
+    state: String,
+    request: BackfillJobRequest,
+    cursor_time: DateTime<Utc>,
+    completed_slices: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -778,6 +864,10 @@ pub struct ClaimedBackfillJob {
 pub struct BacktestRequest {
     #[serde(default)]
     pub strategy_id: Option<uuid::Uuid>,
+    /// Explicit database cost model for ad-hoc backtests. Backtests tied to a
+    /// persisted strategy always use that strategy's assigned model instead.
+    #[serde(default)]
+    pub cost_model_id: Option<uuid::Uuid>,
     pub conid: i32,
     pub timeframe: String,
     pub start: DateTime<Utc>,
@@ -790,12 +880,30 @@ pub struct BacktestRequest {
     pub strategy_config: Option<serde_json::Value>,
     pub quantity: f64,
     pub initial_cash: f64,
+    /// Selects the same IBKR historical-data session scope as the strategy's
+    /// execution configuration. False means liquidHours (regular session),
+    /// true means tradingHours (extended session).
     #[serde(default)]
-    pub slippage_bps: f64,
-    #[serde(default)]
-    pub commission_per_order: f64,
+    pub outside_rth: bool,
     #[serde(default)]
     pub seed: i64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct BacktestDetailOptions {
+    pub trade_page: usize,
+    pub trade_page_size: usize,
+    pub max_equity_points: usize,
+}
+
+impl Default for BacktestDetailOptions {
+    fn default() -> Self {
+        Self {
+            trade_page: 1,
+            trade_page_size: 200,
+            max_equity_points: 2_000,
+        }
+    }
 }
 
 fn default_strategy_kind() -> String {
@@ -820,6 +928,7 @@ struct SimulatedTrade {
     quantity: f64,
     price: f64,
     commission: f64,
+    spread: f64,
     slippage: f64,
 }
 
@@ -877,6 +986,80 @@ pub struct ExecutionCostModelInput {
     pub estimated_slippage_bps: f64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CostSide {
+    Buy,
+    Sell,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct EstimatedExecutionCost {
+    pub commission: f64,
+    pub spread: f64,
+    pub slippage: f64,
+}
+
+impl ExecutionCostModelInput {
+    pub fn estimated_commission(&self, side: CostSide, notional: f64, quantity: f64) -> f64 {
+        let (fixed, per_share, rate_bps, minimum) = match side {
+            CostSide::Buy => (
+                self.buy_fixed_fee,
+                self.buy_per_share_fee,
+                self.buy_rate_bps,
+                self.buy_min_fee,
+            ),
+            CostSide::Sell => (
+                self.sell_fixed_fee,
+                self.sell_per_share_fee,
+                self.sell_rate_bps,
+                self.sell_min_fee,
+            ),
+        };
+        let broker_fee =
+            (fixed + quantity * per_share + notional * rate_bps / 10_000.0).max(minimum);
+        let sell_tax = if side == CostSide::Sell {
+            notional * self.sell_tax_bps / 10_000.0
+        } else {
+            0.0
+        };
+        broker_fee + sell_tax
+    }
+
+    pub fn estimated_execution_cost(
+        &self,
+        side: CostSide,
+        notional: f64,
+        quantity: f64,
+    ) -> EstimatedExecutionCost {
+        EstimatedExecutionCost {
+            commission: self.estimated_commission(side, notional, quantity),
+            // Crossing from a mid/open reference to one side of the quoted
+            // market consumes half of the full bid/ask spread on each leg.
+            spread: notional * self.estimated_spread_bps / 2.0 / 10_000.0,
+            slippage: notional * self.estimated_slippage_bps / 10_000.0,
+        }
+    }
+
+    pub fn estimated_round_trip_cost(
+        &self,
+        notional: f64,
+        quantity: f64,
+        learned_commission_bps_p90: Option<f64>,
+    ) -> f64 {
+        let buy = self.estimated_execution_cost(CostSide::Buy, notional, quantity);
+        let sell = self.estimated_execution_cost(CostSide::Sell, notional, quantity);
+        let configured_commissions = buy.commission + sell.commission;
+        let learned_commissions = learned_commission_bps_p90
+            .map(|bps| 2.0 * notional * bps / 10_000.0)
+            .unwrap_or(0.0);
+        configured_commissions.max(learned_commissions)
+            + buy.spread
+            + sell.spread
+            + buy.slippage
+            + sell.slippage
+    }
+}
+
 #[derive(Clone, Debug, serde::Deserialize, Serialize)]
 pub struct StrategyCostControlInput {
     pub strategy_id: uuid::Uuid,
@@ -889,18 +1072,7 @@ pub struct StrategyCostControlInput {
 
 #[derive(Clone, Debug)]
 pub struct ClaimedCostControl {
-    pub currency: String,
-    pub buy_fixed_fee: f64,
-    pub buy_per_share_fee: f64,
-    pub buy_rate_bps: f64,
-    pub buy_min_fee: f64,
-    pub sell_fixed_fee: f64,
-    pub sell_per_share_fee: f64,
-    pub sell_rate_bps: f64,
-    pub sell_min_fee: f64,
-    pub sell_tax_bps: f64,
-    pub estimated_spread_bps: f64,
-    pub estimated_slippage_bps: f64,
+    pub model: ExecutionCostModelInput,
     pub minimum_cost_multiple: f64,
     pub maximum_commission_to_gross_profit_ratio: f64,
     pub minimum_completed_trades: usize,
@@ -1038,7 +1210,12 @@ impl Storage {
             database_path: path.to_path_buf(),
         };
         storage.migrate()?;
+        storage.repair_reconciled_execution_times()?;
         storage.recover_interrupted_jobs()?;
+        storage.recover_dst_decoder_backfill_failures()?;
+        // A daemon restart is a safe point to collapse overlapping queued
+        // downloads left by older versions or repeated Web submissions.
+        storage.deduplicate_active_backfill_jobs()?;
         Ok(storage)
     }
 
@@ -1131,6 +1308,97 @@ impl Storage {
                     detail = 'daemon stopped while action outcome was unknown; manual review required',
                     updated_at = ?
                  WHERE state = 'processing'",
+                params![Utc::now()],
+            )
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        // Keep leg rows consistent with their parent action after a crash;
+        // otherwise legs of a failed batch linger in 'processing' forever.
+        self.connection
+            .execute(
+                "UPDATE strategy_execution_action_legs AS l SET state = 'failed',
+                    detail = 'daemon stopped while leg outcome was unknown; manual review required',
+                    updated_at = ?
+                 WHERE l.state = 'processing'
+                   AND EXISTS (SELECT 1 FROM strategy_execution_actions a
+                               WHERE a.action_id = l.action_id
+                                 AND a.state IN ('failed', 'rejected'))",
+                params![Utc::now()],
+            )
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        // An intent stuck in 'approved' means the daemon stopped between risk
+        // approval and the broker acknowledgement. The order may or may not
+        // have reached IBKR; per the crash-recovery contract it must be marked
+        // 'unknown' and resolved through reconciliation, never resubmitted.
+        self.connection
+            .execute(
+                "UPDATE order_intents SET status = 'unknown',
+                    rejection_reason = 'daemon stopped before the broker acknowledgement was \
+                                        recorded; resolve through reconciliation',
+                    updated_at = ?
+                 WHERE status = 'approved'
+                   AND NOT EXISTS (SELECT 1 FROM orders o
+                                   WHERE o.order_intent_id = order_intents.order_intent_id)",
+                params![Utc::now()],
+            )
+            .map(|_| ())
+            .map_err(|error| AppError::Storage(error.to_string()))
+    }
+
+    fn repair_reconciled_execution_times(&mut self) -> Result<()> {
+        let rows: Vec<(String, DateTime<Utc>, DateTime<Utc>, String)> = {
+            let mut statement = self
+                .connection
+                .prepare(
+                    "SELECT e.broker_execution_id, e.executed_at, o.created_at,
+                            json_extract_string(b.payload_json, '$.completed_time')
+                     FROM executions e
+                     JOIN orders o ON o.order_id = e.order_id
+                     JOIN broker_order_events b
+                       ON b.connection_session_id = o.connection_session_id
+                      AND b.broker_order_id = o.broker_order_id
+                     WHERE b.event_type = 'open_order'
+                       AND json_extract_string(b.payload_json, '$.completed_time') <> ''
+                       AND date_diff('second', o.created_at, e.executed_at) > 300
+                       AND b.received_at = (
+                         SELECT max(latest.received_at) FROM broker_order_events latest
+                         WHERE latest.connection_session_id = o.connection_session_id
+                           AND latest.broker_order_id = o.broker_order_id
+                           AND latest.event_type = 'open_order')",
+                )
+                .map_err(|error| AppError::Storage(error.to_string()))?;
+            statement
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .map_err(|error| AppError::Storage(error.to_string()))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|error| AppError::Storage(error.to_string()))?
+        };
+        for (execution_id, current, created_at, raw_time) in rows {
+            let Ok(executed_at) = crate::ibkr::parse_ibkr_execution_datetime(&raw_time) else {
+                continue;
+            };
+            if (executed_at - created_at).num_minutes().abs() <= 5 && executed_at != current {
+                self.connection
+                    .execute(
+                        "UPDATE executions SET executed_at = ? WHERE broker_execution_id = ?",
+                        params![executed_at, execution_id],
+                    )
+                    .map_err(|error| AppError::Storage(error.to_string()))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn recover_dst_decoder_backfill_failures(&mut self) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE data_jobs
+                 SET state = 'retrying', attempts = 0,
+                     last_error = 'automatically retrying after DST historical decoder recovery',
+                     updated_at = ?
+                 WHERE state = 'failed'
+                   AND last_error LIKE 'IBKR historical decoder panicked on an ambiguous daylight-saving-time endpoint%'",
                 params![Utc::now()],
             )
             .map(|_| ())
@@ -1499,6 +1767,23 @@ impl Storage {
 
     pub fn claim_strategy_action(&mut self) -> Result<Option<ClaimedStrategyAction>> {
         self.record_disabled_strategy_actions()?;
+        // Position targets are computed from positions_current. While an IBKR
+        // position snapshot is synchronizing that table is transiently empty;
+        // claiming during the window would compute deltas against a zero
+        // position (losing close signals forever or doubling entries). Defer
+        // claiming until the snapshot is ready; evaluations stay unclaimed and
+        // are retried on the next scheduler tick.
+        let position_sync_state: String = self
+            .connection
+            .query_row(
+                "SELECT state FROM position_sync_state WHERE singleton",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        if position_sync_state != "ready" {
+            return Ok(None);
+        }
         let candidate = self
             .connection
             .query_row(
@@ -1506,7 +1791,7 @@ impl Storage {
                     c.account_id, c.target_quantity, c.order_type,
                     c.paper_only, c.contract_json::VARCHAR,
                     c.short_target_quantity, c.allow_short, e.output_json::VARCHAR,
-                    e.short_value, e.long_value, s.kind, c.outside_rth
+                    e.short_value, e.long_value, s.kind, c.outside_rth, e.created_at
              FROM strategy_evaluations e
              JOIN strategy_execution_configs c ON c.strategy_id = e.strategy_id
              JOIN strategies s ON s.strategy_id = e.strategy_id
@@ -1533,6 +1818,7 @@ impl Storage {
                         row.get::<_, f64>(12)?,
                         row.get::<_, String>(13)?,
                         row.get::<_, bool>(14)?,
+                        row.get::<_, DateTime<Utc>>(15)?,
                     ))
                 },
             )
@@ -1554,10 +1840,43 @@ impl Storage {
             indicator_b,
             strategy_kind,
             outside_rth,
+            evaluation_created_at,
         )) = candidate
         else {
             return Ok(None);
         };
+        // A signal that sat unexecuted past this age (for example while the
+        // daemon was stopped) no longer reflects current market conditions.
+        // Record it as skipped instead of executing it late; it is never
+        // retried because of the evaluation_id uniqueness.
+        let signal_age_seconds = (Utc::now() - evaluation_created_at).num_seconds();
+        if signal_age_seconds > MAX_EXECUTABLE_SIGNAL_AGE_SECONDS {
+            let now = Utc::now();
+            self.connection
+                .execute(
+                    "INSERT INTO strategy_execution_actions
+                     (action_id, strategy_id, evaluation_id, idempotency_key, signal,
+                      requested_quantity, state, detail, created_at, updated_at,
+                      cost_gate_result)
+                     VALUES (?, ?, ?, ?, ?, NULL, 'skipped', ?, ?, ?, 'stale_signal')",
+                    params![
+                        uuid::Uuid::now_v7(),
+                        strategy_id,
+                        evaluation_id,
+                        format!("strategy:{strategy_id}:{evaluation_id}"),
+                        signal,
+                        format!(
+                            "signal skipped as stale: generated {signal_age_seconds} seconds \
+                             ago, exceeding the {MAX_EXECUTABLE_SIGNAL_AGE_SECONDS} second \
+                             execution window; stale signals are never executed late"
+                        ),
+                        now,
+                        now
+                    ],
+                )
+                .map_err(|error| AppError::Storage(error.to_string()))?;
+            return Ok(None);
+        }
         let signal_edge_bps = if strategy_kind == "paper_round_trip" {
             None
         } else {
@@ -1586,7 +1905,8 @@ impl Storage {
         let mut cost_control = self
             .connection
             .query_row(
-                "SELECT m.currency, m.buy_fixed_fee, m.buy_per_share_fee,
+                "SELECT m.cost_model_id, m.name, m.currency,
+                        m.buy_fixed_fee, m.buy_per_share_fee,
                         m.buy_rate_bps, m.buy_min_fee,
                         m.sell_fixed_fee, m.sell_per_share_fee,
                         m.sell_rate_bps, m.sell_min_fee,
@@ -1600,21 +1920,25 @@ impl Storage {
                 params![strategy_id],
                 |row| {
                     Ok(ClaimedCostControl {
-                        currency: row.get(0)?,
-                        buy_fixed_fee: row.get(1)?,
-                        buy_per_share_fee: row.get(2)?,
-                        buy_rate_bps: row.get(3)?,
-                        buy_min_fee: row.get(4)?,
-                        sell_fixed_fee: row.get(5)?,
-                        sell_per_share_fee: row.get(6)?,
-                        sell_rate_bps: row.get(7)?,
-                        sell_min_fee: row.get(8)?,
-                        sell_tax_bps: row.get(9)?,
-                        estimated_spread_bps: row.get(10)?,
-                        estimated_slippage_bps: row.get(11)?,
-                        minimum_cost_multiple: row.get(12)?,
-                        maximum_commission_to_gross_profit_ratio: row.get(13)?,
-                        minimum_completed_trades: row.get::<_, i64>(14)?.max(0) as usize,
+                        model: ExecutionCostModelInput {
+                            cost_model_id: Some(row.get(0)?),
+                            name: row.get(1)?,
+                            currency: row.get(2)?,
+                            buy_fixed_fee: row.get(3)?,
+                            buy_per_share_fee: row.get(4)?,
+                            buy_rate_bps: row.get(5)?,
+                            buy_min_fee: row.get(6)?,
+                            sell_fixed_fee: row.get(7)?,
+                            sell_per_share_fee: row.get(8)?,
+                            sell_rate_bps: row.get(9)?,
+                            sell_min_fee: row.get(10)?,
+                            sell_tax_bps: row.get(11)?,
+                            estimated_spread_bps: row.get(12)?,
+                            estimated_slippage_bps: row.get(13)?,
+                        },
+                        minimum_cost_multiple: row.get(14)?,
+                        maximum_commission_to_gross_profit_ratio: row.get(15)?,
+                        minimum_completed_trades: row.get::<_, i64>(16)?.max(0) as usize,
                         actual_fee_bps_p90: None,
                     })
                 },
@@ -1634,7 +1958,7 @@ impl Storage {
                      WHERE a.strategy_id = ? AND upper(e.currency) = upper(?)
                        AND e.commission IS NOT NULL
                        AND e.quantity > 0 AND e.price > 0",
-                    params![strategy_id, control.currency],
+                    params![strategy_id, control.model.currency],
                     |row| row.get::<_, Option<f64>>(0),
                 )
                 .map_err(|error| AppError::Storage(error.to_string()))?;
@@ -1659,22 +1983,17 @@ impl Storage {
                 .optional()
                 .map_err(|error| AppError::Storage(error.to_string()))?;
             if let Some((gross_pnl, commissions, trades)) = performance {
-                let ratio = if gross_pnl > 0.0 {
-                    commissions / gross_pnl
-                } else if commissions > 0.0 {
-                    f64::INFINITY
-                } else {
-                    0.0
-                };
-                if trades >= control.minimum_completed_trades
+                if let Some(ratio) = commission_to_gross_profit_ratio(gross_pnl, commissions)
+                    && trades >= control.minimum_completed_trades
                     && ratio > control.maximum_commission_to_gross_profit_ratio
                 {
                     let now = Utc::now();
                     let action_id = uuid::Uuid::now_v7();
                     let detail = format!(
-                        "execution automatically paused: commission/gross-profit ratio {:.4} \
-                         exceeds configured {:.4} after {} completed trades",
-                        ratio, control.maximum_commission_to_gross_profit_ratio, trades
+                        "自动执行已暂停：完成 {trades} 笔交易后，佣金/毛利润比例 {:.2}% \
+                         超过配置上限 {:.2}%",
+                        ratio * 100.0,
+                        control.maximum_commission_to_gross_profit_ratio * 100.0
                     );
                     let transaction = self
                         .connection
@@ -1785,7 +2104,30 @@ impl Storage {
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .map_err(|error| AppError::Storage(error.to_string()))?;
             drop(active_statement);
-            if !active_orders.is_empty() {
+            // Intents whose broker submission is in flight ('approved') or
+            // whose outcome could not be confirmed ('unknown') have no orders
+            // row yet, but the order may already be live at IBKR. They must
+            // block further automatic submissions for the same contract until
+            // they resolve (unknown intents resolve only through
+            // reconciliation).
+            let mut pending_statement = self
+                .connection
+                .prepare(
+                    "SELECT order_intent_id, status FROM order_intents
+                     WHERE account_id = ? AND conid = ?
+                       AND status IN ('approved', 'unknown')
+                     ORDER BY created_at",
+                )
+                .map_err(|error| AppError::Storage(error.to_string()))?;
+            let pending_intents = pending_statement
+                .query_map(params![account, leg_contract.conid], |row| {
+                    Ok((row.get::<_, uuid::Uuid>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|error| AppError::Storage(error.to_string()))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|error| AppError::Storage(error.to_string()))?;
+            drop(pending_statement);
+            if !active_orders.is_empty() || !pending_intents.is_empty() {
                 for (order_id, broker_order_id, status) in active_orders {
                     let broker = broker_order_id
                         .map(|id| id.to_string())
@@ -1798,6 +2140,13 @@ impl Storage {
                         broker,
                         status,
                         order_id
+                    ));
+                }
+                for (intent_id, status) in pending_intents {
+                    active_order_details.push(format!(
+                        "{}（Conid {}，账户 {}）存在未决订单意图：Intent {}，状态 {}；\
+                         'unknown' 状态必须先通过对账确认结果",
+                        leg_contract.symbol, leg_contract.conid, account, intent_id, status
                     ));
                 }
                 continue;
@@ -2364,6 +2713,29 @@ impl Storage {
             return Ok(false);
         }
         bars.reverse();
+        let expected_seconds = match strategy.bar_timeframe() {
+            "5s" => 5,
+            "1m" => 60,
+            _ => unreachable!("timeframe validated above"),
+        };
+        if bars
+            .windows(2)
+            .any(|pair| (pair[1].time - pair[0].time).num_seconds() != expected_seconds)
+        {
+            // A quote-silent period or a recent reconnect is an expected
+            // readiness state, not a strategy failure. Do not emit an ERROR on
+            // every scheduler pass; the next real tick will carry short gaps
+            // forward and evaluation resumes once the window is contiguous.
+            self.connection
+                .execute(
+                    "UPDATE strategies SET last_error = NULL
+                     WHERE strategy_id = ?
+                       AND last_error LIKE '%contiguous%Bars%waiting%gaps%'",
+                    params![strategy_id],
+                )
+                .map_err(|error| AppError::Storage(error.to_string()))?;
+            return Ok(false);
+        }
         let bar_time = bars.last().expect("bars non-empty").time;
         if last_evaluated.is_some_and(|time| time >= bar_time) {
             return Ok(false);
@@ -3030,6 +3402,19 @@ impl Storage {
                 "strategy and execution cost model must both exist".into(),
             ));
         }
+        let strategy_state: String = self
+            .connection
+            .query_row(
+                "SELECT state FROM strategies WHERE strategy_id = ?",
+                params![input.strategy_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        if strategy_state == "running" {
+            return Err(AppError::Storage(
+                "策略正在运行，无法修改成本控制；请先暂停策略，保存后再重新启动".into(),
+            ));
+        }
         let now = Utc::now();
         self.connection
             .execute(
@@ -3364,7 +3749,27 @@ impl Storage {
             "sell" => -request.quantity,
             _ => 0.0,
         };
-        let projected_position = current_position + signed_quantity;
+        // Intents that are approved but not yet acknowledged by the broker, or
+        // whose outcome is unknown, may already be live at IBKR. Project them
+        // into the position so concurrent submissions cannot squeeze past the
+        // position and exposure limits together.
+        let pending_intent_quantity: f64 = self
+            .connection
+            .query_row(
+                "SELECT coalesce(sum(CASE
+                     WHEN lower(json_extract_string(payload_json, '$.side')) = 'buy'
+                     THEN coalesce(try_cast(
+                         json_extract_string(payload_json, '$.quantity') AS DOUBLE), 0)
+                     ELSE -coalesce(try_cast(
+                         json_extract_string(payload_json, '$.quantity') AS DOUBLE), 0)
+                 END), 0)
+                 FROM order_intents
+                 WHERE account_id = ? AND conid = ? AND status IN ('approved', 'unknown')",
+                params![account, request.contract.conid],
+                |row| row.get(0),
+            )
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        let projected_position = current_position + pending_intent_quantity + signed_quantity;
         let mut position_statement = self
             .connection
             .prepare(
@@ -3389,27 +3794,42 @@ impl Storage {
         drop(position_statement);
         let mut gross_exposure = 0.0;
         let mut net_exposure = 0.0;
+        // Exposure conversion fails closed: a position whose currency has no
+        // fresh FX rate must reject opening orders instead of being silently
+        // excluded from the gross/net exposure totals.
+        let mut missing_fx_currencies: Vec<String> = Vec::new();
         for (quantity, average_cost, currency) in position_rows {
-            let rate = self
-                .currency_conversion_rate(
-                    &currency,
-                    &config.base_currency,
-                    config.max_fx_rate_age_seconds,
-                    now,
-                )?
-                .unwrap_or(0.0);
+            let rate = self.currency_conversion_rate(
+                &currency,
+                &config.base_currency,
+                config.max_fx_rate_age_seconds,
+                now,
+            )?;
+            let Some(rate) = rate else {
+                if quantity != 0.0 && !missing_fx_currencies.contains(&currency) {
+                    missing_fx_currencies.push(currency);
+                }
+                continue;
+            };
             let exposure = quantity * average_cost * rate;
             gross_exposure += exposure.abs();
             net_exposure += exposure;
         }
-        let request_fx_rate = self
-            .currency_conversion_rate(
-                &request.contract.currency,
-                &config.base_currency,
-                config.max_fx_rate_age_seconds,
-                now,
-            )?
-            .unwrap_or(0.0);
+        let request_fx_rate = match self.currency_conversion_rate(
+            &request.contract.currency,
+            &config.base_currency,
+            config.max_fx_rate_age_seconds,
+            now,
+        )? {
+            Some(rate) => rate,
+            None => {
+                let currency = request.contract.currency.clone();
+                if !missing_fx_currencies.contains(&currency) {
+                    missing_fx_currencies.push(currency);
+                }
+                0.0
+            }
+        };
         let latest_position_observed_at = self
             .connection
             .query_row(
@@ -3435,17 +3855,23 @@ impl Storage {
         let projected_gross_exposure =
             (gross_exposure - current_contribution.abs() + projected_contribution.abs()).max(0.0);
         let projected_net_exposure = net_exposure - current_contribution + projected_contribution;
+        // Counts broker-active orders plus intents that are in flight
+        // ('approved') or unresolved ('unknown'); both may already occupy an
+        // order slot at IBKR even though no orders row exists yet.
         let active_order_count: i64 = self
             .connection
             .query_row(
-                "SELECT count(*) FROM orders o
-                 JOIN order_intents i USING (order_intent_id)
-                 WHERE i.account_id = ?
-                   AND lower(o.status) IN
-                       ('submitted', 'presubmitted', 'pending_submit',
-                        'pendingsubmit', 'pending_cancel', 'pendingcancel',
-                        'cancel_pending')",
-                params![account],
+                "SELECT
+                   (SELECT count(*) FROM orders o
+                    JOIN order_intents i USING (order_intent_id)
+                    WHERE i.account_id = ?
+                      AND lower(o.status) IN
+                          ('submitted', 'presubmitted', 'pending_submit',
+                           'pendingsubmit', 'pending_cancel', 'pendingcancel',
+                           'cancel_pending', 'apipending', 'api_pending'))
+                 + (SELECT count(*) FROM order_intents
+                    WHERE account_id = ? AND status IN ('approved', 'unknown'))",
+                params![account, account],
                 |row| row.get(0),
             )
             .map_err(|error| AppError::Storage(error.to_string()))?;
@@ -3503,6 +3929,18 @@ impl Storage {
                 decision,
                 "POSITION_SYNC_INCOMPLETE",
                 "IBKR position snapshot is still synchronizing".into(),
+            ));
+        }
+        if !close_only && !missing_fx_currencies.is_empty() {
+            return Ok(portfolio_reject(
+                decision,
+                "FX_RATE_UNAVAILABLE",
+                format!(
+                    "portfolio exposure cannot be converted to {}: no fresh FX rate for {}; \
+                     opening risk is blocked",
+                    config.base_currency,
+                    missing_fx_currencies.join(", ")
+                ),
             ));
         }
         if !close_only
@@ -3671,6 +4109,48 @@ impl Storage {
             .connection
             .transaction()
             .map_err(|error| AppError::Storage(error.to_string()))?;
+        let previous: Option<(DateTime<Utc>, f64)> = transaction
+            .query_row(
+                &format!(
+                    "SELECT bar_time, close FROM {table}
+                     WHERE conid = ? AND bar_time < ? ORDER BY bar_time DESC LIMIT 1"
+                ),
+                params![conid, bar_time],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        if let Some((previous_time, previous_close)) = previous {
+            let missing = (bar_time - previous_time).num_seconds() / interval_seconds - 1;
+            // Carry forward short quote-silent periods so an N-Bar indicator
+            // still represents N fixed time buckets. A long disconnect is not
+            // synthesized; strategy evaluation then pauses until enough fresh,
+            // contiguous history has accumulated.
+            if missing > 0 && missing <= 120 {
+                for offset in 1..=missing {
+                    let synthetic_time =
+                        previous_time + chrono::Duration::seconds(offset * interval_seconds);
+                    transaction
+                        .execute(
+                            &format!(
+                                "INSERT INTO {table}
+                                 VALUES (?, ?, ?, ?, ?, ?, 0, true, ?)
+                                 ON CONFLICT (conid, bar_time) DO NOTHING"
+                            ),
+                            params![
+                                conid,
+                                synthetic_time,
+                                previous_close,
+                                previous_close,
+                                previous_close,
+                                previous_close,
+                                observed_at
+                            ],
+                        )
+                        .map_err(|error| AppError::Storage(error.to_string()))?;
+                }
+            }
+        }
         transaction
             .execute(
                 &format!(
@@ -3680,6 +4160,9 @@ impl Storage {
                 params![observed_at, conid, bar_time],
             )
             .map_err(|error| AppError::Storage(error.to_string()))?;
+        // A finalised bar is immutable: strategy evaluations are idempotent
+        // per bar, so a late out-of-order tick must never rewrite the OHLC of
+        // a bar that may already have produced a persisted signal.
         transaction
             .execute(
                 &format!(
@@ -3690,7 +4173,8 @@ impl Storage {
                    low = least({table}.low, excluded.close),
                    close = excluded.close,
                    tick_count = {table}.tick_count + 1,
-                   updated_at = excluded.updated_at"
+                   updated_at = excluded.updated_at
+                 WHERE {table}.final = false"
                 ),
                 params![conid, bar_time, price, price, price, price, observed_at],
             )
@@ -3700,13 +4184,50 @@ impl Storage {
             .map_err(|error| AppError::Storage(error.to_string()))
     }
 
-    pub fn create_backfill_job(&mut self, request: &BackfillJobRequest) -> Result<uuid::Uuid> {
+    pub fn create_backfill_job(
+        &mut self,
+        request: &BackfillJobRequest,
+    ) -> Result<BackfillJobCreation> {
         if request.end <= request.start {
             return Err(AppError::Storage("backfill end must be after start".into()));
         }
+        // DuckDB TIMESTAMPTZ stores microsecond precision. Keep request_json and
+        // cursor/end columns at the same precision so a completed job cannot
+        // appear to have a sub-microsecond uncovered tail.
+        let mut request = request.clone();
+        request.start = duckdb_timestamp(request.start);
+        request.end = duckdb_timestamp(request.end);
+        self.deduplicate_active_backfill_jobs()?;
+
+        if let Some(existing) = self.active_backfill_jobs()?.into_iter().find(|job| {
+            same_backfill_scope(&job.request, &request)
+                    && backfill_ranges_overlap(&job.request, &request)
+                    // Moving a running cursor backwards would race the slice
+                    // that is already in flight. End-only expansion is safe;
+                    // the worker reads the persisted end on advance.
+                    && (job.state != "running" || request.start >= job.request.start)
+        }) {
+            let merged_start = existing.request.start.min(request.start);
+            let merged_end = existing.request.end.max(request.end);
+            let range_expanded =
+                merged_start != existing.request.start || merged_end != existing.request.end;
+            if range_expanded {
+                let mut merged = existing.request.clone();
+                merged.start = merged_start;
+                merged.end = merged_end;
+                self.update_backfill_job_range(&existing, &merged)?;
+                self.deduplicate_active_backfill_jobs()?;
+            }
+            return Ok(BackfillJobCreation {
+                job_id: existing.job_id,
+                reused: true,
+                range_expanded,
+            });
+        }
+
         let job_id = uuid::Uuid::now_v7();
         let now = Utc::now();
-        let request_json = serde_json::to_string(request)?;
+        let request_json = serde_json::to_string(&request)?;
         self.connection
             .execute(
                 "INSERT INTO data_jobs VALUES
@@ -3714,7 +4235,132 @@ impl Storage {
                 params![job_id, request_json, request.start, request.end, now, now],
             )
             .map_err(|error| AppError::Storage(error.to_string()))?;
-        Ok(job_id)
+        Ok(BackfillJobCreation {
+            job_id,
+            reused: false,
+            range_expanded: false,
+        })
+    }
+
+    fn active_backfill_jobs(&self) -> Result<Vec<ActiveBackfillJob>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT job_id, state, request_json::VARCHAR, cursor_time,
+                        completed_slices
+                 FROM data_jobs
+                 WHERE job_type = 'historical_backfill'
+                   AND state IN ('pending', 'retrying', 'running')
+                   AND attempts < 3
+                 ORDER BY created_at, job_id",
+            )
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        let rows = statement
+            .query_map([], |row| {
+                let request_json = row.get::<_, String>(2)?;
+                Ok((
+                    row.get::<_, uuid::Uuid>(0)?,
+                    row.get::<_, String>(1)?,
+                    request_json,
+                    row.get::<_, DateTime<Utc>>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        rows.map(|row| {
+            let (job_id, state, request_json, cursor_time, completed_slices) =
+                row.map_err(|error| AppError::Storage(error.to_string()))?;
+            let request = serde_json::from_str(&request_json)?;
+            Ok(ActiveBackfillJob {
+                job_id,
+                state,
+                request,
+                cursor_time,
+                completed_slices,
+            })
+        })
+        .collect()
+    }
+
+    fn update_backfill_job_range(
+        &mut self,
+        existing: &ActiveBackfillJob,
+        merged: &BackfillJobRequest,
+    ) -> Result<()> {
+        let reset_cursor = merged.start < existing.request.start;
+        let cursor_time = if reset_cursor {
+            merged.start
+        } else {
+            existing.cursor_time
+        };
+        let completed_slices = if reset_cursor {
+            0
+        } else {
+            existing.completed_slices
+        };
+        let request_json = serde_json::to_string(merged)?;
+        self.connection
+            .execute(
+                "UPDATE data_jobs
+                 SET request_json = ?, cursor_time = ?, end_time = ?,
+                     completed_slices = ?, updated_at = ?
+                 WHERE job_id = ?",
+                params![
+                    request_json,
+                    cursor_time,
+                    merged.end,
+                    completed_slices,
+                    Utc::now(),
+                    existing.job_id
+                ],
+            )
+            .map(|_| ())
+            .map_err(|error| AppError::Storage(error.to_string()))
+    }
+
+    fn deduplicate_active_backfill_jobs(&mut self) -> Result<()> {
+        loop {
+            let jobs = self.active_backfill_jobs()?;
+            let mut duplicate = None;
+            'outer: for (index, primary) in jobs.iter().enumerate() {
+                for secondary in jobs.iter().skip(index + 1) {
+                    if !same_backfill_scope(&primary.request, &secondary.request)
+                        || !backfill_ranges_overlap(&primary.request, &secondary.request)
+                        || secondary.state == "running"
+                    {
+                        continue;
+                    }
+                    let merged_start = primary.request.start.min(secondary.request.start);
+                    // A running task may only be extended forward. Startup
+                    // recovery turns interrupted jobs into retrying before this
+                    // method runs, so this restriction only affects live RPCs.
+                    if primary.state == "running" && merged_start < primary.request.start {
+                        continue;
+                    }
+                    duplicate = Some((primary.clone(), secondary.clone()));
+                    break 'outer;
+                }
+            }
+            let Some((primary, secondary)) = duplicate else {
+                return Ok(());
+            };
+            let mut merged = primary.request.clone();
+            merged.start = merged.start.min(secondary.request.start);
+            merged.end = merged.end.max(secondary.request.end);
+            self.update_backfill_job_range(&primary, &merged)?;
+            self.connection
+                .execute(
+                    "UPDATE data_jobs
+                     SET state = 'cancelled', last_error = ?, updated_at = ?
+                     WHERE job_id = ? AND state IN ('pending', 'retrying')",
+                    params![
+                        format!("merged into historical data job {}", primary.job_id),
+                        Utc::now(),
+                        secondary.job_id
+                    ],
+                )
+                .map_err(|error| AppError::Storage(error.to_string()))?;
+        }
     }
 
     pub fn claim_backfill_job(&mut self) -> Result<Option<ClaimedBackfillJob>> {
@@ -3759,8 +4405,19 @@ impl Storage {
         &mut self,
         job_id: uuid::Uuid,
         next_cursor: DateTime<Utc>,
-        end_time: DateTime<Utc>,
+        _end_time: DateTime<Utc>,
     ) -> Result<()> {
+        // The range can be expanded while a slice is in flight. Always use the
+        // persisted end instead of the stale end captured when the worker
+        // claimed that slice.
+        let end_time = self
+            .connection
+            .query_row(
+                "SELECT end_time FROM data_jobs WHERE job_id = ?",
+                params![job_id],
+                |row| row.get::<_, DateTime<Utc>>(0),
+            )
+            .map_err(|error| AppError::Storage(error.to_string()))?;
         let state = if next_cursor >= end_time {
             "completed"
         } else {
@@ -3799,17 +4456,45 @@ impl Storage {
             .map_err(|error| AppError::Storage(error.to_string()))
     }
 
-    pub fn list_data_jobs(&self) -> Result<Vec<serde_json::Value>> {
+    #[cfg(test)]
+    pub fn list_data_jobs(&self, worker_ready: bool) -> Result<Vec<serde_json::Value>> {
+        self.list_data_jobs_page(worker_ready, 1, 200)
+            .map(|(jobs, _)| jobs)
+    }
+
+    pub fn data_job_queue_status(&self) -> Result<(Option<uuid::Uuid>, usize)> {
+        let jobs = self.active_backfill_jobs()?;
+        Ok((jobs.first().map(|job| job.job_id), jobs.len()))
+    }
+
+    pub fn list_data_jobs_page(
+        &self,
+        worker_ready: bool,
+        page: usize,
+        page_size: usize,
+    ) -> Result<(Vec<serde_json::Value>, usize)> {
+        let queue_positions = self
+            .active_backfill_jobs()?
+            .into_iter()
+            .enumerate()
+            .map(|(index, job)| (job.job_id, index + 1))
+            .collect::<std::collections::HashMap<_, _>>();
+        let total: i64 = self
+            .connection
+            .query_row("SELECT count(*) FROM data_jobs", [], |row| row.get(0))
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        let page_size = page_size.clamp(1, 500);
+        let offset = page.saturating_sub(1).saturating_mul(page_size);
         let mut statement = self
             .connection
             .prepare(
                 "SELECT job_id, job_type, state, request_json::VARCHAR, cursor_time, end_time, attempts,
                         completed_slices, last_error, created_at, updated_at
-                 FROM data_jobs ORDER BY created_at DESC LIMIT 200",
+                 FROM data_jobs ORDER BY created_at DESC LIMIT ? OFFSET ?",
             )
             .map_err(|error| AppError::Storage(error.to_string()))?;
         let rows = statement
-            .query_map([], |row| {
+            .query_map(params![page_size as i64, offset as i64], |row| {
                 Ok(serde_json::json!({
                     "job_id": row.get::<_, uuid::Uuid>(0)?,
                     "job_type": row.get::<_, String>(1)?,
@@ -3827,8 +4512,35 @@ impl Storage {
                 }))
             })
             .map_err(|error| AppError::Storage(error.to_string()))?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|error| AppError::Storage(error.to_string()))
+        let mut jobs = rows
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        for job in &mut jobs {
+            let Some(object) = job.as_object_mut() else {
+                continue;
+            };
+            let job_id = object.get("job_id").and_then(Value::as_str);
+            let state = object
+                .get("state")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let position = job_id
+                .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                .and_then(|value| queue_positions.get(&value).copied());
+            let runtime_state = match position {
+                Some(1) if !worker_ready => "waiting_for_ibkr",
+                Some(1) => "running",
+                Some(_) => "queued",
+                None => state,
+            };
+            object.insert("runtime_state".into(), serde_json::json!(runtime_state));
+            object.insert("queue_position".into(), serde_json::json!(position));
+            object.insert(
+                "jobs_ahead".into(),
+                serde_json::json!(position.map(|value| value.saturating_sub(1))),
+            );
+        }
+        Ok((jobs, total.max(0) as usize))
     }
 
     pub fn cancel_data_job(&mut self, job_id: uuid::Uuid) -> Result<bool> {
@@ -3843,6 +4555,7 @@ impl Storage {
             .map_err(|error| AppError::Storage(error.to_string()))
     }
 
+    #[cfg(test)]
     pub fn historical_coverage(
         &self,
         conid: i32,
@@ -3850,61 +4563,197 @@ impl Storage {
         requested_start: DateTime<Utc>,
         requested_end: DateTime<Utc>,
     ) -> Result<serde_json::Value> {
+        self.historical_coverage_for_session(
+            conid,
+            timeframe,
+            requested_start,
+            requested_end,
+            false,
+        )
+    }
+
+    /// Reports whether a backtest range has been fully inspected by successful
+    /// IBKR backfill slices for the requested session scope.
+    ///
+    /// Manifest timestamps alone cannot prove this: nights, weekends, holidays
+    /// and valid no-trade slices create no Parquet rows. Conversely, a single
+    /// Parquet fragment inside a long request must not make that entire request
+    /// runnable. `data_jobs.cursor_time` advances only after a slice succeeds,
+    /// so the union of `[request.start, cursor_time)` is the authoritative
+    /// download-verification range.
+    pub fn historical_coverage_for_session(
+        &self,
+        conid: i32,
+        timeframe: &str,
+        requested_start: DateTime<Utc>,
+        requested_end: DateTime<Utc>,
+        outside_rth: bool,
+    ) -> Result<serde_json::Value> {
+        let requested_start = duckdb_timestamp(requested_start);
+        let requested_end = duckdb_timestamp(requested_end);
+        if requested_end <= requested_start {
+            return Err(AppError::Storage("coverage end must be after start".into()));
+        }
+        let step = timeframe_duration(timeframe)?;
+        let session_kind = if outside_rth { "extended" } else { "regular" };
         let mut statement = self
             .connection
             .prepare(
                 "SELECT min_time, max_time, row_count, relative_path
                  FROM dataset_files
                  WHERE dataset = 'bars' AND conid = ? AND timeframe = ? AND active = true
+                   AND coalesce(session_kind, 'regular') = ?
+                   AND max_time >= ? AND min_time < ?
                  ORDER BY min_time",
             )
             .map_err(|error| AppError::Storage(error.to_string()))?;
         let files = statement
-            .query_map(params![conid, timeframe], |row| {
+            .query_map(
+                params![
+                    conid,
+                    timeframe,
+                    session_kind,
+                    requested_start,
+                    requested_end
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, DateTime<Utc>>(0)?,
+                        row.get::<_, DateTime<Utc>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .map_err(|error| AppError::Storage(error.to_string()))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+
+        let mut rows = 0_i64;
+        let mut file_values = Vec::new();
+        let mut file_intervals = Vec::new();
+        let mut first_bar_time: Option<DateTime<Utc>> = None;
+        let mut last_bar_time: Option<DateTime<Utc>> = None;
+        for (min_time, max_time, row_count, path) in files {
+            rows += row_count;
+            file_intervals.push((min_time, max_time + step));
+            first_bar_time = Some(first_bar_time.map_or(min_time, |value| value.min(min_time)));
+            last_bar_time = Some(last_bar_time.map_or(max_time, |value| value.max(max_time)));
+            file_values.push(serde_json::json!({
+                "path": path,
+                "min_time": min_time,
+                "max_time": max_time,
+                "row_count": row_count,
+                "session_kind": session_kind
+            }));
+        }
+
+        let raw_gaps = interval_gaps(requested_start, requested_end, &file_intervals);
+        let raw_covered = raw_gaps.is_empty();
+
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT job_id, state, request_json::VARCHAR, cursor_time
+                 FROM data_jobs
+                 WHERE job_type = 'historical_backfill' AND cursor_time > ?
+                 ORDER BY created_at",
+            )
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        let jobs = statement
+            .query_map(params![requested_start], |row| {
                 Ok((
-                    row.get::<_, DateTime<Utc>>(0)?,
-                    row.get::<_, DateTime<Utc>>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, String>(3)?,
+                    row.get::<_, uuid::Uuid>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, DateTime<Utc>>(3)?,
                 ))
             })
             .map_err(|error| AppError::Storage(error.to_string()))?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|error| AppError::Storage(error.to_string()))?;
-        let step = timeframe_duration(timeframe)?;
-        let mut gaps = Vec::new();
-        let mut cursor = requested_start;
-        let mut rows = 0_i64;
-        let mut file_values = Vec::new();
-        for (min_time, max_time, row_count, path) in files {
-            if max_time < requested_start || min_time >= requested_end {
+        let mut verified_intervals = Vec::new();
+        let mut verified_jobs = Vec::new();
+        for (job_id, state, request_json, cursor_time) in jobs {
+            let Ok(mut request) = serde_json::from_str::<BackfillJobRequest>(&request_json) else {
+                continue;
+            };
+            request.start = duckdb_timestamp(request.start);
+            request.end = duckdb_timestamp(request.end);
+            if request.contract.conid != conid
+                || request.timeframe != timeframe
+                || request.outside_rth != outside_rth
+            {
                 continue;
             }
-            if min_time > cursor {
-                gaps.push(serde_json::json!({"start": cursor, "end": min_time}));
+            let verified_end = cursor_time.min(request.end);
+            if verified_end <= request.start {
+                continue;
             }
-            cursor = cursor.max(max_time + step);
-            rows += row_count;
-            file_values.push(serde_json::json!({
-                "path": path,
-                "min_time": min_time,
-                "max_time": max_time,
-                "row_count": row_count
+            verified_intervals.push((request.start, verified_end));
+            verified_jobs.push(serde_json::json!({
+                "job_id": job_id,
+                "state": state,
+                "start": request.start,
+                "verified_end": verified_end,
+                "requested_end": request.end
             }));
         }
-        if cursor < requested_end {
-            gaps.push(serde_json::json!({"start": cursor, "end": requested_end}));
-        }
+
+        let verified_ranges =
+            merged_time_intervals(requested_start, requested_end, &verified_intervals);
+        let verified_gaps = interval_gaps(requested_start, requested_end, &verified_ranges);
+        let download_verified = verified_gaps.is_empty();
+        let has_data = !file_values.is_empty() && rows > 0;
+        // Only successful slice traversal proves that an exchange-data range
+        // is complete. Raw Parquet continuity is diagnostic-only: a compact
+        // file can span a missing month, while nights/weekends legitimately
+        // produce no files at all.
+        let backtest_ready = has_data && download_verified;
+        let coverage_error = if !download_verified {
+            Some(format!(
+                "historical download has not successfully fetched {} interval(s) in the requested range",
+                verified_gaps.len()
+            ))
+        } else if !has_data {
+            Some(
+                "the requested range was fetched but contains no local bars for this session scope"
+                    .to_owned(),
+            )
+        } else {
+            None
+        };
+        let verified_range_values = gaps_to_json(&verified_ranges);
+        let verified_gap_values = gaps_to_json(&verified_gaps);
         Ok(serde_json::json!({
             "conid": conid,
             "timeframe": timeframe,
             "requested_start": requested_start,
             "requested_end": requested_end,
-            "covered": gaps.is_empty(),
+            "outside_rth": outside_rth,
+            "session_kind": session_kind,
+            "covered": download_verified,
+            "verified": download_verified,
+            "backtest_ready": backtest_ready,
+            "coverage_basis": "successful_backfill_ranges",
+            "download_verified": download_verified,
+            "fetched_ranges": verified_range_values.clone(),
+            "verified_ranges": verified_range_values,
+            "unfetched_ranges": verified_gap_values.clone(),
+            "verified_gaps": verified_gap_values,
+            "raw_covered": raw_covered,
             "row_count": rows,
+            "row_count_basis": "overlapping_file_manifests",
             "files": file_values,
-            "raw_gaps": gaps,
-            "calendar_adjusted": false
+            "first_bar_time": first_bar_time,
+            "last_bar_time": last_bar_time,
+            "raw_gaps": gaps_to_json(&raw_gaps),
+            "verified_jobs": verified_jobs,
+            // The current ContractDetails cache only covers nearby dates and
+            // is not a historical-calendar proof. Successful empty backfill
+            // slices are what verify nights, weekends and holidays here.
+            "calendar_adjusted": false,
+            "coverage_error": coverage_error
         }))
     }
 
@@ -4158,7 +5007,12 @@ impl Storage {
         let destination = backup_dir.join(backup_id.to_string());
         let files_dir = destination.join("lake");
         fs::create_dir_all(&files_dir)?;
-        fs::copy(&self.database_path, destination.join("state.duckdb"))?;
+        let database_target = destination.join("state.duckdb");
+        fs::copy(&self.database_path, &database_target)?;
+        // The manifest carries a checksum of the copied database so a restore
+        // can verify the copy is intact. The checksum is computed on the copy
+        // (after CHECKPOINT, under the storage lock, so no concurrent writes).
+        let database_checksum = file_checksum(&database_target)?;
         let mut statement = self
             .connection
             .prepare(
@@ -4186,10 +5040,24 @@ impl Storage {
                 fs::create_dir_all(parent)?;
             }
             fs::copy(&source, &target)?;
+            // Verify each copy against the manifest checksum (or the source
+            // checksum when the manifest has none). A mismatch fails the
+            // backup instead of silently persisting a corrupt copy.
+            let expected = match checksum {
+                Some(value) => value,
+                None => file_checksum(&source)?,
+            };
+            let copied = file_checksum(&target)?;
+            if copied != expected {
+                return Err(AppError::Storage(format!(
+                    "backup copy verification failed for {relative_path}: \
+                     checksum {copied} does not match expected {expected}"
+                )));
+            }
             manifest_files.push(serde_json::json!({
                 "file_id": file_id,
                 "relative_path": relative_path,
-                "checksum": checksum.or_else(|| file_checksum(&source).ok())
+                "checksum": expected
             }));
         }
         let manifest = serde_json::json!({
@@ -4197,6 +5065,7 @@ impl Storage {
             "created_at": Utc::now(),
             "schema_version": self.schema_version()?,
             "database": "state.duckdb",
+            "database_checksum": database_checksum,
             "files": manifest_files
         });
         fs::write(
@@ -4243,18 +5112,56 @@ impl Storage {
     ) -> Result<serde_json::Value> {
         let request = self.resolve_backtest_request(request)?;
         validate_backtest_request(&request)?;
+        let (cost_model, cost_model_source) = self.resolve_backtest_cost_model(&request)?;
+        let mut persisted_parameters = serde_json::to_value(&request)?;
+        persisted_parameters["cost_model"] = serde_json::to_value(&cost_model)?;
+        persisted_parameters["cost_model_source"] = serde_json::json!(cost_model_source);
+        let coverage = self.historical_coverage_for_session(
+            request.conid,
+            &request.timeframe,
+            request.start,
+            request.end,
+            request.outside_rth,
+        )?;
+        if coverage["backtest_ready"] != true {
+            let detail = coverage["coverage_error"]
+                .as_str()
+                .unwrap_or("historical coverage could not be verified");
+            return Err(AppError::Storage(format!(
+                "backtest data is incomplete for {} {} data: {detail}. \
+                 Wait for a matching IBKR backfill job to finish",
+                request.timeframe,
+                if request.outside_rth {
+                    "extended-hours"
+                } else {
+                    "regular-hours"
+                }
+            )));
+        }
+        let session_kind = if request.outside_rth {
+            "extended"
+        } else {
+            "regular"
+        };
         let mut statement = self
             .connection
             .prepare(
                 "SELECT file_id, relative_path FROM dataset_files
                  WHERE dataset = 'bars' AND conid = ? AND timeframe = ? AND active = true
+                   AND coalesce(session_kind, 'regular') = ?
                    AND max_time >= ? AND min_time < ?
                  ORDER BY min_time",
             )
             .map_err(|error| AppError::Storage(error.to_string()))?;
         let files = statement
             .query_map(
-                params![request.conid, request.timeframe, request.start, request.end],
+                params![
+                    request.conid,
+                    request.timeframe,
+                    session_kind,
+                    request.start,
+                    request.end
+                ],
                 |row| Ok((row.get::<_, uuid::Uuid>(0)?, row.get::<_, String>(1)?)),
             )
             .map_err(|error| AppError::Storage(error.to_string()))?
@@ -4305,8 +5212,9 @@ impl Storage {
         let file_ids: Vec<uuid::Uuid> = files.iter().map(|(file_id, _)| *file_id).collect();
         // Simulate before writing the run row: a failure is recorded as a
         // terminal 'failed' run instead of leaving a zombie 'running' record.
-        let simulation = build_backtest_strategy(&request)
-            .and_then(|strategy| simulate_strategy(&request, strategy.as_ref(), &bars));
+        let simulation = build_backtest_strategy(&request).and_then(|strategy| {
+            simulate_strategy(&request, strategy.as_ref(), &cost_model, &bars)
+        });
         let (trades, equity, metrics) = match simulation {
             Ok(result) => result,
             Err(error) => {
@@ -4317,7 +5225,7 @@ impl Storage {
                         params![
                             backtest_id,
                             request.strategy_kind,
-                            serde_json::to_string(&request)?,
+                            serde_json::to_string(&persisted_parameters)?,
                             serde_json::to_string(&file_ids)?,
                             request.seed,
                             started_at,
@@ -4340,7 +5248,7 @@ impl Storage {
                 params![
                     backtest_id,
                     request.strategy_kind,
-                    serde_json::to_string(&request)?,
+                    serde_json::to_string(&persisted_parameters)?,
                     serde_json::to_string(&file_ids)?,
                     request.seed,
                     started_at,
@@ -4365,7 +5273,8 @@ impl Storage {
                         trade.quantity,
                         trade.price,
                         trade.commission,
-                        trade.slippage
+                        trade.slippage,
+                        trade.spread
                     ])
                     .map_err(|error| AppError::Storage(error.to_string()))?;
             }
@@ -4400,8 +5309,117 @@ impl Storage {
             "backtest_id": backtest_id,
             "state": "completed",
             "metrics": metrics,
+            "cost_model": cost_model,
             "dataset_file_ids": file_ids
         }))
+    }
+
+    fn resolve_backtest_cost_model(
+        &self,
+        request: &BacktestRequest,
+    ) -> Result<(ExecutionCostModelInput, &'static str)> {
+        let instrument_currency = self
+            .connection
+            .query_row(
+                "SELECT currency FROM instruments WHERE conid = ?",
+                params![request.conid],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        let (model, source) = if let Some(strategy_id) = request.strategy_id {
+            let model = self
+                .execution_cost_model_for_strategy(strategy_id)?
+                .ok_or_else(|| {
+                    AppError::Storage(
+                        "strategy has no assigned execution cost model; configure one on the 交易成本 page before running a backtest"
+                            .into(),
+                    )
+                })?;
+            (model, "strategy_cost_control")
+        } else {
+            let cost_model_id = request.cost_model_id.ok_or_else(|| {
+                AppError::Storage(
+                    "cost_model_id is required for an ad-hoc backtest; select a database fee model"
+                        .into(),
+                )
+            })?;
+            let model = self
+                .execution_cost_model_by_id(cost_model_id)?
+                .ok_or_else(|| AppError::Storage(format!("unknown cost model {cost_model_id}")))?;
+            (model, "explicit_cost_model")
+        };
+        if let Some(currency) = instrument_currency
+            && !currency.eq_ignore_ascii_case(&model.currency)
+        {
+            return Err(AppError::Storage(format!(
+                "strategy cost model currency {} does not match instrument currency {}",
+                model.currency, currency
+            )));
+        }
+        Ok((model, source))
+    }
+
+    fn execution_cost_model_for_strategy(
+        &self,
+        strategy_id: uuid::Uuid,
+    ) -> Result<Option<ExecutionCostModelInput>> {
+        self.query_execution_cost_model(
+            "SELECT m.cost_model_id, m.name, m.currency,
+                    m.buy_fixed_fee, m.buy_per_share_fee,
+                    m.buy_rate_bps, m.buy_min_fee,
+                    m.sell_fixed_fee, m.sell_per_share_fee,
+                    m.sell_rate_bps, m.sell_min_fee, m.sell_tax_bps,
+                    m.estimated_spread_bps, m.estimated_slippage_bps
+             FROM strategy_cost_controls c
+             JOIN execution_cost_models m USING (cost_model_id)
+             WHERE c.strategy_id = ?",
+            strategy_id,
+        )
+    }
+
+    fn execution_cost_model_by_id(
+        &self,
+        cost_model_id: uuid::Uuid,
+    ) -> Result<Option<ExecutionCostModelInput>> {
+        self.query_execution_cost_model(
+            "SELECT cost_model_id, name, currency,
+                    buy_fixed_fee, buy_per_share_fee,
+                    buy_rate_bps, buy_min_fee,
+                    sell_fixed_fee, sell_per_share_fee,
+                    sell_rate_bps, sell_min_fee, sell_tax_bps,
+                    estimated_spread_bps, estimated_slippage_bps
+             FROM execution_cost_models WHERE cost_model_id = ?",
+            cost_model_id,
+        )
+    }
+
+    fn query_execution_cost_model(
+        &self,
+        sql: &str,
+        id: uuid::Uuid,
+    ) -> Result<Option<ExecutionCostModelInput>> {
+        self.connection
+            .query_row(sql, params![id], |row| {
+                Ok(ExecutionCostModelInput {
+                    cost_model_id: Some(row.get(0)?),
+                    name: row.get(1)?,
+                    currency: row.get(2)?,
+                    buy_fixed_fee: row.get(3)?,
+                    buy_per_share_fee: row.get(4)?,
+                    buy_rate_bps: row.get(5)?,
+                    buy_min_fee: row.get(6)?,
+                    sell_fixed_fee: row.get(7)?,
+                    sell_per_share_fee: row.get(8)?,
+                    sell_rate_bps: row.get(9)?,
+                    sell_min_fee: row.get(10)?,
+                    sell_tax_bps: row.get(11)?,
+                    estimated_spread_bps: row.get(12)?,
+                    estimated_slippage_bps: row.get(13)?,
+                })
+            })
+            .optional()
+            .map_err(|error| AppError::Storage(error.to_string()))
     }
 
     fn resolve_backtest_request(&self, request: &BacktestRequest) -> Result<BacktestRequest> {
@@ -4411,9 +5429,18 @@ impl Storage {
         let stored = self
             .connection
             .query_row(
-                "SELECT kind, config_json::VARCHAR FROM strategies WHERE strategy_id = ?",
+                "SELECT s.kind, s.config_json::VARCHAR, c.outside_rth
+                 FROM strategies s
+                 LEFT JOIN strategy_execution_configs c USING (strategy_id)
+                 WHERE s.strategy_id = ?",
                 params![strategy_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<bool>>(2)?,
+                    ))
+                },
             )
             .optional()
             .map_err(|error| AppError::Storage(error.to_string()))?
@@ -4428,6 +5455,9 @@ impl Storage {
         resolved.strategy_config = Some(strategy_config);
         resolved.short_window = None;
         resolved.long_window = None;
+        if let Some(outside_rth) = stored.2 {
+            resolved.outside_rth = outside_rth;
+        }
         Ok(resolved)
     }
 
@@ -4470,7 +5500,16 @@ impl Storage {
             .map_err(|error| AppError::Storage(error.to_string()))
     }
 
+    #[cfg(test)]
     pub fn backtest_details(&self, backtest_id: uuid::Uuid) -> Result<Option<serde_json::Value>> {
+        self.backtest_details_with_options(backtest_id, BacktestDetailOptions::default())
+    }
+
+    pub fn backtest_details_with_options(
+        &self,
+        backtest_id: uuid::Uuid,
+        options: BacktestDetailOptions,
+    ) -> Result<Option<serde_json::Value>> {
         let run = self
             .connection
             .query_row(
@@ -4510,36 +5549,80 @@ impl Storage {
         let Some(mut run) = run else {
             return Ok(None);
         };
+        let trade_page = options.trade_page.max(1);
+        let trade_page_size = options.trade_page_size.clamp(1, 500);
+        let trade_total = self
+            .connection
+            .query_row(
+                "SELECT count(*) FROM backtest_trades WHERE backtest_id = ?",
+                params![backtest_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| AppError::Storage(error.to_string()))?
+            .max(0) as usize;
+        let trade_total_pages = trade_total.div_ceil(trade_page_size).max(1);
+        let trade_page = trade_page.min(trade_total_pages);
+        let trade_offset = (trade_page - 1).saturating_mul(trade_page_size);
         let mut trade_statement = self
             .connection
             .prepare(
                 "SELECT conid, signal_time, fill_time, side, quantity, price,
-                        commission, slippage
-                 FROM backtest_trades WHERE backtest_id = ? ORDER BY fill_time",
+                        commission, slippage, spread
+                 FROM backtest_trades WHERE backtest_id = ?
+                 ORDER BY fill_time LIMIT ? OFFSET ?",
             )
             .map_err(|error| AppError::Storage(error.to_string()))?;
         let trades = trade_statement
-            .query_map(params![backtest_id], |row| {
-                Ok(serde_json::json!({
-                    "conid": row.get::<_, i64>(0)?,
-                    "signal_time": row.get::<_, DateTime<Utc>>(1)?,
-                    "fill_time": row.get::<_, DateTime<Utc>>(2)?,
-                    "side": row.get::<_, String>(3)?,
-                    "quantity": row.get::<_, f64>(4)?,
-                    "price": row.get::<_, f64>(5)?,
-                    "commission": row.get::<_, f64>(6)?,
-                    "slippage": row.get::<_, f64>(7)?
-                }))
-            })
+            .query_map(
+                params![backtest_id, trade_page_size as i64, trade_offset as i64],
+                |row| {
+                    Ok(serde_json::json!({
+                        "conid": row.get::<_, i64>(0)?,
+                        "signal_time": row.get::<_, DateTime<Utc>>(1)?,
+                        "fill_time": row.get::<_, DateTime<Utc>>(2)?,
+                        "side": row.get::<_, String>(3)?,
+                        "quantity": row.get::<_, f64>(4)?,
+                        "price": row.get::<_, f64>(5)?,
+                        "commission": row.get::<_, f64>(6)?,
+                        "slippage": row.get::<_, f64>(7)?,
+                        "spread": row.get::<_, f64>(8)?
+                    }))
+                },
+            )
             .map_err(|error| AppError::Storage(error.to_string()))?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|error| AppError::Storage(error.to_string()))?;
+        let equity_total = self
+            .connection
+            .query_row(
+                "SELECT count(*) FROM backtest_equity WHERE backtest_id = ?",
+                params![backtest_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| AppError::Storage(error.to_string()))?
+            .max(0) as usize;
+        let max_equity_points = options.max_equity_points.clamp(100, 5_000);
+        let equity_step = equity_total.div_ceil(max_equity_points).max(1);
+        let equity_sql = if equity_step == 1 {
+            "SELECT observed_at, cash, position, close, equity
+             FROM backtest_equity WHERE backtest_id = ? ORDER BY observed_at"
+                .to_owned()
+        } else {
+            format!(
+                "WITH ranked AS (
+                    SELECT observed_at, cash, position, close, equity,
+                           row_number() OVER (ORDER BY observed_at) AS point_number
+                    FROM backtest_equity WHERE backtest_id = ?
+                 )
+                 SELECT observed_at, cash, position, close, equity FROM ranked
+                 WHERE point_number = 1 OR point_number = {equity_total}
+                    OR (point_number - 1) % {equity_step} = 0
+                 ORDER BY observed_at"
+            )
+        };
         let mut equity_statement = self
             .connection
-            .prepare(
-                "SELECT observed_at, cash, position, close, equity
-                 FROM backtest_equity WHERE backtest_id = ? ORDER BY observed_at",
-            )
+            .prepare(&equity_sql)
             .map_err(|error| AppError::Storage(error.to_string()))?;
         let equity = equity_statement
             .query_map(params![backtest_id], |row| {
@@ -4554,28 +5637,54 @@ impl Storage {
             .map_err(|error| AppError::Storage(error.to_string()))?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|error| AppError::Storage(error.to_string()))?;
+        let equity_sampled = equity.len();
         run["trades"] = serde_json::Value::Array(trades);
+        run["trades_page"] = serde_json::json!({
+            "page": trade_page,
+            "page_size": trade_page_size,
+            "total_items": trade_total,
+            "total_pages": trade_total_pages,
+        });
         run["equity"] = serde_json::Value::Array(equity);
+        run["equity_sampling"] = serde_json::json!({
+            "total_points": equity_total,
+            "returned_points": equity_sampled,
+            "step": equity_step,
+            "downsampled": equity_step > 1,
+        });
         Ok(Some(run))
     }
 
+    #[cfg(test)]
     pub fn write_historical_bars(
         &mut self,
         lake_dir: &Path,
         staging_dir: &Path,
         bars: &[crate::ibkr::HistoricalBar],
     ) -> Result<DatasetFile> {
+        self.write_historical_bars_for_session(lake_dir, staging_dir, bars, false)
+    }
+
+    pub fn write_historical_bars_for_session(
+        &mut self,
+        lake_dir: &Path,
+        staging_dir: &Path,
+        bars: &[crate::ibkr::HistoricalBar],
+        outside_rth: bool,
+    ) -> Result<DatasetFile> {
         let first = bars
             .first()
             .ok_or_else(|| AppError::Storage("IBKR returned no historical bars".into()))?;
         validate_bars(bars)?;
+        let session_kind = if outside_rth { "extended" } else { "regular" };
         fs::create_dir_all(staging_dir)?;
         let file_id = uuid::Uuid::now_v7();
         let staging_path = staging_dir.join(format!("{file_id}.parquet.tmp"));
         let final_dir = lake_dir
             .join("bars")
             .join(format!("timeframe={}", first.timeframe))
-            .join(format!("conid={}", first.conid));
+            .join(format!("conid={}", first.conid))
+            .join(format!("session_kind={session_kind}"));
         fs::create_dir_all(&final_dir)?;
         let final_path = final_dir.join(format!("part-{file_id}.parquet"));
 
@@ -4622,9 +5731,6 @@ impl Storage {
         self.connection
             .execute_batch(&copy_sql)
             .map_err(|error| AppError::Storage(error.to_string()))?;
-        fs::rename(&staging_path, &final_path)?;
-        let metadata = fs::metadata(&final_path)?;
-        let checksum = file_checksum(&final_path)?;
         let min_time = bars
             .iter()
             .map(|bar| bar.open_time)
@@ -4635,6 +5741,32 @@ impl Storage {
             .map(|bar| bar.open_time)
             .max()
             .expect("not empty");
+        // Verify the staged Parquet file before publishing it: the row count
+        // and time range must match the validated in-memory batch, otherwise
+        // the temporary file is discarded and the slice fails (and retries).
+        let (written_rows, written_min, written_max): (i64, DateTime<Utc>, DateTime<Utc>) = self
+            .connection
+            .query_row(
+                &format!(
+                    "SELECT count(*), min(open_time), max(open_time)
+                     FROM read_parquet('{}')",
+                    sql_path(&staging_path)
+                ),
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        if written_rows != bars.len() as i64 || written_min != min_time || written_max != max_time {
+            let _ = fs::remove_file(&staging_path);
+            return Err(AppError::Storage(format!(
+                "staged parquet verification failed: wrote {written_rows} rows \
+                 [{written_min} .. {written_max}], expected {} rows [{min_time} .. {max_time}]",
+                bars.len()
+            )));
+        }
+        let checksum = file_checksum(&staging_path)?;
+        fs::rename(&staging_path, &final_path)?;
+        let metadata = fs::metadata(&final_path)?;
         let relative_path = final_path
             .strip_prefix(lake_dir)
             .unwrap_or(&final_path)
@@ -4647,8 +5779,9 @@ impl Storage {
             .execute(
                 "INSERT INTO dataset_files
                  (file_id, dataset, relative_path, schema_version, conid, timeframe,
-                  min_time, max_time, row_count, byte_size, active, created_at, checksum)
-                 VALUES (?, 'bars', ?, 1, ?, ?, ?, ?, ?, ?, true, ?, ?)",
+                  min_time, max_time, row_count, byte_size, active, created_at, checksum,
+                  session_kind)
+                 VALUES (?, 'bars', ?, 1, ?, ?, ?, ?, ?, ?, true, ?, ?, ?)",
                 params![
                     file_id,
                     relative_path.to_string_lossy(),
@@ -4660,6 +5793,7 @@ impl Storage {
                     metadata.len() as i64,
                     Utc::now(),
                     checksum,
+                    session_kind,
                 ],
             )
             .map_err(|error| AppError::Storage(error.to_string()))?;
@@ -4669,9 +5803,17 @@ impl Storage {
             .execute(
                 "UPDATE dataset_files SET active = false
                  WHERE dataset = 'bars' AND conid = ? AND timeframe = ?
+                   AND coalesce(session_kind, 'regular') = ?
                    AND active = true AND file_id <> ?
                    AND min_time >= ? AND max_time <= ?",
-                params![first.conid, first.timeframe, file_id, min_time, max_time],
+                params![
+                    first.conid,
+                    first.timeframe,
+                    session_kind,
+                    file_id,
+                    min_time,
+                    max_time
+                ],
             )
             .map_err(|error| AppError::Storage(error.to_string()))?;
         transaction
@@ -4757,6 +5899,72 @@ impl Storage {
             .map_err(|error| AppError::Storage(error.to_string()))
     }
 
+    /// Manually resolves an 'unknown' intent after the operator confirmed the
+    /// true outcome against IBKR. Unknown intents block automatic execution
+    /// for their contract and occupy risk headroom until resolved; resolution
+    /// is deliberately manual because the daemon cannot correlate an intent
+    /// that never received a broker order id. The resolution is audited as a
+    /// risk decision.
+    pub fn resolve_order_intent(
+        &mut self,
+        intent_id: uuid::Uuid,
+        note: &str,
+    ) -> Result<serde_json::Value> {
+        let note = note.trim();
+        if note.is_empty() {
+            return Err(AppError::Storage(
+                "intent resolution note cannot be empty".into(),
+            ));
+        }
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        let now = Utc::now();
+        let changed = transaction
+            .execute(
+                "UPDATE order_intents
+                 SET status = 'resolved_manual',
+                     rejection_reason = concat(coalesce(rejection_reason, ''),
+                                               '; manually resolved: ', ?),
+                     updated_at = ?
+                 WHERE order_intent_id = ? AND status = 'unknown'",
+                params![note, now, intent_id],
+            )
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        if changed == 0 {
+            let status: Option<String> = transaction
+                .query_row(
+                    "SELECT status FROM order_intents WHERE order_intent_id = ?",
+                    params![intent_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| AppError::Storage(error.to_string()))?;
+            return Err(AppError::Storage(match status {
+                Some(status) => format!(
+                    "only intents in status 'unknown' can be manually resolved; \
+                     intent {intent_id} has status '{status}'"
+                ),
+                None => format!("order intent {intent_id} does not exist"),
+            }));
+        }
+        transaction
+            .execute(
+                "INSERT INTO risk_decisions VALUES (?, ?, 'resolved', 'MANUAL_RESOLUTION', ?, ?)",
+                params![uuid::Uuid::now_v7(), intent_id, note, now],
+            )
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        transaction
+            .commit()
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        Ok(serde_json::json!({
+            "order_intent_id": intent_id,
+            "status": "resolved_manual",
+            "note": note,
+        }))
+    }
+
     pub fn record_risk_decision(
         &mut self,
         intent_id: uuid::Uuid,
@@ -4818,7 +6026,199 @@ impl Storage {
         transaction
             .commit()
             .map_err(|error| AppError::Storage(error.to_string()))?;
+        self.replay_broker_events_for_order(order_id)?;
+        self.drain_pending_broker_executions()?;
         Ok(order_id)
+    }
+
+    /// Replays broker events which raced ahead of the local `orders` insert.
+    /// Terminal completed-order events are applied last because IBKR treats
+    /// them as authoritative over an earlier submitted status notification.
+    fn replay_broker_events_for_order(&mut self, order_id: uuid::Uuid) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE orders AS o SET
+                   status = json_extract_string(b.payload_json, '$.status'),
+                   filled_quantity = coalesce(
+                     try_cast(json_extract_string(b.payload_json, '$.filled') AS DOUBLE),
+                     o.filled_quantity),
+                   remaining_quantity = try_cast(
+                     json_extract_string(b.payload_json, '$.remaining') AS DOUBLE),
+                   average_fill_price = try_cast(
+                     json_extract_string(b.payload_json, '$.average_fill_price') AS DOUBLE),
+                   last_fill_price = try_cast(
+                     json_extract_string(b.payload_json, '$.last_fill_price') AS DOUBLE),
+                   broker_perm_id = CASE WHEN b.broker_perm_id <> 0 THEN b.broker_perm_id
+                                         ELSE o.broker_perm_id END,
+                   why_held = json_extract_string(b.payload_json, '$.why_held'),
+                   market_cap_price = try_cast(
+                     json_extract_string(b.payload_json, '$.market_cap_price') AS DOUBLE),
+                   updated_at = greatest(o.updated_at, b.received_at)
+                 FROM broker_order_events AS b
+                 WHERE o.order_id = ?
+                   AND b.connection_session_id = o.connection_session_id
+                   AND b.broker_order_id = o.broker_order_id
+                   AND b.event_type = 'order_status'
+                   AND b.received_at = (
+                     SELECT max(latest.received_at)
+                     FROM broker_order_events AS latest
+                     WHERE latest.connection_session_id = o.connection_session_id
+                       AND latest.broker_order_id = o.broker_order_id
+                       AND latest.event_type = 'order_status')",
+                params![order_id],
+            )
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        self.connection
+            .execute(
+                "UPDATE orders AS o SET
+                   status = json_extract_string(b.payload_json, '$.status'),
+                   broker_perm_id = CASE WHEN b.broker_perm_id <> 0 THEN b.broker_perm_id
+                                         ELSE o.broker_perm_id END,
+                   updated_at = greatest(o.updated_at, b.received_at)
+                 FROM broker_order_events AS b
+                 WHERE o.order_id = ?
+                   AND b.connection_session_id = o.connection_session_id
+                   AND b.broker_order_id = o.broker_order_id
+                   AND b.event_type = 'open_order'
+                   AND lower(json_extract_string(b.payload_json, '$.status')) IN
+                     ('filled','cancelled','canceled','inactive','rejected')
+                   AND b.received_at = (
+                     SELECT max(latest.received_at)
+                     FROM broker_order_events AS latest
+                     WHERE latest.connection_session_id = o.connection_session_id
+                       AND latest.broker_order_id = o.broker_order_id
+                       AND latest.event_type = 'open_order')",
+                params![order_id],
+            )
+            .map(|_| ())
+            .map_err(|error| AppError::Storage(error.to_string()))
+    }
+
+    fn drain_pending_broker_executions(&mut self) -> Result<()> {
+        type PendingExecution = (
+            String,
+            Option<uuid::Uuid>,
+            i32,
+            i64,
+            i32,
+            String,
+            f64,
+            f64,
+            DateTime<Utc>,
+            DateTime<Utc>,
+        );
+        let pending: Vec<PendingExecution> = {
+            let mut statement = self
+                .connection
+                .prepare(
+                    "SELECT broker_execution_id, connection_session_id, broker_order_id,
+                            broker_perm_id, conid, side, quantity, price, executed_at, received_at
+                     FROM pending_broker_executions ORDER BY received_at",
+                )
+                .map_err(|error| AppError::Storage(error.to_string()))?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                    ))
+                })
+                .map_err(|error| AppError::Storage(error.to_string()))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|error| AppError::Storage(error.to_string()))?
+        };
+        for (
+            execution_id,
+            session_id,
+            broker_order_id,
+            perm_id,
+            conid,
+            side,
+            quantity,
+            price,
+            executed_at,
+            received_at,
+        ) in pending
+        {
+            let order_id: Option<uuid::Uuid> = self
+                .connection
+                .query_row(
+                    "SELECT order_id FROM orders
+                     WHERE (? IS NOT NULL AND connection_session_id = ? AND broker_order_id = ?)
+                        OR (? <> 0 AND broker_perm_id = ?)
+                     ORDER BY created_at DESC LIMIT 1",
+                    params![session_id, session_id, broker_order_id, perm_id, perm_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| AppError::Storage(error.to_string()))?;
+            let Some(order_id) = order_id else { continue };
+            let transaction = self
+                .connection
+                .transaction()
+                .map_err(|error| AppError::Storage(error.to_string()))?;
+            transaction
+                .execute(
+                    "INSERT INTO executions
+                       (execution_id, broker_execution_id, order_id, conid, side, quantity,
+                        price, executed_at, received_at, connection_session_id, broker_perm_id)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     ON CONFLICT (broker_execution_id) DO NOTHING",
+                    params![
+                        uuid::Uuid::now_v7(),
+                        execution_id,
+                        order_id,
+                        conid,
+                        side,
+                        quantity,
+                        price,
+                        executed_at,
+                        received_at,
+                        session_id,
+                        perm_id
+                    ],
+                )
+                .map_err(|error| AppError::Storage(error.to_string()))?;
+            transaction
+                .execute(
+                    "UPDATE executions SET
+                       commission = (SELECT commission FROM pending_commissions
+                                     WHERE broker_execution_id = ?),
+                       currency = (SELECT currency FROM pending_commissions
+                                   WHERE broker_execution_id = ?)
+                     WHERE broker_execution_id = ?
+                       AND EXISTS (SELECT 1 FROM pending_commissions
+                                   WHERE broker_execution_id = ?)",
+                    params![execution_id, execution_id, execution_id, execution_id],
+                )
+                .map_err(|error| AppError::Storage(error.to_string()))?;
+            transaction
+                .execute(
+                    "DELETE FROM pending_commissions WHERE broker_execution_id = ?
+                     AND EXISTS (SELECT 1 FROM executions WHERE broker_execution_id = ?)",
+                    params![execution_id, execution_id],
+                )
+                .map_err(|error| AppError::Storage(error.to_string()))?;
+            transaction
+                .execute(
+                    "DELETE FROM pending_broker_executions WHERE broker_execution_id = ?
+                     AND EXISTS (SELECT 1 FROM executions WHERE broker_execution_id = ?)",
+                    params![execution_id, execution_id],
+                )
+                .map_err(|error| AppError::Storage(error.to_string()))?;
+            transaction
+                .commit()
+                .map_err(|error| AppError::Storage(error.to_string()))?;
+        }
+        Ok(())
     }
 
     pub fn mark_cancel_pending(
@@ -5034,20 +6434,33 @@ impl Storage {
                         ],
                     )
                     .map_err(|error| AppError::Storage(error.to_string()))?;
+                // A late or replayed non-terminal status must never demote a
+                // terminal order back to active, regress its filled quantity,
+                // or erase a learned perm id with 0.
                 transaction
                     .execute(
-                        "UPDATE orders SET status = ?, filled_quantity = ?,
+                        "UPDATE orders SET status = ?,
+                             filled_quantity = greatest(filled_quantity, ?),
                              remaining_quantity = ?, average_fill_price = ?,
-                             last_fill_price = ?, broker_perm_id = ?, why_held = ?,
+                             last_fill_price = ?,
+                             broker_perm_id = CASE WHEN ? <> 0 THEN ?
+                                                   ELSE broker_perm_id END,
+                             why_held = ?,
                              market_cap_price = ?, updated_at = ?
-                         WHERE (connection_session_id = ? AND broker_order_id = ?)
-                            OR (? IS NULL AND broker_perm_id = ? AND ? <> 0)",
+                         WHERE ((connection_session_id = ? AND broker_order_id = ?)
+                            OR (? IS NULL AND broker_perm_id = ? AND ? <> 0))
+                           AND NOT (lower(status) IN
+                                 ('filled','cancelled','canceled','inactive',
+                                  'rejected','not_open')
+                             AND lower(?) NOT IN
+                                 ('filled','cancelled','canceled','inactive','rejected'))",
                         params![
                             status,
                             filled,
                             remaining,
                             average_fill_price,
                             last_fill_price,
+                            perm_id,
                             perm_id,
                             why_held,
                             market_cap_price,
@@ -5057,6 +6470,7 @@ impl Storage {
                             connection_session_id,
                             perm_id,
                             perm_id,
+                            status,
                         ],
                     )
                     .map_err(|error| AppError::Storage(error.to_string()))?;
@@ -5131,11 +6545,14 @@ impl Storage {
                              THEN status
                              ELSE ?
                            END,
-                           broker_perm_id = ?, updated_at = ?
+                           broker_perm_id = CASE WHEN ? <> 0 THEN ?
+                                                 ELSE broker_perm_id END,
+                           updated_at = ?
                          WHERE (connection_session_id = ? AND broker_order_id = ?)
                             OR (? IS NULL AND broker_perm_id = ? AND ? <> 0)",
                         params![
                             status,
+                            perm_id,
                             perm_id,
                             now,
                             connection_session_id,
@@ -5180,9 +6597,17 @@ impl Storage {
                 side,
                 quantity,
                 price,
-                ..
+                executed_at,
             } => {
-                self.connection
+                let now = Utc::now();
+                // The execution insert, pending-commission application and
+                // pending-commission cleanup commit atomically so a crash
+                // cannot strand a commission in the pending table.
+                let transaction = self
+                    .connection
+                    .transaction()
+                    .map_err(|error| AppError::Storage(error.to_string()))?;
+                let changed = transaction
                     .execute(
                         "INSERT INTO executions
                              (execution_id, broker_execution_id, order_id, conid, side,
@@ -5201,8 +6626,8 @@ impl Storage {
                             side,
                             quantity,
                             price,
-                            Utc::now(),
-                            Utc::now(),
+                            executed_at,
+                            now,
                             connection_session_id,
                             perm_id,
                             connection_session_id,
@@ -5213,7 +6638,47 @@ impl Storage {
                         ],
                     )
                     .map_err(|error| AppError::Storage(error.to_string()))?;
-                self.connection
+                if changed == 0 {
+                    let already_recorded: bool = transaction
+                        .query_row(
+                            "SELECT count(*) > 0 FROM executions
+                             WHERE broker_execution_id = ?",
+                            params![execution_id],
+                            |row| row.get(0),
+                        )
+                        .map_err(|error| AppError::Storage(error.to_string()))?;
+                    if !already_recorded {
+                        transaction
+                            .execute(
+                                "INSERT INTO pending_broker_executions
+                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                 ON CONFLICT (broker_execution_id) DO UPDATE SET
+                                   connection_session_id = excluded.connection_session_id,
+                                   broker_order_id = excluded.broker_order_id,
+                                   broker_perm_id = excluded.broker_perm_id,
+                                   conid = excluded.conid,
+                                   side = excluded.side,
+                                   quantity = excluded.quantity,
+                                   price = excluded.price,
+                                   executed_at = excluded.executed_at,
+                                   received_at = excluded.received_at",
+                                params![
+                                    execution_id,
+                                    connection_session_id,
+                                    broker_order_id,
+                                    perm_id,
+                                    conid,
+                                    side,
+                                    quantity,
+                                    price,
+                                    executed_at,
+                                    now
+                                ],
+                            )
+                            .map_err(|error| AppError::Storage(error.to_string()))?;
+                    }
+                }
+                transaction
                     .execute(
                         "UPDATE executions SET
                            commission = (SELECT commission FROM pending_commissions
@@ -5226,12 +6691,15 @@ impl Storage {
                         params![execution_id, execution_id, execution_id, execution_id],
                     )
                     .map_err(|error| AppError::Storage(error.to_string()))?;
-                self.connection
+                transaction
                     .execute(
-                        "DELETE FROM pending_commissions WHERE broker_execution_id = ?",
-                        params![execution_id],
+                        "DELETE FROM pending_commissions WHERE broker_execution_id = ?
+                         AND EXISTS (SELECT 1 FROM executions WHERE broker_execution_id = ?)",
+                        params![execution_id, execution_id],
                     )
-                    .map(|_| ())
+                    .map_err(|error| AppError::Storage(error.to_string()))?;
+                transaction
+                    .commit()
                     .map_err(|error| AppError::Storage(error.to_string()))
             }
             crate::ibkr::BrokerEvent::Commission {
@@ -5240,8 +6708,11 @@ impl Storage {
                 currency,
                 ..
             } => {
-                let changed = self
+                let transaction = self
                     .connection
+                    .transaction()
+                    .map_err(|error| AppError::Storage(error.to_string()))?;
+                let changed = transaction
                     .execute(
                         "UPDATE executions SET commission = ?, currency = ?
                      WHERE broker_execution_id = ?",
@@ -5249,7 +6720,7 @@ impl Storage {
                     )
                     .map_err(|error| AppError::Storage(error.to_string()))?;
                 if changed == 0 {
-                    self.connection
+                    transaction
                         .execute(
                             "INSERT INTO pending_commissions VALUES (?, ?, ?, ?)
                          ON CONFLICT (broker_execution_id) DO UPDATE SET
@@ -5260,6 +6731,9 @@ impl Storage {
                         )
                         .map_err(|error| AppError::Storage(error.to_string()))?;
                 }
+                transaction
+                    .commit()
+                    .map_err(|error| AppError::Storage(error.to_string()))?;
                 Ok(())
             }
             crate::ibkr::BrokerEvent::AccountSummary {
@@ -5331,6 +6805,15 @@ impl Storage {
                     .commit()
                     .map_err(|error| AppError::Storage(error.to_string()))
             }
+            crate::ibkr::BrokerEvent::PositionSubscriptionHeartbeat { observed_at } => self
+                .connection
+                .execute(
+                    "UPDATE position_sync_state SET observed_at = ?
+                     WHERE singleton AND state = 'ready'",
+                    params![observed_at],
+                )
+                .map(|_| ())
+                .map_err(|error| AppError::Storage(error.to_string())),
             crate::ibkr::BrokerEvent::Pnl {
                 account,
                 daily_pnl,
@@ -5421,6 +6904,53 @@ impl Storage {
                 .map(|_| ())
                 .map_err(|error| AppError::Storage(error.to_string())),
         }
+    }
+
+    /// Returns every non-base currency currently needed by configured strategy
+    /// contracts, portfolio legs, orders, positions, or recorded executions.
+    /// The daemon uses this list to verify that each periodic IBKR account FX
+    /// snapshot actually covers all currencies needed by risk and performance
+    /// calculations.
+    pub fn required_fx_currencies(&self, base_currency: &str) -> Result<Vec<String>> {
+        let base_currency = base_currency.trim().to_ascii_uppercase();
+        if base_currency.len() != 3 {
+            return Err(AppError::Storage(
+                "base currency must be a three-letter code".into(),
+            ));
+        }
+        let mut statement = self
+            .connection
+            .prepare(
+                "WITH currencies(currency) AS (
+                   SELECT json_extract_string(contract_json, '$.currency')
+                   FROM strategy_execution_configs
+                   UNION ALL
+                   SELECT json_extract_string(contract_json, '$.currency')
+                   FROM strategy_execution_portfolio_legs
+                   UNION ALL
+                   SELECT json_extract_string(payload_json, '$.contract.currency')
+                   FROM order_intents
+                   WHERE status IN ('approved', 'unknown')
+                   UNION ALL
+                   SELECT i.currency
+                   FROM positions_current p
+                   JOIN instruments i USING (conid)
+                   UNION ALL
+                   SELECT currency FROM executions
+                 )
+                 SELECT DISTINCT upper(trim(currency)) AS currency
+                 FROM currencies
+                 WHERE currency IS NOT NULL
+                   AND length(trim(currency)) = 3
+                   AND upper(trim(currency)) <> ?
+                 ORDER BY currency",
+            )
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        statement
+            .query_map(params![base_currency], |row| row.get::<_, String>(0))
+            .map_err(|error| AppError::Storage(error.to_string()))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| AppError::Storage(error.to_string()))
     }
 
     pub fn upsert_fx_rate(&mut self, input: &FxRateInput) -> Result<()> {
@@ -5842,13 +7372,73 @@ impl Storage {
                 "initial_capital must be finite and greater than zero".into(),
             ));
         }
+        let allow_short: bool = self
+            .connection
+            .query_row(
+                "SELECT coalesce(allow_short, false) FROM strategy_execution_configs
+                 WHERE strategy_id = ?",
+                params![strategy_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| AppError::Storage(error.to_string()))?
+            .unwrap_or(false);
+        let mut data_warnings = Vec::new();
+        {
+            let mut missing_statement = self
+                .connection
+                .prepare(
+                    "WITH attributed AS (
+                       SELECT order_intent_id FROM strategy_execution_actions
+                       WHERE strategy_id = ? AND order_intent_id IS NOT NULL
+                       UNION
+                       SELECT l.order_intent_id
+                       FROM strategy_execution_action_legs l
+                       JOIN strategy_execution_actions a USING (action_id)
+                       WHERE a.strategy_id = ? AND l.order_intent_id IS NOT NULL
+                     )
+                     SELECT o.broker_order_id,
+                            try_cast(json_extract_string(i.payload_json, '$.quantity') AS DOUBLE),
+                            coalesce(sum(e.quantity), 0)
+                     FROM attributed
+                     JOIN orders o USING (order_intent_id)
+                     JOIN order_intents i USING (order_intent_id)
+                     LEFT JOIN executions e ON e.order_id = o.order_id
+                     WHERE lower(o.status) = 'filled'
+                     GROUP BY o.order_id, o.broker_order_id, i.payload_json, o.created_at
+                     HAVING coalesce(sum(e.quantity), 0) + 0.000000001 <
+                            try_cast(json_extract_string(i.payload_json, '$.quantity') AS DOUBLE)
+                     ORDER BY o.created_at",
+                )
+                .map_err(|error| AppError::Storage(error.to_string()))?;
+            let missing = missing_statement
+                .query_map(params![strategy_id, strategy_id], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, f64>(1)?,
+                        row.get::<_, f64>(2)?,
+                    ))
+                })
+                .map_err(|error| AppError::Storage(error.to_string()))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|error| AppError::Storage(error.to_string()))?;
+            for (broker_order_id, expected, recorded) in missing {
+                data_warnings.push(format!(
+                    "Broker Order ID {broker_order_id} 已成交 {expected:.4}，但本地仅有 {recorded:.4} 的成交明细；无法可靠计算该段损益"
+                ));
+            }
+        }
         let mut statement = self
             .connection
             .prepare(
                 "SELECT e.executed_at, lower(e.side), e.quantity, e.price,
-                        coalesce(e.commission, 0), e.currency, e.conid
+                        coalesce(e.commission, 0),
+                        coalesce(e.currency,
+                          json_extract_string(oi.payload_json, '$.contract.currency')),
+                        e.conid
                  FROM executions e
                  JOIN orders o ON o.order_id = e.order_id
+                 JOIN order_intents oi ON oi.order_intent_id = o.order_intent_id
                  JOIN (
                     SELECT strategy_id, order_intent_id
                     FROM strategy_execution_actions
@@ -5892,6 +7482,8 @@ impl Storage {
         let mut daily_equity: BTreeMap<chrono::NaiveDate, f64> = BTreeMap::new();
         let mut first_execution_at = None;
         let mut last_execution_at = None;
+        let mut cycle_realized: HashMap<i32, f64> = HashMap::new();
+        let mut unmatched_execution_quantity = 0.0_f64;
 
         for (executed_at, side, quantity, price, commission, currency, conid) in rows {
             first_execution_at.get_or_insert(executed_at);
@@ -5906,6 +7498,7 @@ impl Storage {
             commissions += commission * fx;
             turnover += quantity * price * fx;
             let position = positions.entry(conid).or_default();
+            let previous_quantity = position.quantity;
             let mut realized = 0.0;
             if side.starts_with("bought") || side == "buy" {
                 if position.quantity < 0.0 {
@@ -5933,10 +7526,16 @@ impl Storage {
                     position.quantity -= closing;
                     let remaining = quantity - closing;
                     if position.quantity.abs() <= f64::EPSILON {
-                        position.quantity = -remaining;
-                        position.average_price = if remaining > 0.0 { price } else { 0.0 };
+                        if remaining > 0.0 && !allow_short {
+                            unmatched_execution_quantity += remaining;
+                            position.quantity = 0.0;
+                            position.average_price = 0.0;
+                        } else {
+                            position.quantity = -remaining;
+                            position.average_price = if remaining > 0.0 { price } else { 0.0 };
+                        }
                     }
-                } else {
+                } else if allow_short {
                     let current_abs = -position.quantity;
                     let next_abs = current_abs + quantity;
                     position.average_price = if next_abs > 0.0 {
@@ -5945,14 +7544,24 @@ impl Storage {
                         0.0
                     };
                     position.quantity = -next_abs;
+                } else {
+                    unmatched_execution_quantity += quantity;
                 }
             }
             if realized.abs() > f64::EPSILON {
-                realized_trade_count += 1;
-                if realized > 0.0 {
-                    winning_trade_count += 1;
-                } else {
-                    losing_trade_count += 1;
+                *cycle_realized.entry(conid).or_default() += realized * fx;
+                let closed_cycle = position.quantity.abs() <= f64::EPSILON
+                    || (previous_quantity.abs() > f64::EPSILON
+                        && position.quantity.abs() > f64::EPSILON
+                        && previous_quantity.signum() != position.quantity.signum());
+                if closed_cycle {
+                    let completed = cycle_realized.remove(&conid).unwrap_or_default();
+                    realized_trade_count += 1;
+                    if completed > 0.0 {
+                        winning_trade_count += 1;
+                    } else if completed < 0.0 {
+                        losing_trade_count += 1;
+                    }
                 }
             }
             gross_pnl += realized * fx;
@@ -6000,14 +7609,19 @@ impl Storage {
             .values()
             .filter(|position| position.quantity.abs() > f64::EPSILON)
             .count();
+        if unmatched_execution_quantity > f64::EPSILON {
+            data_warnings.push(format!(
+                "共有 {unmatched_execution_quantity:.4} 股卖出成交找不到可配对的策略买入；已按长期策略安全口径排除，未当作新开空仓"
+            ));
+        }
         let benchmark_return = match (benchmark_conid, first_execution_at, last_execution_at) {
             (Some(conid), Some(start), Some(end)) => {
                 let first = self
                     .connection
                     .query_row(
                         "SELECT close FROM market_minute_bars
-                     WHERE conid = ? AND minute >= ? AND minute <= ?
-                     ORDER BY minute LIMIT 1",
+                     WHERE conid = ? AND bar_time >= ? AND bar_time <= ?
+                     ORDER BY bar_time LIMIT 1",
                         params![conid, start, end],
                         |row| row.get::<_, f64>(0),
                     )
@@ -6017,8 +7631,8 @@ impl Storage {
                     .connection
                     .query_row(
                         "SELECT close FROM market_minute_bars
-                     WHERE conid = ? AND minute >= ? AND minute <= ?
-                     ORDER BY minute DESC LIMIT 1",
+                     WHERE conid = ? AND bar_time >= ? AND bar_time <= ?
+                     ORDER BY bar_time DESC LIMIT 1",
                         params![conid, start, end],
                         |row| row.get::<_, f64>(0),
                     )
@@ -6053,6 +7667,9 @@ impl Storage {
             "win_rate": (realized_trade_count > 0)
                 .then_some(winning_trade_count as f64 / realized_trade_count as f64),
             "open_position_count": open_position_count,
+            "data_complete": data_warnings.is_empty() && unmatched_execution_quantity <= f64::EPSILON,
+            "data_warnings": data_warnings,
+            "unmatched_execution_quantity": unmatched_execution_quantity,
             "daily_equity": daily_equity.into_iter().map(|(date, equity)| {
                 serde_json::json!({"date": date, "equity": equity})
             }).collect::<Vec<_>>(),
@@ -6491,7 +8108,8 @@ impl Storage {
             .prepare(
                 "SELECT order_id, connection_session_id, broker_order_id, broker_perm_id FROM orders
                  WHERE broker_order_id IS NOT NULL
-                   AND lower(status) NOT IN ('filled', 'cancelled', 'canceled', 'inactive', 'rejected')",
+                   AND lower(status) NOT IN ('filled', 'cancelled', 'canceled', 'inactive',
+                                             'rejected', 'not_open')",
             )
             .map_err(|error| AppError::Storage(error.to_string()))?;
         let candidates: Vec<(uuid::Uuid, Option<uuid::Uuid>, i32, Option<i64>)> = statement
@@ -6552,6 +8170,10 @@ impl Storage {
         transaction
             .commit()
             .map_err(|error| AppError::Storage(error.to_string()))?;
+        // Reconciliation may only now have associated a stable Perm ID with a
+        // local order. Executions received earlier in this same snapshot can
+        // therefore be attached safely after the order transaction commits.
+        self.drain_pending_broker_executions()?;
         Ok(ReconciliationReport {
             reconciliation_id,
             healthy,
@@ -6677,6 +8299,75 @@ fn timeframe_duration(timeframe: &str) -> Result<chrono::Duration> {
     }
 }
 
+fn duckdb_timestamp(value: DateTime<Utc>) -> DateTime<Utc> {
+    DateTime::from_timestamp_micros(value.timestamp_micros())
+        .expect("a valid DateTime remains valid at microsecond precision")
+}
+
+fn same_backfill_scope(left: &BackfillJobRequest, right: &BackfillJobRequest) -> bool {
+    left.contract.conid == right.contract.conid
+        && left.timeframe == right.timeframe
+        && left.outside_rth == right.outside_rth
+}
+
+fn backfill_ranges_overlap(left: &BackfillJobRequest, right: &BackfillJobRequest) -> bool {
+    left.start <= right.end && right.start <= left.end
+}
+
+fn interval_gaps(
+    requested_start: DateTime<Utc>,
+    requested_end: DateTime<Utc>,
+    intervals: &[(DateTime<Utc>, DateTime<Utc>)],
+) -> Vec<(DateTime<Utc>, DateTime<Utc>)> {
+    let intervals = merged_time_intervals(requested_start, requested_end, intervals);
+
+    let mut gaps = Vec::new();
+    let mut cursor = requested_start;
+    for (start, end) in intervals {
+        if start > cursor {
+            gaps.push((cursor, start));
+        }
+        cursor = cursor.max(end);
+        if cursor >= requested_end {
+            break;
+        }
+    }
+    if cursor < requested_end {
+        gaps.push((cursor, requested_end));
+    }
+    gaps
+}
+
+fn merged_time_intervals(
+    requested_start: DateTime<Utc>,
+    requested_end: DateTime<Utc>,
+    intervals: &[(DateTime<Utc>, DateTime<Utc>)],
+) -> Vec<(DateTime<Utc>, DateTime<Utc>)> {
+    let mut intervals = intervals
+        .iter()
+        .map(|(start, end)| ((*start).max(requested_start), (*end).min(requested_end)))
+        .filter(|(start, end)| end > start)
+        .collect::<Vec<_>>();
+    intervals.sort_unstable_by_key(|(start, _)| *start);
+    let mut merged: Vec<(DateTime<Utc>, DateTime<Utc>)> = Vec::new();
+    for (start, end) in intervals {
+        if let Some((_, previous_end)) = merged.last_mut()
+            && start <= *previous_end
+        {
+            *previous_end = (*previous_end).max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    merged
+}
+
+fn gaps_to_json(gaps: &[(DateTime<Utc>, DateTime<Utc>)]) -> Vec<serde_json::Value> {
+    gaps.iter()
+        .map(|(start, end)| serde_json::json!({"start": start, "end": end}))
+        .collect()
+}
+
 fn serialize_strategy_state(state: &serde_json::Value) -> Result<String> {
     let serialized = serde_json::to_string(state)?;
     if serialized.len() > MAX_STRATEGY_STATE_BYTES {
@@ -6689,13 +8380,15 @@ fn serialize_strategy_state(state: &serde_json::Value) -> Result<String> {
     Ok(serialized)
 }
 
+fn commission_to_gross_profit_ratio(gross_pnl: f64, commissions: f64) -> Option<f64> {
+    (gross_pnl > 0.0 && commissions.is_finite()).then_some(commissions.max(0.0) / gross_pnl)
+}
+
 fn validate_backtest_request(request: &BacktestRequest) -> Result<()> {
     if request.conid <= 0
         || request.end <= request.start
         || request.quantity <= 0.0
         || request.initial_cash <= 0.0
-        || request.slippage_bps < 0.0
-        || request.commission_per_order < 0.0
     {
         return Err(AppError::Storage("invalid backtest parameters".into()));
     }
@@ -6734,6 +8427,7 @@ fn build_backtest_strategy(
 fn simulate_strategy(
     request: &BacktestRequest,
     strategy: &dyn crate::strategy::Strategy,
+    cost_model: &ExecutionCostModelInput,
     bars: &[BacktestBar],
 ) -> Result<(Vec<SimulatedTrade>, Vec<EquityPoint>, serde_json::Value)> {
     if bars.len() < strategy.minimum_history() + 1 {
@@ -6752,52 +8446,53 @@ fn simulate_strategy(
     let mut strategy_state = strategy.initial_state();
     for bar in bars {
         if let Some((side, signal_time)) = pending.take() {
-            let direction = if side == "buy" { 1.0 } else { -1.0 };
-            let slippage = bar.open * request.slippage_bps / 10_000.0 * direction;
-            let fill_price = bar.open + slippage;
             let quantity = if side == "buy" {
                 request.quantity
             } else {
                 position.min(request.quantity)
             };
             if quantity > 0.0 {
-                let cash_change = fill_price * quantity;
-                if side == "buy"
-                    && cash >= cash_change + request.commission_per_order
-                    && position == 0.0
-                {
-                    cash -= cash_change + request.commission_per_order;
-                    position += quantity;
-                } else if side == "sell" && position > 0.0 {
-                    cash += cash_change - request.commission_per_order;
-                    position -= quantity;
+                let cost_side = if side == "buy" {
+                    CostSide::Buy
                 } else {
-                    history.push(crate::strategy::StrategyBar {
-                        time: bar.open_time,
-                        open: bar.open,
-                        high: bar.high,
-                        low: bar.low,
-                        close: bar.close,
-                        volume: bar.volume,
+                    CostSide::Sell
+                };
+                let direction = if side == "buy" { 1.0 } else { -1.0 };
+                let reference_notional = bar.open * quantity;
+                let estimated =
+                    cost_model.estimated_execution_cost(cost_side, reference_notional, quantity);
+                let fill_price =
+                    bar.open + direction * (estimated.spread + estimated.slippage) / quantity;
+                let cash_change = fill_price * quantity;
+                let commission = estimated.commission;
+                // An unfillable order (for example a buy without enough cash)
+                // is abandoned, but the bar itself must still be evaluated
+                // below: skipping it would silently drop signals and desync
+                // stateful strategies from the live per-bar evaluation.
+                let filled = if side == "buy" && cash >= cash_change + commission && position == 0.0
+                {
+                    cash -= cash_change + commission;
+                    position += quantity;
+                    true
+                } else if side == "sell" && position > 0.0 {
+                    cash += cash_change - commission;
+                    position -= quantity;
+                    true
+                } else {
+                    false
+                };
+                if filled {
+                    trades.push(SimulatedTrade {
+                        signal_time,
+                        fill_time: bar.open_time,
+                        side,
+                        quantity,
+                        price: fill_price,
+                        commission,
+                        spread: estimated.spread,
+                        slippage: estimated.slippage,
                     });
-                    equity.push(EquityPoint {
-                        observed_at: bar.open_time,
-                        cash,
-                        position,
-                        close: bar.close,
-                        equity: cash + position * bar.close,
-                    });
-                    continue;
                 }
-                trades.push(SimulatedTrade {
-                    signal_time,
-                    fill_time: bar.open_time,
-                    side,
-                    quantity,
-                    price: fill_price,
-                    commission: request.commission_per_order,
-                    slippage: slippage.abs() * quantity,
-                });
             }
         }
         history.push(crate::strategy::StrategyBar {
@@ -6863,6 +8558,9 @@ fn simulate_strategy(
         .iter()
         .map(|trade| trade.price * trade.quantity)
         .sum::<f64>();
+    let total_commission = trades.iter().map(|trade| trade.commission).sum::<f64>();
+    let total_spread = trades.iter().map(|trade| trade.spread).sum::<f64>();
+    let total_slippage = trades.iter().map(|trade| trade.slippage).sum::<f64>();
     let metrics = serde_json::json!({
         "bar_count": bars.len(),
         "trade_count": trades.len(),
@@ -6872,6 +8570,10 @@ fn simulate_strategy(
         "bar_return_volatility": volatility,
         "maximum_drawdown": maximum_drawdown,
         "turnover": traded_notional / request.initial_cash,
+        "total_commission": total_commission,
+        "total_spread": total_spread,
+        "total_slippage": total_slippage,
+        "total_execution_cost": total_commission + total_spread + total_slippage,
         "open_position": position,
         "pending_signal_discarded_at_end": pending.is_some()
     });
@@ -6960,6 +8662,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn commission_ratio_fuse_requires_positive_gross_profit() {
+        assert_eq!(commission_to_gross_profit_ratio(100.0, 25.0), Some(0.25));
+        assert_eq!(commission_to_gross_profit_ratio(0.0, 25.0), None);
+        assert_eq!(commission_to_gross_profit_ratio(-100.0, 25.0), None);
+    }
+
+    #[test]
     fn creates_and_migrates_database() {
         let directory = tempfile::tempdir().unwrap();
         let storage = Storage::open(&directory.path().join("state.duckdb")).unwrap();
@@ -7007,6 +8716,63 @@ mod tests {
         }
     }
 
+    fn test_cost_model(fixed_fee: f64, slippage_bps: f64) -> ExecutionCostModelInput {
+        ExecutionCostModelInput {
+            cost_model_id: None,
+            name: format!("test-cost-{fixed_fee}-{slippage_bps}"),
+            currency: "USD".into(),
+            buy_fixed_fee: fixed_fee,
+            buy_per_share_fee: 0.0,
+            buy_rate_bps: 0.0,
+            buy_min_fee: 0.0,
+            sell_fixed_fee: fixed_fee,
+            sell_per_share_fee: 0.0,
+            sell_rate_bps: 0.0,
+            sell_min_fee: 0.0,
+            sell_tax_bps: 0.0,
+            estimated_spread_bps: 0.0,
+            estimated_slippage_bps: slippage_bps,
+        }
+    }
+
+    fn insert_test_cost_model(
+        storage: &mut Storage,
+        fixed_fee: f64,
+        slippage_bps: f64,
+    ) -> uuid::Uuid {
+        storage
+            .upsert_execution_cost_model(&test_cost_model(fixed_fee, slippage_bps))
+            .unwrap()
+    }
+
+    fn mark_backfill_range_verified(
+        storage: &mut Storage,
+        timeframe: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        outside_rth: bool,
+    ) {
+        let request = BackfillJobRequest {
+            contract: crate::ibkr::ContractCandidate {
+                conid: 756733,
+                symbol: "SPY".into(),
+                security_type: "STK".into(),
+                currency: "USD".into(),
+                exchange: "SMART".into(),
+                primary_exchange: "ARCA".into(),
+                local_symbol: "SPY".into(),
+                description: String::new(),
+                derivative_security_types: Vec::new(),
+            },
+            timeframe: timeframe.into(),
+            start,
+            end,
+            outside_rth,
+        };
+        let job_id = storage.create_backfill_job(&request).unwrap().job_id;
+        storage.advance_backfill_job(job_id, end, end).unwrap();
+    }
+
     #[test]
     fn repeated_backfill_deactivates_fully_covered_files() {
         let directory = tempfile::tempdir().unwrap();
@@ -7040,6 +8806,155 @@ mod tests {
     }
 
     #[test]
+    fn completed_backfill_verifies_a_range_despite_nontrading_file_gaps() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(&directory.path().join("state.duckdb")).unwrap();
+        let lake = directory.path().join("lake");
+        let staging = directory.path().join("staging");
+        let start = "2026-07-31T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let end = "2026-08-04T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        // Friday and Monday live in separate fragments. The wall-clock gap is
+        // expected (weekend), and a completed IBKR request proves it was not a
+        // silently omitted data range.
+        storage
+            .write_historical_bars(&lake, &staging, &[test_bar(start, 100.0)])
+            .unwrap();
+        storage
+            .write_historical_bars(
+                &lake,
+                &staging,
+                &[test_bar(start + chrono::Duration::days(3), 101.0)],
+            )
+            .unwrap();
+        mark_backfill_range_verified(&mut storage, "1d", start, end, false);
+
+        let coverage = storage
+            .historical_coverage_for_session(756733, "1d", start, end, false)
+            .unwrap();
+        assert_eq!(coverage["raw_covered"], false);
+        assert_eq!(coverage["covered"], true);
+        assert_eq!(coverage["verified"], true);
+        assert_eq!(coverage["backtest_ready"], true);
+        assert_eq!(coverage["coverage_basis"], "successful_backfill_ranges");
+        assert!(coverage["verified_gaps"].as_array().unwrap().is_empty());
+        assert_eq!(coverage["first_bar_time"], serde_json::json!(start));
+        assert_eq!(
+            coverage["last_bar_time"],
+            serde_json::json!(start + chrono::Duration::days(3))
+        );
+    }
+
+    #[test]
+    fn partial_backfill_never_makes_a_longer_range_runnable() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(&directory.path().join("state.duckdb")).unwrap();
+        let lake = directory.path().join("lake");
+        let staging = directory.path().join("staging");
+        let start = "2025-07-26T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let end = "2026-08-02T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let downloaded_end = start + chrono::Duration::days(5);
+        let bars = (0..5)
+            .map(|day| test_bar(start + chrono::Duration::days(day), 100.0 + day as f64))
+            .collect::<Vec<_>>();
+        storage
+            .write_historical_bars(&lake, &staging, &bars)
+            .unwrap();
+        let job = BackfillJobRequest {
+            contract: crate::ibkr::ContractCandidate {
+                conid: 756733,
+                symbol: "SPY".into(),
+                security_type: "STK".into(),
+                currency: "USD".into(),
+                exchange: "SMART".into(),
+                primary_exchange: "ARCA".into(),
+                local_symbol: "SPY".into(),
+                description: String::new(),
+                derivative_security_types: Vec::new(),
+            },
+            timeframe: "1d".into(),
+            start,
+            end,
+            outside_rth: false,
+        };
+        let job_id = storage.create_backfill_job(&job).unwrap().job_id;
+        storage
+            .advance_backfill_job(job_id, downloaded_end, end)
+            .unwrap();
+
+        let coverage = storage
+            .historical_coverage_for_session(756733, "1d", start, end, false)
+            .unwrap();
+        assert_eq!(coverage["covered"], false);
+        assert_eq!(coverage["verified"], false);
+        assert_eq!(coverage["backtest_ready"], false);
+        assert_eq!(
+            coverage["fetched_ranges"][0]["end"],
+            serde_json::json!(downloaded_end)
+        );
+        assert_eq!(
+            coverage["verified_gaps"][0]["start"],
+            serde_json::json!(downloaded_end)
+        );
+
+        let cost_model_id = insert_test_cost_model(&mut storage, 0.0, 0.0);
+        let request = BacktestRequest {
+            strategy_id: None,
+            cost_model_id: Some(cost_model_id),
+            conid: 756733,
+            timeframe: "1d".into(),
+            start,
+            end,
+            short_window: Some(2),
+            long_window: Some(3),
+            strategy_kind: "moving_average_cross".into(),
+            strategy_config: None,
+            quantity: 1.0,
+            initial_cash: 100_000.0,
+            outside_rth: false,
+            seed: 1,
+        };
+        let error = storage
+            .run_moving_average_backtest(&lake, &request)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("historical download has not successfully fetched")
+        );
+        assert!(storage.list_backtests().unwrap().is_empty());
+    }
+
+    #[test]
+    fn adjacent_backfills_merge_without_crossing_session_scopes() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(&directory.path().join("state.duckdb")).unwrap();
+        let lake = directory.path().join("lake");
+        let staging = directory.path().join("staging");
+        let start = "2026-07-31T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let middle = start + chrono::Duration::days(1);
+        let end = middle + chrono::Duration::days(1);
+        storage
+            .write_historical_bars(&lake, &staging, &[test_bar(start, 100.0)])
+            .unwrap();
+        mark_backfill_range_verified(&mut storage, "1d", start, middle, false);
+        mark_backfill_range_verified(&mut storage, "1d", middle, end, false);
+
+        let regular = storage
+            .historical_coverage_for_session(756733, "1d", start, end, false)
+            .unwrap();
+        assert_eq!(regular["verified"], true);
+        assert_eq!(regular["backtest_ready"], true);
+        assert_eq!(regular["verified_ranges"].as_array().unwrap().len(), 1);
+
+        let extended = storage
+            .historical_coverage_for_session(756733, "1d", start, end, true)
+            .unwrap();
+        assert_eq!(extended["verified"], false);
+        assert_eq!(extended["backtest_ready"], false);
+        assert_eq!(extended["session_kind"], "extended");
+    }
+
+    #[test]
     fn failed_backtest_is_recorded_as_failed_not_running() {
         let directory = tempfile::tempdir().unwrap();
         let mut storage = Storage::open(&directory.path().join("state.duckdb")).unwrap();
@@ -7052,8 +8967,17 @@ mod tests {
         storage
             .write_historical_bars(&lake, &staging, &bars)
             .unwrap();
+        mark_backfill_range_verified(
+            &mut storage,
+            "1d",
+            start,
+            start + chrono::Duration::days(3),
+            false,
+        );
+        let cost_model_id = insert_test_cost_model(&mut storage, 0.0, 0.0);
         let request = BacktestRequest {
             strategy_id: None,
+            cost_model_id: Some(cost_model_id),
             conid: 756733,
             timeframe: "1d".into(),
             start,
@@ -7066,8 +8990,7 @@ mod tests {
             strategy_config: None,
             quantity: 1.0,
             initial_cash: 100.0,
-            slippage_bps: 0.0,
-            commission_per_order: 0.0,
+            outside_rth: false,
             seed: 1,
         };
         assert!(
@@ -7108,8 +9031,17 @@ mod tests {
         storage
             .write_historical_bars(&lake, &staging, &bars[3..])
             .unwrap();
+        mark_backfill_range_verified(
+            &mut storage,
+            "1d",
+            start,
+            start + chrono::Duration::days(5),
+            false,
+        );
+        let cost_model_id = insert_test_cost_model(&mut storage, 1.0, 0.0);
         let request = BacktestRequest {
             strategy_id: None,
+            cost_model_id: Some(cost_model_id),
             conid: 756733,
             timeframe: "1d".into(),
             start,
@@ -7120,8 +9052,7 @@ mod tests {
             strategy_config: None,
             quantity: 1.0,
             initial_cash: 100.0,
-            slippage_bps: 0.0,
-            commission_per_order: 1.0,
+            outside_rth: false,
             seed: 1,
         };
 
@@ -7132,8 +9063,48 @@ mod tests {
         let details = storage.backtest_details(backtest_id).unwrap().unwrap();
         assert_eq!(details["state"], "completed");
         assert_eq!(details["metrics"]["bar_count"], 5);
+        assert_eq!(details["metrics"]["total_commission"], 1.0);
+        assert_eq!(details["metrics"]["total_spread"], 0.0);
+        assert_eq!(
+            details["parameters"]["cost_model_source"],
+            "explicit_cost_model"
+        );
+        assert_eq!(details["parameters"]["cost_model"]["name"], "test-cost-1-0");
         assert_eq!(details["equity"].as_array().unwrap().len(), 5);
         assert_eq!(details["trades"].as_array().unwrap().len(), 1);
+        assert_eq!(details["trades"][0]["spread"], 0.0);
+
+        for index in 0..200 {
+            storage
+                .connection
+                .execute(
+                    "INSERT INTO backtest_equity VALUES (?, ?, ?, ?, ?, ?)",
+                    params![
+                        backtest_id,
+                        start + chrono::Duration::days(10) + chrono::Duration::seconds(index),
+                        100.0,
+                        0.0,
+                        1.0,
+                        100.0 + index as f64,
+                    ],
+                )
+                .unwrap();
+        }
+        let compact = storage
+            .backtest_details_with_options(
+                backtest_id,
+                BacktestDetailOptions {
+                    trade_page: 1,
+                    trade_page_size: 1,
+                    max_equity_points: 100,
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(compact["trades_page"]["total_items"], 1);
+        assert_eq!(compact["equity_sampling"]["total_points"], 205);
+        assert_eq!(compact["equity_sampling"]["downsampled"], true);
+        assert!(compact["equity"].as_array().unwrap().len() <= 101);
     }
 
     #[test]
@@ -7155,6 +9126,7 @@ mod tests {
         let start = Utc::now();
         let request = BacktestRequest {
             strategy_id: Some(strategy_id),
+            cost_model_id: None,
             conid: 756733,
             timeframe: "1d".into(),
             start,
@@ -7169,8 +9141,7 @@ mod tests {
             })),
             quantity: 1.0,
             initial_cash: 100_000.0,
-            slippage_bps: 0.0,
-            commission_per_order: 0.0,
+            outside_rth: false,
             seed: 42,
         };
 
@@ -7235,7 +9206,81 @@ mod tests {
         let controls = storage.list_strategy_cost_controls().unwrap();
         assert_eq!(controls[0]["strategy_id"], strategy_id.to_string());
         assert_eq!(controls[0]["cost_model_id"], model_id.to_string());
+        let start = Utc::now();
+        let (backtest_model, source) = storage
+            .resolve_backtest_cost_model(&BacktestRequest {
+                strategy_id: Some(strategy_id),
+                cost_model_id: None,
+                conid: 272093,
+                timeframe: "1m".into(),
+                start,
+                end: start + chrono::Duration::days(1),
+                short_window: None,
+                long_window: None,
+                strategy_kind: "moving_average_cross".into(),
+                strategy_config: None,
+                quantity: 100.0,
+                initial_cash: 100_000.0,
+                outside_rth: false,
+                seed: 1,
+            })
+            .unwrap();
+        assert_eq!(source, "strategy_cost_control");
+        assert_eq!(backtest_model.cost_model_id, Some(model_id));
+        assert_eq!(backtest_model.estimated_slippage_bps, 3.0);
         assert!(storage.delete_execution_cost_model(model_id).is_err());
+    }
+
+    #[test]
+    fn running_strategy_cost_control_requires_pausing_before_save() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(&directory.path().join("state.duckdb")).unwrap();
+        let model_id = storage
+            .upsert_execution_cost_model(&ExecutionCostModelInput {
+                cost_model_id: None,
+                name: "test-fees".into(),
+                currency: "USD".into(),
+                buy_fixed_fee: 0.0,
+                buy_per_share_fee: 0.0,
+                buy_rate_bps: 0.0,
+                buy_min_fee: 0.0,
+                sell_fixed_fee: 0.0,
+                sell_per_share_fee: 0.0,
+                sell_rate_bps: 0.0,
+                sell_min_fee: 0.0,
+                sell_tax_bps: 0.0,
+                estimated_spread_bps: 0.0,
+                estimated_slippage_bps: 0.0,
+            })
+            .unwrap();
+        let strategy_id = storage
+            .create_strategy(
+                "running-cost-control",
+                "moving_average_cross",
+                &serde_json::json!({
+                    "conid": 272093,
+                    "short_window": 5,
+                    "long_window": 20
+                }),
+            )
+            .unwrap();
+        let input = StrategyCostControlInput {
+            strategy_id,
+            enabled: true,
+            cost_model_id: model_id,
+            minimum_cost_multiple: 2.0,
+            maximum_commission_to_gross_profit_ratio: 0.5,
+            minimum_completed_trades: 5,
+        };
+
+        storage.set_strategy_state(strategy_id, "running").unwrap();
+        let error = storage
+            .configure_strategy_cost_control(&input)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("请先暂停策略"));
+        storage.set_strategy_state(strategy_id, "paused").unwrap();
+        storage.configure_strategy_cost_control(&input).unwrap();
     }
 
     #[test]
@@ -7357,6 +9402,43 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stale.reason_code, "POSITION_DATA_UNAVAILABLE");
+
+        let refreshed_at =
+            now + chrono::Duration::seconds(config.max_account_data_age_seconds as i64 + 1);
+        storage
+            .apply_broker_event(&crate::ibkr::BrokerEvent::PositionSubscriptionHeartbeat {
+                observed_at: refreshed_at,
+            })
+            .unwrap();
+        // PnL has an independent freshness requirement. Refresh it here so the
+        // assertion isolates the position-subscription lease.
+        storage
+            .apply_broker_event(&crate::ibkr::BrokerEvent::Pnl {
+                account: "DU123".into(),
+                daily_pnl: 0.0,
+                unrealized_pnl: Some(0.0),
+                realized_pnl: Some(0.0),
+                observed_at: refreshed_at,
+            })
+            .unwrap();
+        let refreshed = storage
+            .evaluate_portfolio_risk(
+                &config,
+                "DU123",
+                &request,
+                Some(100.0),
+                Some(100.0),
+                false,
+                refreshed_at,
+            )
+            .unwrap();
+        assert!(refreshed.allowed, "{refreshed:?}");
+        assert_eq!(
+            refreshed
+                .positions_observed_at
+                .map(|time| time.timestamp_micros()),
+            Some(refreshed_at.timestamp_micros())
+        );
     }
 
     #[test]
@@ -7657,6 +9739,56 @@ mod tests {
             serde_json::json!(start + chrono::Duration::seconds(15))
         );
         assert_eq!(evaluations[0]["output"]["timeframe"], "5s");
+    }
+
+    #[test]
+    fn incomplete_live_bar_window_is_a_quiet_wait_not_a_strategy_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(&directory.path().join("state.duckdb")).unwrap();
+        let strategy_id = storage
+            .create_strategy(
+                "gapped five second crossover",
+                "moving_average_cross_5s",
+                &serde_json::json!({"conid": 756733, "short_window": 2, "long_window": 3}),
+            )
+            .unwrap();
+        storage.set_strategy_state(strategy_id, "running").unwrap();
+        let start = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        for (offset, close) in [(0, 3.0), (5, 2.0), (15, 1.0), (20, 4.0)] {
+            let time = start + chrono::Duration::seconds(offset);
+            storage
+                .connection
+                .execute(
+                    "INSERT INTO market_five_second_bars
+                     VALUES (756733, ?, ?, ?, ?, ?, 1, true, ?)",
+                    params![time, close, close, close, close, time],
+                )
+                .unwrap();
+        }
+        storage
+            .connection
+            .execute(
+                "UPDATE strategies SET last_error =
+                 'moving_average_cross_v2 requires 25 contiguous 5s Bars; waiting for gaps in live market data to refill'
+                 WHERE strategy_id = ?",
+                params![strategy_id],
+            )
+            .unwrap();
+
+        assert_eq!(storage.evaluate_running_strategies().unwrap(), 0);
+        let strategy = storage
+            .list_strategies()
+            .unwrap()
+            .into_iter()
+            .find(|strategy| strategy["strategy_id"] == strategy_id.to_string())
+            .unwrap();
+        assert!(strategy["last_error"].is_null());
+        assert!(
+            storage
+                .list_strategy_evaluations(strategy_id, 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -8148,6 +10280,90 @@ mod tests {
     }
 
     #[test]
+    fn broker_completion_and_execution_are_replayed_when_they_arrive_before_order_insert() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(&directory.path().join("state.duckdb")).unwrap();
+        let session = uuid::Uuid::now_v7();
+        let request = crate::ibkr::BrokerOrderRequest {
+            contract: crate::ibkr::ContractCandidate {
+                conid: 272093,
+                symbol: "MSFT".into(),
+                security_type: "STK".into(),
+                currency: "USD".into(),
+                exchange: "SMART".into(),
+                primary_exchange: "NASDAQ".into(),
+                local_symbol: "MSFT".into(),
+                description: "MICROSOFT CORP".into(),
+                derivative_security_types: Vec::new(),
+            },
+            side: "SELL".into(),
+            quantity: 100.0,
+            order_type: "MKT".into(),
+            limit_price: None,
+            outside_rth: false,
+        };
+        let intent_id = storage
+            .create_order_intent("fast-fill", "DU123", &request, "accepted", None)
+            .unwrap();
+
+        storage
+            .apply_broker_event(&crate::ibkr::BrokerEvent::Execution {
+                connection_session_id: Some(session),
+                broker_order_id: 33,
+                perm_id: 1608303481,
+                execution_id: "fast.execution.1".into(),
+                conid: 272093,
+                side: "SLD".into(),
+                quantity: 100.0,
+                price: 463.6,
+                executed_at: Utc::now(),
+            })
+            .unwrap();
+        storage
+            .apply_broker_event(&crate::ibkr::BrokerEvent::Commission {
+                execution_id: "fast.execution.1".into(),
+                commission: 1.25,
+                currency: "USD".into(),
+            })
+            .unwrap();
+        storage
+            .apply_broker_event(&crate::ibkr::BrokerEvent::OpenOrder {
+                connection_session_id: Some(session),
+                broker_order_id: 33,
+                perm_id: 1608303481,
+                status: "Filled".into(),
+                reject_reason: String::new(),
+                warning_text: String::new(),
+                completed_time: "20260731 12:34:01 US/Eastern".into(),
+                completed_status: "Filled Size: 100".into(),
+            })
+            .unwrap();
+        assert_eq!(storage.list_executions_page(1, 10).unwrap().1, 0);
+
+        let order_id = storage
+            .record_submitted_order(intent_id, 33, session)
+            .unwrap();
+        let order = &storage.list_orders_page(1, 10).unwrap().0[0];
+        assert_eq!(order["status"], "Filled");
+        assert_eq!(order["broker_perm_id"], 1608303481_i64);
+        let (executions, count) = storage.list_executions_page(1, 10).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(executions[0]["order_id"], order_id.to_string());
+        assert_eq!(executions[0]["broker_execution_id"], "fast.execution.1");
+        assert_eq!(executions[0]["commission"], 1.25);
+        assert_eq!(executions[0]["currency"], "USD");
+        let pending: i64 = storage
+            .connection
+            .query_row(
+                "SELECT count(*) FROM pending_broker_executions",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 0);
+    }
+
+    #[test]
     fn reconciliation_recovers_completed_order_through_broker_event_perm_id() {
         let directory = tempfile::tempdir().unwrap();
         let mut storage = Storage::open(&directory.path().join("state.duckdb")).unwrap();
@@ -8275,6 +10491,7 @@ mod tests {
             .collect();
         let request = BacktestRequest {
             strategy_id: None,
+            cost_model_id: None,
             conid: 756733,
             timeframe: "1m".into(),
             start,
@@ -8285,12 +10502,13 @@ mod tests {
             strategy_config: None,
             quantity: 1.0,
             initial_cash: 100.0,
-            slippage_bps: 100.0,
-            commission_per_order: 1.0,
+            outside_rth: false,
             seed: 7,
         };
         let strategy = build_backtest_strategy(&request).unwrap();
-        let (trades, _, metrics) = simulate_strategy(&request, strategy.as_ref(), &bars).unwrap();
+        let cost_model = test_cost_model(1.0, 100.0);
+        let (trades, _, metrics) =
+            simulate_strategy(&request, strategy.as_ref(), &cost_model, &bars).unwrap();
         assert_eq!(trades.len(), 1);
         assert_eq!(trades[0].signal_time, bars[3].open_time);
         assert_eq!(trades[0].fill_time, bars[4].open_time);
@@ -8404,6 +10622,190 @@ mod tests {
         assert_eq!(storage.list_account_summary().unwrap().len(), 1);
         assert_eq!(storage.list_account_pnl().unwrap().len(), 1);
         assert_eq!(storage.list_positions().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn live_bar_builder_carries_forward_short_quote_silence() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(&directory.path().join("state.duckdb")).unwrap();
+        let start = "2026-08-01T13:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        storage
+            .update_market_five_second_bar(272093, 100.0, start)
+            .unwrap();
+        storage
+            .update_market_five_second_bar(272093, 101.0, start + chrono::Duration::seconds(20))
+            .unwrap();
+
+        let mut bars = storage.list_market_bars(272093, "5s", 10).unwrap();
+        bars.reverse();
+        assert_eq!(bars.len(), 5);
+        for pair in bars.windows(2) {
+            let left = pair[0]["bar_time"]
+                .as_str()
+                .unwrap()
+                .parse::<DateTime<Utc>>()
+                .unwrap();
+            let right = pair[1]["bar_time"]
+                .as_str()
+                .unwrap()
+                .parse::<DateTime<Utc>>()
+                .unwrap();
+            assert_eq!((right - left).num_seconds(), 5);
+        }
+        assert_eq!(bars[1]["tick_count"], 0);
+        assert_eq!(bars[1]["close"], 100.0);
+        assert_eq!(bars[4]["close"], 101.0);
+    }
+
+    #[test]
+    fn performance_excludes_unmatched_long_only_sells_and_counts_round_trips() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(&directory.path().join("state.duckdb")).unwrap();
+        let strategy_id = storage
+            .create_strategy(
+                "performance-integrity",
+                "close_threshold",
+                &serde_json::json!({"conid": 272093, "buy_below": 90.0, "sell_above": 110.0}),
+            )
+            .unwrap();
+        let contract = crate::ibkr::ContractCandidate {
+            conid: 272093,
+            symbol: "MSFT".into(),
+            security_type: "STK".into(),
+            currency: "USD".into(),
+            exchange: "SMART".into(),
+            primary_exchange: "NASDAQ".into(),
+            local_symbol: "MSFT".into(),
+            description: "MICROSOFT CORP".into(),
+            derivative_security_types: Vec::new(),
+        };
+        storage
+            .configure_strategy_execution(&StrategyExecutionConfig {
+                strategy_id,
+                account: "DU123".into(),
+                target_quantity: 100.0,
+                short_target_quantity: 0.0,
+                allow_short: false,
+                order_type: "market".into(),
+                paper_only: true,
+                outside_rth: false,
+                contract: contract.clone(),
+            })
+            .unwrap();
+        let session = uuid::Uuid::now_v7();
+        let start = "2026-08-01T14:00:00Z".parse::<DateTime<Utc>>().unwrap();
+
+        let mut add_order = |broker_id: i32, side: &str, price: Option<f64>, parts: &[f64]| {
+            let request = crate::ibkr::BrokerOrderRequest {
+                contract: contract.clone(),
+                side: side.into(),
+                quantity: 100.0,
+                order_type: "MKT".into(),
+                limit_price: None,
+                outside_rth: false,
+            };
+            let intent_id = storage
+                .create_order_intent(
+                    &format!("performance-{broker_id}"),
+                    "DU123",
+                    &request,
+                    "accepted",
+                    None,
+                )
+                .unwrap();
+            let now = start + chrono::Duration::minutes(broker_id as i64);
+            storage
+                .connection
+                .execute(
+                    "INSERT INTO strategy_execution_actions
+                     (action_id, strategy_id, evaluation_id, idempotency_key, signal,
+                      requested_quantity, state, order_intent_id, broker_order_id,
+                      created_at, updated_at)
+                     VALUES (?, ?, ?, ?, ?, 100, 'submitted', ?, ?, ?, ?)",
+                    params![
+                        uuid::Uuid::now_v7(),
+                        strategy_id,
+                        uuid::Uuid::now_v7(),
+                        format!("performance-{broker_id}"),
+                        side.to_ascii_lowercase(),
+                        intent_id,
+                        broker_id,
+                        now,
+                        now
+                    ],
+                )
+                .unwrap();
+            storage
+                .record_submitted_order(intent_id, broker_id, session)
+                .unwrap();
+            if let Some(price) = price {
+                for (index, quantity) in parts.iter().enumerate() {
+                    storage
+                        .apply_broker_event(&crate::ibkr::BrokerEvent::Execution {
+                            connection_session_id: Some(session),
+                            broker_order_id: broker_id,
+                            perm_id: 10_000 + broker_id as i64,
+                            execution_id: format!("performance.{broker_id}.{index}"),
+                            conid: 272093,
+                            side: if side == "BUY" { "Bought" } else { "Sold" }.into(),
+                            quantity: *quantity,
+                            price,
+                            executed_at: now,
+                        })
+                        .unwrap();
+                }
+            }
+            storage
+                .apply_broker_event(&crate::ibkr::BrokerEvent::OpenOrder {
+                    connection_session_id: Some(session),
+                    broker_order_id: broker_id,
+                    perm_id: 10_000 + broker_id as i64,
+                    status: "Filled".into(),
+                    reject_reason: String::new(),
+                    warning_text: String::new(),
+                    completed_time: String::new(),
+                    completed_status: "Filled Size: 100".into(),
+                })
+                .unwrap();
+        };
+        add_order(1, "BUY", None, &[]); // Historical execution is missing.
+        add_order(2, "SELL", Some(99.0), &[100.0]); // Must not create a synthetic short.
+        add_order(3, "BUY", Some(100.0), &[100.0]);
+        add_order(4, "SELL", Some(101.0), &[40.0, 60.0]);
+        drop(add_order);
+        storage
+            .connection
+            .execute(
+                "INSERT INTO market_minute_bars VALUES
+                 (272093, ?, 100, 100, 100, 100, 1, true, ?),
+                 (272093, ?, 101, 101, 101, 101, 1, true, ?)",
+                params![
+                    start + chrono::Duration::minutes(2),
+                    start,
+                    start + chrono::Duration::minutes(4),
+                    start
+                ],
+            )
+            .unwrap();
+
+        let report = storage
+            .strategy_performance_report(
+                strategy_id,
+                100_000.0,
+                "USD",
+                300,
+                Some(272093),
+                start + chrono::Duration::minutes(5),
+            )
+            .unwrap();
+        assert_eq!(report["gross_pnl"], 100.0);
+        assert_eq!(report["realized_trade_count"], 1);
+        assert_eq!(report["winning_trade_count"], 1);
+        assert_eq!(report["losing_trade_count"], 0);
+        assert_eq!(report["open_position_count"], 0);
+        assert_eq!(report["data_complete"], false);
+        assert_eq!(report["unmatched_execution_quantity"], 100.0);
+        assert!((report["benchmark_return"].as_f64().unwrap() - 0.01).abs() < 0.000000001);
     }
 
     #[test]
@@ -8588,15 +10990,15 @@ mod tests {
         assert_eq!(bars[1]["low"], 699.0);
         assert_eq!(bars[1]["final"], true);
         let five_second_bars = storage.list_market_bars(contract.conid, "5s", 20).unwrap();
-        assert_eq!(five_second_bars.len(), 4);
+        assert_eq!(five_second_bars.len(), 13);
         assert_eq!(
             five_second_bars
                 .iter()
                 .filter(|bar| bar["final"] == true)
                 .count(),
-            3
+            12
         );
-        assert_eq!(five_second_bars[3]["close"], 700.0);
+        assert_eq!(five_second_bars[12]["close"], 700.0);
         assert_eq!(five_second_bars[0]["close"], 701.0);
 
         let delayed_observed_at = first + chrono::Duration::minutes(2);
@@ -8746,6 +11148,444 @@ mod tests {
         );
     }
 
+    fn spy_contract() -> crate::ibkr::ContractCandidate {
+        crate::ibkr::ContractCandidate {
+            conid: 756733,
+            symbol: "SPY".into(),
+            security_type: "STK".into(),
+            currency: "USD".into(),
+            exchange: "SMART".into(),
+            primary_exchange: "ARCA".into(),
+            local_symbol: "SPY".into(),
+            description: String::new(),
+            derivative_security_types: Vec::new(),
+        }
+    }
+
+    fn configure_spy_execution(storage: &mut Storage) -> uuid::Uuid {
+        let strategy_id = storage
+            .create_strategy(
+                "pending intent test",
+                "close_threshold",
+                &serde_json::json!({
+                    "conid": 756733,
+                    "buy_below": 100.0,
+                    "sell_above": 200.0
+                }),
+            )
+            .unwrap();
+        storage
+            .configure_strategy_execution(&StrategyExecutionConfig {
+                strategy_id,
+                account: "DU123".into(),
+                target_quantity: 3.0,
+                short_target_quantity: 0.0,
+                allow_short: false,
+                order_type: "market".into(),
+                paper_only: true,
+                outside_rth: false,
+                contract: spy_contract(),
+            })
+            .unwrap();
+        storage
+            .set_strategy_execution_enabled(strategy_id, true)
+            .unwrap();
+        strategy_id
+    }
+
+    fn insert_buy_evaluation(
+        storage: &mut Storage,
+        strategy_id: uuid::Uuid,
+        created_at: DateTime<Utc>,
+    ) -> uuid::Uuid {
+        let evaluation_id = uuid::Uuid::now_v7();
+        storage
+            .connection
+            .execute(
+                "INSERT INTO strategy_evaluations
+                 VALUES (?, ?, 756733, ?, 90, 100, 90, 200, 'buy', ?, '{}')",
+                params![evaluation_id, strategy_id, created_at, created_at],
+            )
+            .unwrap();
+        evaluation_id
+    }
+
+    #[test]
+    fn in_flight_and_unknown_intents_block_claims_and_occupy_risk_headroom() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(&directory.path().join("state.duckdb")).unwrap();
+        let now = Utc::now();
+        storage
+            .apply_broker_event(&crate::ibkr::BrokerEvent::Position {
+                position: crate::ibkr::PositionSnapshot {
+                    account: "DU123".into(),
+                    conid: 756733,
+                    symbol: "SPY".into(),
+                    security_type: "STK".into(),
+                    currency: "USD".into(),
+                    exchange: "ARCA".into(),
+                    quantity: 5.0,
+                    average_cost: 100.0,
+                    observed_at: now,
+                },
+            })
+            .unwrap();
+        storage
+            .apply_broker_event(&crate::ibkr::BrokerEvent::Pnl {
+                account: "DU123".into(),
+                daily_pnl: 0.0,
+                unrealized_pnl: Some(0.0),
+                realized_pnl: Some(0.0),
+                observed_at: now,
+            })
+            .unwrap();
+        let request = crate::ibkr::BrokerOrderRequest {
+            contract: spy_contract(),
+            side: "buy".into(),
+            quantity: 2.0,
+            order_type: "limit".into(),
+            limit_price: Some(100.0),
+            outside_rth: false,
+        };
+        // An approved intent whose broker call is still in flight: no orders
+        // row exists yet.
+        storage
+            .create_order_intent("in-flight", "DU123", &request, "approved", None)
+            .unwrap();
+        let mut config = crate::config::RiskConfig::default();
+        config.max_open_orders = 1;
+        let decision = storage
+            .evaluate_portfolio_risk(&config, "DU123", &request, None, Some(100.0), false, now)
+            .unwrap();
+        assert_eq!(decision.reason_code, "MAX_OPEN_ORDERS");
+        assert_eq!(decision.active_order_count, 1);
+        // 5 held + 2 pending intent + 2 this request.
+        assert_eq!(decision.projected_position, 9.0);
+        // The claim path must also treat the in-flight intent as an active
+        // order for the same contract.
+        let strategy_id = configure_spy_execution(&mut storage);
+        insert_buy_evaluation(&mut storage, strategy_id, Utc::now());
+        assert!(storage.claim_strategy_action().unwrap().is_none());
+        let actions = storage.list_strategy_execution_actions(10).unwrap();
+        assert_eq!(actions[0]["state"], "skipped");
+        assert!(
+            actions[0]["detail"]
+                .as_str()
+                .unwrap()
+                .contains("未决订单意图")
+        );
+    }
+
+    #[test]
+    fn stale_signals_are_recorded_as_skipped_not_executed() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(&directory.path().join("state.duckdb")).unwrap();
+        let strategy_id = configure_spy_execution(&mut storage);
+        storage
+            .connection
+            .execute(
+                "UPDATE strategy_execution_configs SET enabled_at = ? WHERE strategy_id = ?",
+                params![Utc::now() - chrono::Duration::hours(3), strategy_id],
+            )
+            .unwrap();
+        insert_buy_evaluation(
+            &mut storage,
+            strategy_id,
+            Utc::now() - chrono::Duration::seconds(MAX_EXECUTABLE_SIGNAL_AGE_SECONDS + 60),
+        );
+        assert!(storage.claim_strategy_action().unwrap().is_none());
+        let actions = storage.list_strategy_execution_actions(10).unwrap();
+        assert_eq!(actions[0]["state"], "skipped");
+        assert!(actions[0]["detail"].as_str().unwrap().contains("stale"));
+        // The stale signal is consumed and never retried.
+        assert!(storage.claim_strategy_action().unwrap().is_none());
+        assert_eq!(
+            storage.list_strategy_execution_actions(10).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn claims_are_deferred_while_position_snapshot_is_syncing() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(&directory.path().join("state.duckdb")).unwrap();
+        let strategy_id = configure_spy_execution(&mut storage);
+        insert_buy_evaluation(&mut storage, strategy_id, Utc::now());
+        storage
+            .apply_broker_event(&crate::ibkr::BrokerEvent::PositionSnapshotStarted {
+                observed_at: Utc::now(),
+            })
+            .unwrap();
+        // While syncing, the evaluation must stay unclaimed (deferred, not
+        // consumed) because position deltas would be computed against a
+        // transiently empty positions table.
+        assert!(storage.claim_strategy_action().unwrap().is_none());
+        assert!(
+            storage
+                .list_strategy_execution_actions(10)
+                .unwrap()
+                .is_empty()
+        );
+        storage
+            .apply_broker_event(&crate::ibkr::BrokerEvent::PositionSnapshotCompleted {
+                observed_at: Utc::now(),
+            })
+            .unwrap();
+        let action = storage.claim_strategy_action().unwrap().unwrap();
+        assert_eq!(action.quantity, 3.0);
+    }
+
+    #[test]
+    fn missing_fx_rate_for_a_position_blocks_opening_risk() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(&directory.path().join("state.duckdb")).unwrap();
+        let now = Utc::now();
+        let eur_contract = crate::ibkr::ContractCandidate {
+            conid: 999001,
+            symbol: "SAP".into(),
+            security_type: "STK".into(),
+            currency: "EUR".into(),
+            exchange: "IBIS".into(),
+            primary_exchange: "IBIS".into(),
+            local_symbol: "SAP".into(),
+            description: String::new(),
+            derivative_security_types: Vec::new(),
+        };
+        storage.upsert_instrument(&eur_contract).unwrap();
+        storage
+            .apply_broker_event(&crate::ibkr::BrokerEvent::Position {
+                position: crate::ibkr::PositionSnapshot {
+                    account: "DU123".into(),
+                    conid: 999001,
+                    symbol: "SAP".into(),
+                    security_type: "STK".into(),
+                    currency: "EUR".into(),
+                    exchange: "IBIS".into(),
+                    quantity: 10.0,
+                    average_cost: 50.0,
+                    observed_at: now,
+                },
+            })
+            .unwrap();
+        storage
+            .apply_broker_event(&crate::ibkr::BrokerEvent::Pnl {
+                account: "DU123".into(),
+                daily_pnl: 0.0,
+                unrealized_pnl: Some(0.0),
+                realized_pnl: Some(0.0),
+                observed_at: now,
+            })
+            .unwrap();
+        let opening = crate::ibkr::BrokerOrderRequest {
+            contract: spy_contract(),
+            side: "buy".into(),
+            quantity: 1.0,
+            order_type: "limit".into(),
+            limit_price: Some(100.0),
+            outside_rth: false,
+        };
+        // No EUR->USD FX rate exists: the EUR position cannot be converted,
+        // so opening risk fails closed instead of understating exposure.
+        let decision = storage
+            .evaluate_portfolio_risk(
+                &crate::config::RiskConfig::default(),
+                "DU123",
+                &opening,
+                None,
+                Some(100.0),
+                false,
+                now,
+            )
+            .unwrap();
+        assert_eq!(decision.reason_code, "FX_RATE_UNAVAILABLE");
+        // A strictly risk-reducing close still bypasses the FX gate.
+        let closing = crate::ibkr::BrokerOrderRequest {
+            contract: eur_contract,
+            side: "sell".into(),
+            quantity: 1.0,
+            order_type: "limit".into(),
+            limit_price: Some(50.0),
+            outside_rth: false,
+        };
+        assert!(
+            storage
+                .evaluate_portfolio_risk(
+                    &crate::config::RiskConfig::default(),
+                    "DU123",
+                    &closing,
+                    None,
+                    None,
+                    true,
+                    now,
+                )
+                .unwrap()
+                .allowed
+        );
+    }
+
+    #[test]
+    fn late_out_of_order_ticks_never_rewrite_final_bars() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(&directory.path().join("state.duckdb")).unwrap();
+        let start = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        storage
+            .update_market_minute_bar(756733, 100.0, start + chrono::Duration::seconds(5))
+            .unwrap();
+        // First tick of the next minute finalises the previous bar.
+        storage
+            .update_market_minute_bar(756733, 101.0, start + chrono::Duration::seconds(65))
+            .unwrap();
+        // A late tick for the already-final bucket must be discarded.
+        storage
+            .update_market_minute_bar(756733, 999.0, start + chrono::Duration::seconds(30))
+            .unwrap();
+        let (close, high, tick_count, is_final): (f64, f64, i64, bool) = storage
+            .connection
+            .query_row(
+                "SELECT close, high, tick_count, final FROM market_minute_bars
+                 WHERE conid = 756733 ORDER BY bar_time LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert!(is_final);
+        assert_eq!(close, 100.0);
+        assert_eq!(high, 100.0);
+        assert_eq!(tick_count, 1);
+    }
+
+    #[test]
+    fn late_order_status_never_demotes_a_terminal_order_or_erases_perm_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(&directory.path().join("state.duckdb")).unwrap();
+        let session_id = uuid::Uuid::now_v7();
+        let request = crate::ibkr::BrokerOrderRequest {
+            contract: spy_contract(),
+            side: "BUY".into(),
+            quantity: 5.0,
+            order_type: "LMT".into(),
+            limit_price: Some(500.0),
+            outside_rth: false,
+        };
+        let intent_id = storage
+            .create_order_intent("terminal-guard", "DU123", &request, "approved", None)
+            .unwrap();
+        storage
+            .record_submitted_order(intent_id, 42, session_id)
+            .unwrap();
+        storage
+            .apply_broker_event(&crate::ibkr::BrokerEvent::OrderStatus {
+                connection_session_id: Some(session_id),
+                broker_order_id: 42,
+                status: "Filled".into(),
+                filled: 5.0,
+                remaining: 0.0,
+                average_fill_price: Some(500.0),
+                last_fill_price: Some(500.0),
+                perm_id: 777,
+                why_held: String::new(),
+                market_cap_price: None,
+            })
+            .unwrap();
+        // A replayed pre-fill status arriving late must not resurrect the
+        // order, regress its filled quantity or zero out the perm id.
+        storage
+            .apply_broker_event(&crate::ibkr::BrokerEvent::OrderStatus {
+                connection_session_id: Some(session_id),
+                broker_order_id: 42,
+                status: "Submitted".into(),
+                filled: 0.0,
+                remaining: 5.0,
+                average_fill_price: None,
+                last_fill_price: None,
+                perm_id: 0,
+                why_held: String::new(),
+                market_cap_price: None,
+            })
+            .unwrap();
+        let (status, filled_quantity, perm_id): (String, f64, i64) = storage
+            .connection
+            .query_row(
+                "SELECT status, filled_quantity, broker_perm_id FROM orders
+                 WHERE broker_order_id = 42",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "Filled");
+        assert_eq!(filled_quantity, 5.0);
+        assert_eq!(perm_id, 777);
+    }
+
+    #[test]
+    fn unknown_intents_require_manual_resolution_with_a_note() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(&directory.path().join("state.duckdb")).unwrap();
+        let request = crate::ibkr::BrokerOrderRequest {
+            contract: spy_contract(),
+            side: "BUY".into(),
+            quantity: 1.0,
+            order_type: "LMT".into(),
+            limit_price: Some(500.0),
+            outside_rth: false,
+        };
+        let intent_id = storage
+            .create_order_intent("resolve-me", "DU123", &request, "approved", None)
+            .unwrap();
+        // Only 'unknown' intents can be resolved.
+        assert!(storage.resolve_order_intent(intent_id, "note").is_err());
+        storage
+            .mark_order_intent_unknown(intent_id, "ack timeout")
+            .unwrap();
+        assert!(storage.resolve_order_intent(intent_id, "  ").is_err());
+        let resolved = storage
+            .resolve_order_intent(intent_id, "verified against IBKR: not open, no fills")
+            .unwrap();
+        assert_eq!(resolved["status"], "resolved_manual");
+        // Resolution is final and audited.
+        assert!(storage.resolve_order_intent(intent_id, "again").is_err());
+        let audit: i64 = storage
+            .connection
+            .query_row(
+                "SELECT count(*) FROM risk_decisions
+                 WHERE order_intent_id = ? AND reason_code = 'MANUAL_RESOLUTION'",
+                params![intent_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(audit, 1);
+    }
+
+    #[test]
+    fn stale_approved_intents_become_unknown_after_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.duckdb");
+        let request = crate::ibkr::BrokerOrderRequest {
+            contract: spy_contract(),
+            side: "BUY".into(),
+            quantity: 1.0,
+            order_type: "LMT".into(),
+            limit_price: Some(500.0),
+            outside_rth: false,
+        };
+        {
+            let mut storage = Storage::open(&path).unwrap();
+            storage
+                .create_order_intent("crashed-in-flight", "DU123", &request, "approved", None)
+                .unwrap();
+        }
+        let storage = Storage::open(&path).unwrap();
+        let status: String = storage
+            .connection
+            .query_row(
+                "SELECT status FROM order_intents WHERE idempotency_key = 'crashed-in-flight'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "unknown");
+    }
+
     #[test]
     fn backfill_jobs_persist_progress_and_complete() {
         let directory = tempfile::tempdir().unwrap();
@@ -8769,22 +11609,27 @@ mod tests {
             end,
             outside_rth: false,
         };
-        let job_id = storage.create_backfill_job(&request).unwrap();
+        let job_id = storage.create_backfill_job(&request).unwrap().job_id;
         let claimed = storage.claim_backfill_job().unwrap().unwrap();
         assert_eq!(claimed.job_id, job_id);
         storage
             .advance_backfill_job(job_id, start + chrono::Duration::days(1), end)
             .unwrap();
-        assert_eq!(storage.list_data_jobs().unwrap()[0]["state"], "pending");
+        assert_eq!(storage.list_data_jobs(true).unwrap()[0]["state"], "pending");
         let claimed = storage.claim_backfill_job().unwrap().unwrap();
         storage
             .advance_backfill_job(job_id, end, claimed.request.end)
             .unwrap();
-        assert_eq!(storage.list_data_jobs().unwrap()[0]["state"], "completed");
+        assert_eq!(
+            storage.list_data_jobs(true).unwrap()[0]["state"],
+            "completed"
+        );
         let coverage = storage
             .historical_coverage(756733, "1m", start, end)
             .unwrap();
-        assert_eq!(coverage["covered"], false);
+        assert_eq!(coverage["covered"], true);
+        assert_eq!(coverage["verified"], true);
+        assert_eq!(coverage["backtest_ready"], false);
         assert_eq!(coverage["raw_gaps"].as_array().unwrap().len(), 1);
         let five_second_coverage = storage
             .historical_coverage(756733, "5s", start, end)
@@ -8794,6 +11639,222 @@ mod tests {
             five_second_coverage["raw_gaps"].as_array().unwrap().len(),
             1
         );
+    }
+
+    #[test]
+    fn overlapping_active_backfill_requests_reuse_and_expand_the_oldest_job() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(&directory.path().join("state.duckdb")).unwrap();
+        let start = DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut request = BackfillJobRequest {
+            contract: spy_contract(),
+            timeframe: "5s".into(),
+            start,
+            end: start + chrono::Duration::days(7),
+            outside_rth: false,
+        };
+        let first = storage.create_backfill_job(&request).unwrap();
+        assert!(!first.reused);
+        let claimed = storage.claim_backfill_job().unwrap().unwrap();
+
+        request.start += chrono::Duration::days(6);
+        request.end += chrono::Duration::days(2);
+        let second = storage.create_backfill_job(&request).unwrap();
+        assert_eq!(second.job_id, first.job_id);
+        assert!(second.reused);
+        assert!(second.range_expanded);
+        storage
+            .advance_backfill_job(first.job_id, claimed.request.end, claimed.request.end)
+            .unwrap();
+
+        let jobs = storage.list_data_jobs(true).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0]["state"], "pending");
+        assert_eq!(jobs[0]["runtime_state"], "running");
+        assert_eq!(jobs[0]["queue_position"], 1);
+        assert_eq!(
+            jobs[0].pointer("/request/end").and_then(Value::as_str),
+            Some("2026-07-10T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn data_jobs_report_effective_runtime_state_and_queue_position() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(&directory.path().join("state.duckdb")).unwrap();
+        let start = DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let first_request = BackfillJobRequest {
+            contract: spy_contract(),
+            timeframe: "5s".into(),
+            start,
+            end: start + chrono::Duration::days(1),
+            outside_rth: false,
+        };
+        let mut second_request = first_request.clone();
+        second_request.start = first_request.end + chrono::Duration::hours(1);
+        second_request.end = second_request.start + chrono::Duration::days(1);
+        let first = storage.create_backfill_job(&first_request).unwrap();
+        let second = storage.create_backfill_job(&second_request).unwrap();
+
+        let jobs = storage.list_data_jobs(true).unwrap();
+        let first_job = jobs
+            .iter()
+            .find(|job| job["job_id"] == serde_json::json!(first.job_id))
+            .unwrap();
+        let second_job = jobs
+            .iter()
+            .find(|job| job["job_id"] == serde_json::json!(second.job_id))
+            .unwrap();
+        assert_eq!(first_job["runtime_state"], "running");
+        assert_eq!(first_job["queue_position"], 1);
+        assert_eq!(first_job["jobs_ahead"], 0);
+        assert_eq!(second_job["runtime_state"], "queued");
+        assert_eq!(second_job["queue_position"], 2);
+        assert_eq!(second_job["jobs_ahead"], 1);
+
+        let disconnected = storage.list_data_jobs(false).unwrap();
+        let first_job = disconnected
+            .iter()
+            .find(|job| job["job_id"] == serde_json::json!(first.job_id))
+            .unwrap();
+        assert_eq!(first_job["runtime_state"], "waiting_for_ibkr");
+    }
+
+    #[test]
+    fn data_jobs_can_be_paginated_without_losing_queue_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(&directory.path().join("state.duckdb")).unwrap();
+        let start = DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let first_request = BackfillJobRequest {
+            contract: spy_contract(),
+            timeframe: "5s".into(),
+            start,
+            end: start + chrono::Duration::hours(1),
+            outside_rth: false,
+        };
+        let mut second_request = first_request.clone();
+        second_request.start += chrono::Duration::hours(2);
+        second_request.end += chrono::Duration::hours(2);
+        let first = storage.create_backfill_job(&first_request).unwrap();
+        let second = storage.create_backfill_job(&second_request).unwrap();
+
+        let (first_page, total) = storage.list_data_jobs_page(true, 1, 1).unwrap();
+        let (second_page, second_total) = storage.list_data_jobs_page(true, 2, 1).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(second_total, 2);
+        assert_eq!(first_page.len(), 1);
+        assert_eq!(second_page.len(), 1);
+        assert_ne!(first_page[0]["job_id"], second_page[0]["job_id"]);
+        assert!(matches!(
+            first_page[0]["queue_position"].as_u64(),
+            Some(1 | 2)
+        ));
+        assert!(matches!(
+            second_page[0]["queue_position"].as_u64(),
+            Some(1 | 2)
+        ));
+        assert_eq!(storage.data_job_queue_status().unwrap().1, 2);
+        assert!(matches!(
+            storage.data_job_queue_status().unwrap().0,
+            Some(id) if id == first.job_id || id == second.job_id
+        ));
+        assert_ne!(first.job_id, second.job_id);
+    }
+
+    #[test]
+    fn opening_storage_collapses_overlapping_jobs_from_older_versions() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.duckdb");
+        let start = DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let request = BackfillJobRequest {
+            contract: spy_contract(),
+            timeframe: "5s".into(),
+            start,
+            end: start + chrono::Duration::days(7),
+            outside_rth: false,
+        };
+        let primary_id;
+        {
+            let mut storage = Storage::open(&path).unwrap();
+            primary_id = storage.create_backfill_job(&request).unwrap().job_id;
+            let mut duplicate = request.clone();
+            duplicate.start += chrono::Duration::days(6);
+            duplicate.end += chrono::Duration::days(2);
+            let now = Utc::now() + chrono::Duration::milliseconds(1);
+            storage
+                .connection
+                .execute(
+                    "INSERT INTO data_jobs VALUES
+                     (?, 'historical_backfill', 'pending', ?, ?, ?, 0, 0, NULL, ?, ?)",
+                    params![
+                        uuid::Uuid::now_v7(),
+                        serde_json::to_string(&duplicate).unwrap(),
+                        duplicate.start,
+                        duplicate.end,
+                        now,
+                        now
+                    ],
+                )
+                .unwrap();
+        }
+
+        let storage = Storage::open(&path).unwrap();
+        let jobs = storage.list_data_jobs(true).unwrap();
+        assert_eq!(
+            jobs.iter()
+                .filter(|job| {
+                    matches!(
+                        job.get("state").and_then(Value::as_str),
+                        Some("pending" | "retrying" | "running")
+                    )
+                })
+                .count(),
+            1
+        );
+        let primary = jobs
+            .iter()
+            .find(|job| job["job_id"] == serde_json::json!(primary_id))
+            .unwrap();
+        assert_eq!(
+            primary.pointer("/request/end").and_then(Value::as_str),
+            Some("2026-07-10T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn required_fx_currencies_are_discovered_from_current_positions() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&directory.path().join("state.duckdb")).unwrap();
+        let now = Utc::now();
+        storage
+            .connection
+            .execute(
+                "INSERT INTO instruments
+                 (instrument_id, conid, symbol, security_type, currency, exchange,
+                  created_at, updated_at, primary_exchange, local_symbol, description)
+                 VALUES (?, 272093, 'MSFT', 'STK', 'usd', 'NASDAQ', ?, ?,
+                         'NASDAQ', 'MSFT', 'MICROSOFT CORP')",
+                params![uuid::Uuid::now_v7(), now, now],
+            )
+            .unwrap();
+        storage
+            .connection
+            .execute(
+                "INSERT INTO positions_current VALUES ('DU123', 272093, 10, 450, ?)",
+                params![now],
+            )
+            .unwrap();
+
+        assert_eq!(storage.required_fx_currencies("HKD").unwrap(), ["USD"]);
+        assert!(storage.required_fx_currencies("US").is_err());
     }
 
     #[test]

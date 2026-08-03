@@ -13,6 +13,7 @@
 | `moving_average_cross_5s` | 基础 SMA 双均线交叉 | 5 秒 | `long_window + 1` |
 | `moving_average_cross_v2` | 带确认、冷却、波动和趋势过滤的双均线策略 | 1 分钟或 5 秒 | `max(long_window, atr_window + 1, trend_window) + confirmation_bars + cooldown_bars` |
 | `close_threshold` | 按收盘价上下阈值产生信号 | 1 分钟 | 1 |
+| `bollinger_rsi_mean_reversion` | 布林带与 RSI 联合确认的多头均值回归 | 1 分钟或 5 秒 | `max(bollinger_window + 1, rsi_window + 2)` |
 | `paper_round_trip` | paper 环境全链路验证 | 1 分钟 | 1 |
 
 运行以下命令可查看当前二进制实际注册的策略类型：
@@ -33,7 +34,13 @@ quant strategy kinds
 
 策略只在新 final Bar 到达时运行，同一策略、同一 Bar 最多持久化一次评估结果。
 1 分钟策略读取 `market_minute_bars`，5 秒策略读取
-`market_five_second_bars`。没有成交 Tick 的 5 秒区间不会生成空 Bar。
+`market_five_second_bars`。Bar 按固定墙钟时间桶聚合；一个 Bar 只有在更晚时间桶的
+首个成交 Tick 到达时才被定稿（final），因此交易时段的最后一根 Bar 会等到下一时段
+的首个 Tick 才参与评估。较短的无成交间隔（最多 120 个区间，5 秒表约 10 分钟、
+1 分钟表约 2 小时）会以上一根收盘价合成 `tick_count = 0` 的平盘 final Bar，保证
+N 根 Bar 的指标仍然对应 N 个固定时间桶；更长的中断不合成 Bar，评估会因窗口不连续
+暂停，直到累积足够的连续新 Bar。已定稿的 Bar 不可变：迟到的乱序 Tick 不会改写
+final Bar 的 OHLC。
 
 ### 2.2 输出
 
@@ -41,7 +48,9 @@ quant strategy kinds
 
 - `signal`：`buy`、`sell` 或 `hold`；
 - `indicator_a`、`indicator_b`：当前两个主要指标；
-- `previous_indicator_a`、`previous_indicator_b`：相应前值；
+- `previous_indicator_a`、`previous_indicator_b`：相应前值。均线类策略填前一根
+  Bar 的均线值；`close_threshold` 和 `paper_round_trip` 借用这些字段保存阈值或
+  相位等参照值（详见各策略章节），并非严格意义上的“前值”；
 - `details`：策略专属 JSON 诊断内容。
 
 四个标量指标用于高效 SQL 查询，`details` 用于审计信号原因及计算上下文。策略仅
@@ -69,7 +78,8 @@ quant strategy kinds
 ### 2.4 实时与回测语义
 
 实时运行和回测都通过 `strategy::build` 创建策略并调用 `evaluate()`。回测采用
-“当前 Bar 收盘后产生信号，最早在下一根 Bar 开盘成交”，并计入配置的滑点和佣金。
+“当前 Bar 收盘后产生信号，最早在下一根 Bar 开盘成交”，并按数据库费用模型计入
+佣金、税费、点差和滑点。
 当前回测执行模型只维护多头仓位：
 
 - 空仓收到 `buy` 后，下一根 Bar 尝试买入；
@@ -85,10 +95,33 @@ quant strategy kinds
 策略的临时/通用回测请求才显式提供证券和配置。Parquet 历史下载和回测支持真实
 `5s` Bar；下载任务按每小时分片请求 IBKR，不能用 1 分钟或其他周期代替。
 
-`commission_per_order` 是用户提供的每笔固定金额，并不会按交易所、成交额、最低
-收费、印花税或平台费自动计算。它与实时绩效中的 IBKR 实际 `CommissionReport`
-不是同一数据源。研究非美国市场或高换手策略时，必须先把完整费用折算成保守的每笔
-估算，并用 paper 成交报告校准。
+回测不会再把“存在任意重叠 Parquet 文件”当成完整数据。历史下载任务的 cursor 只在
+IBKR 请求成功且分片落盘后推进；系统合并匹配 `conid`、Bar 周期和 `outside_rth` 的
+成功抓取区间，只有其完整覆盖回测请求并且范围内存在 Bar 时才允许运行。该校验同时在
+Web 和后端执行，直接调用 RPC 也不能绕过。自然时间 `raw_gaps` 仅用于诊断，因为夜间、
+周末和休市时段本来就不应产生 Bar。
+
+历史任务队列会按 `conid`、周期和 `outside_rth` 合并重叠的活动请求，避免移动的结束
+时间或重复点击产生整段重复下载。Web 使用后端计算的有效运行状态和队列位置，区分
+“正在下载”“排队中”和“等待 IBKR 就绪”，并显示当前真正占用单 worker 的任务。
+
+通过 `strategy_id` 运行时，回测强制使用该策略在“交易成本”页面绑定的数据库费用
+模型，即使实时成本门控处于关闭状态也照常扣费。临时/通用回测必须显式提供数据库
+`cost_model_id`，不再接受独立的每单佣金或滑点参数。模型币种必须与证券币种一致。
+
+买卖每一腿都使用与实时成本门控相同的确定性公式：
+
+```text
+券商费 = max(最低费, 固定费 + 数量 × 每股费 + 名义金额 × 比例费率)
+卖出佣金/税费 = 卖出券商费 + 名义金额 × 卖出税率
+单腿点差成本 = 名义金额 × 完整点差 bps / 2
+单腿滑点成本 = 名义金额 × 单边滑点 bps
+```
+
+点差与滑点按方向调整下一根 Bar 的开盘成交价，佣金和税费直接从现金扣除。回测结果
+分别保存佣金/税费、点差、滑点和总执行成本，并把完整费用模型写入参数快照；之后编辑
+数据库模型不会改变历史回测。实时成交后的绩效仍以 IBKR 实际
+`CommissionReport` 为准，用于校准估计模型。
 
 ## 3. `moving_average_cross`
 
@@ -164,7 +197,9 @@ quant strategy create \
 ```
 
 该策略依赖连续的实时成交 Tick。`short_window = 5`、`long_window = 20` 表示 5
-根和 20 根实际生成的 5 秒 Bar，而不是固定的 25 秒和 100 秒墙钟时间。
+根和 20 根 5 秒 Bar。短暂无成交的区间会按 §2.1 的规则以前收合成平盘 Bar，因此
+在合成范围内窗口对应固定墙钟时间；超过合成上限的长中断会使评估暂停等待连续
+历史。
 
 ## 5. `moving_average_cross_v2`
 
@@ -246,15 +281,24 @@ atr_percent >= min_atr_percent
 
 ### 确认、触发和冷却
 
-策略逐根计算候选方向：
+确认逻辑以“真实均线交叉”为锚点，而不是简单的连续计数：
 
-- 方向连续相同则累计 streak；
-- 方向变化则以新方向重新从 1 计数；
-- 无方向则清零；
-- 仅当 streak **恰好达到** `confirmation_bars` 的当前 Bar 才形成一次候选信号，
-  持续满足方向不会每根 Bar 重复触发；
-- 若最近一次历史候选信号距当前不超过 `cooldown_bars`，当前信号被抑制为
-  `hold`。
+- 设当前评估位置的原始均线方向（不含过滤）为 `direction`（`short > long` 为
+  多头、`short < long` 为空头、相等为无方向）；
+- 触发要求确认窗口开始前一根（当前位置往前第 `confirmation_bars` 根）的原始
+  均线方向**恰好是相反方向** `-direction`，即确认窗口内发生了一次真实的均线
+  交叉；
+- 并且从交叉后的第一根到当前 Bar，每一根的过滤后方向（通过 gap、ATR 和趋势
+  过滤）都等于 `direction`；
+- 只有当上述条件恰好在窗口最后一根 Bar 成立时才发信号，方向持续成立不会每根
+  Bar 重复触发；
+- 若同一窗口内更早的位置也曾满足触发条件，且距当前不超过 `cooldown_bars`，
+  当前信号被抑制为 `hold`。
+
+这一锚点语义带来两个刻意保守的边界行为：交叉发生后若过滤条件晚一根 Bar 才开始
+满足（锚点处原始方向已与当前同向），该次交叉不再触发信号；从短长均线完全相等
+的状态直接发展出的方向也不会触发，必须存在明确的反向到正向交叉。过滤条件在确认
+窗口中途失效会使该次确认作废，且不会因过滤恢复而重新计数触发。
 
 候选方向为多头时发 `buy`，为空头时发 `sell`，其余情况发 `hold`。为确保实时运行
 与使用扩展历史的回测结果一致，V2 每次只使用末尾 `minimum_history()` 根 Bar。
@@ -267,7 +311,7 @@ atr_percent >= min_atr_percent
 | `cooldown` | 候选信号处于冷却期 |
 | `gap_below_threshold` | 均线差不足 |
 | `atr_below_threshold` | 波动率不足 |
-| `trend_filter` | 未通过长期趋势过滤 |
+| `trend_filter` | 过滤后无方向且趋势过滤开启（含均线无方向、未通过趋势过滤两种情况） |
 | `waiting_for_confirmation_or_new_cross` | 正在等待连续确认或新的方向触发 |
 
 诊断 JSON 还保存所有配置、当前短长均线、均线差、ATR、ATR 百分比、趋势均线、
@@ -326,6 +370,10 @@ Web 的“均线策略向导”也支持创建 V2，并默认给出上述示例�
 在每个新 Bar 重复产生相同方向信号；执行层的目标仓位和活动订单检查负责避免无意义
 的重复下单。
 
+指标字段：`indicator_a` 为当前收盘价，`previous_indicator_a` 也填当前收盘价，
+`indicator_b`/`previous_indicator_b` 分别保存 `buy_below` 与 `sell_above` 阈值，
+便于 SQL 直接对照信号与阈值。
+
 ```bash
 quant strategy create \
   --name spy-threshold \
@@ -333,7 +381,84 @@ quant strategy create \
   --config-json '{"conid":756733,"buy_below":600,"sell_above":800}'
 ```
 
-## 7. `paper_round_trip`
+## 7. `bollinger_rsi_mean_reversion`
+
+这是一个多头均值回归策略。价格首次跌破布林带下轨且滚动 RSI 进入超卖区时买入；
+价格重新上穿中轨或 RSI 恢复到退出阈值时卖出。它不会把上轨信号解释为开空，因此
+`supports_short_targets = false`。
+
+### 参数
+
+```json
+{
+  "conid": 756733,
+  "bar_timeframe": "1m",
+  "bollinger_window": 20,
+  "standard_deviations": 2.0,
+  "rsi_window": 14,
+  "oversold_rsi": 30.0,
+  "exit_rsi": 50.0,
+  "minimum_bandwidth_percent": 0.0
+}
+```
+
+| 参数 | 含义 | 默认值 | 约束 |
+| --- | --- | --- | --- |
+| `conid` | IBKR 合约 ID | 无 | `> 0` |
+| `bar_timeframe` | Bar 周期 | `"1m"` | `"1m"` 或 `"5s"` |
+| `bollinger_window` | 布林带窗口 | `20` | `2..=10000` |
+| `standard_deviations` | 上下轨标准差倍数 | `2` | `0 < value <= 100` |
+| `rsi_window` | RSI 涨跌统计窗口 | `14` | `2..=10000` |
+| `oversold_rsi` | 买入超卖阈值 | `30` | `0 <= value < exit_rsi` |
+| `exit_rsi` | 均值修复退出阈值 | `50` | `oversold_rsi < value <= 100` |
+| `minimum_bandwidth_percent` | 最小布林带宽度占中轨百分比 | `0` | `0..=100`，0 为关闭 |
+
+布林带使用总体标准差：
+
+```text
+middle = average(close over bollinger_window)
+sigma = sqrt(sum((close - middle)^2) / bollinger_window)
+lower = middle - standard_deviations * sigma
+upper = middle + standard_deviations * sigma
+bandwidth_percent = (upper - lower) / abs(middle) * 100
+```
+
+RSI 使用固定滚动窗口内上涨幅度与下跌幅度总和（Cutler RSI），而不是依赖无限历史的
+Wilder 递推。全窗口完全不动时 RSI 定义为 50；只有上涨时为 100；只有下跌时为 0。
+这样实时运行、daemon 重启和有限历史回测始终具有完全相同的结果。
+
+### 信号
+
+- `buy`：当前 `close < lower`、`RSI <= oversold_rsi` 且带宽合格，并且上一根 Bar
+  尚未同时满足这三个条件；
+- `sell`：价格本 Bar 首次重新达到中轨，或 RSI 本 Bar 首次达到 `exit_rsi`；
+- `hold`：其他情况。超卖条件持续成立时不会每根 Bar 重复产生买入信号。
+
+策略把当前收盘价和布林中轨分别写入 `indicator_a`、`indicator_b`，因此现有成本门控
+使用“当前价到预期回归均值的距离”作为信号强度，而不是只使用跌破下轨的微小距离。
+`details` 额外保存上下轨、中轨、当前/前一 RSI、带宽、条件布尔值和
+`signal_reason`。
+
+```bash
+quant strategy create \
+  --name msft-bollinger-rsi \
+  --kind bollinger_rsi_mean_reversion \
+  --config-json '{
+    "conid":272093,
+    "bar_timeframe":"1m",
+    "bollinger_window":20,
+    "standard_deviations":2,
+    "rsi_window":14,
+    "oversold_rsi":30,
+    "exit_rsi":50,
+    "minimum_bandwidth_percent":0
+  }'
+```
+
+Web“均值回归向导”提供证券搜索和同一组参数表单。向导只创建停止状态的策略，不会
+隐式开启信号或自动执行；创建后仍需分别配置执行目标、费用模型和历史数据。
+
+## 8. `paper_round_trip`
 
 该策略专门用于验证 signal → action → order → execution → position →
 performance 全链路，不是盈利策略，不应用于 live。
@@ -362,7 +487,7 @@ phase = floor(minute / phase_bars)
 
 因此 `phase_bars = 1` 时按 UTC epoch 分钟奇偶交替；更大的值会让每个方向持续多个
 分钟。信号取决于绝对 UTC 时间，而不是策略启动后累计了多少根 Bar。策略默认使用 1
-分钟 Bar，只需 1 根历史数据。
+分钟 Bar，只需 1 根历史数据。指标字段保存当前与前一 phase 序号，仅用于诊断。
 
 建议将 `buy` 映射为一个很小的多头目标仓位，将 `sell` 映射为 0，从而在 paper
 账户中产生往返交易：
@@ -380,7 +505,7 @@ quant strategy create \
 `security_type = STK`，并先取得新鲜的实时 Bid/Ask。当前自动执行层不支持 `CASH`
 外汇，Delayed 行情也会被拒绝。
 
-## 8. 策略生命周期与查看信号
+## 9. 策略生命周期与查看信号
 
 ```bash
 quant strategy list
@@ -393,7 +518,7 @@ quant strategy signals <STRATEGY_ID> --limit 100
 创建策略不会自动下单。策略启动后只评估 final Bar 并持久化信号；订单执行必须单独
 配置和显式启用。
 
-## 9. 回测所有注册策略
+## 10. 回测所有注册策略
 
 通用回测入口可以运行任意注册策略：
 
@@ -418,20 +543,24 @@ quant backtest run-strategy \
     "trend_window":0
   }' \
   --quantity 1 \
-  --slippage-bps 5 \
-  --commission-per-order 1
+  --cost-model-id <COST_MODEL_ID>
 ```
 
 除旧版 `moving_average_cross` 的兼容回测入口外，其他类型必须提供完整
 `strategy_config`。数据至少需要 `minimum_history + 1` 根 Bar，额外一根用于下一根
-开盘成交语义。
+开盘成交语义；整个请求范围还必须具有完整的成功抓取证明，不能用局部数据冒充长范围
+回测。
 
 所有均线策略本身都不预测收益；`min_gap_percent` 只描述均线之间的价格差比例。
-可选的执行成本门控会用 `abs(indicator_a-indicator_b)/close` 作为统一信号强度代理，
-与数据库费用模型估计的完整往返成本比较。它能过滤明显无法覆盖费用的信号，但不是
-盈利预测。5 秒策略尤其容易产生高换手。
+可选的执行成本门控会把信号强度换算为 bps，与数据库费用模型估计的完整往返成本
+比较。信号强度按策略取值：均线策略使用 `abs(indicator_a-indicator_b)/close`；
+`close_threshold` 使用收盘价与对应方向阈值（买入用 `buy_below`，卖出用
+`sell_above`）的距离；`paper_round_trip` 不提供信号强度，不参与成本门控。
+它能过滤明显无法覆盖费用的信号，但不是盈利预测。5 秒策略尤其容易产生高换手。
+注意通用回测入口不校验 `--timeframe` 与策略 `bar_timeframe` 是否一致，需自行
+保证；按 `strategy_id` 运行的回测会强制锁定保存配置中的证券与周期。
 
-## 10. Paper 自动执行
+## 11. Paper 自动执行
 
 执行器采用目标仓位语义：
 
@@ -439,7 +568,13 @@ quant backtest run-strategy \
 - `sell`：将每条腿调整到 `sell_target_quantity`，单标的默认是 0；
 - `hold`：不创建 action；
 - 当前仓位已经等于目标时不下单；
-- 同一合约存在活动订单时跳过；
+- 同一合约存在活动订单，或存在提交中（`approved`）/结果不明（`unknown`）的
+  订单意图时跳过，`unknown` 意图必须先通过对账或 `order.intent.resolve`
+  人工确认结果；
+- IBKR 持仓快照正在同步（`syncing`）期间不认领信号，等待快照就绪后按当时的
+  真实仓位计算目标差量；
+- 信号从生成起 15 分钟内未被执行（例如 daemon 停机期间积压）会被记录为
+  `skipped`（`stale_signal`），永不补交；
 - 每个 evaluation 只有一个持久化 action 和幂等键；
 - action 在 `processing` 时崩溃会标记失败并要求人工对账，不会盲目重发。
 
@@ -490,7 +625,8 @@ UTC，缓存每 6 小时按需刷新，同一交易日的分段交易会分别�
 
 配置估算还会与该策略历史实际佣金有效 bps 的 P90 取更保守值。信号强度缺失或低于
 门槛时 action 记为 `skipped`。最新绩效快照达到最少交易数且佣金/毛利润超过配置
-上限时，执行配置自动停用。
+上限时，执行配置自动停用。该熔断只在累计毛利润为正时计算；毛利润为零或负数不再
+换算成无穷比例并触发成本熔断，而应由最大回撤、连续亏损等独立风险规则判断。
 
 订单状态会记录剩余数量、最近成交价、`why_held`、market-cap price，并将 IBKR
 open/completed order 状态、拒绝原因和警告写入 `broker_order_events`。排查未成交

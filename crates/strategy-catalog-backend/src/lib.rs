@@ -1,6 +1,8 @@
 use serde_json::Value;
 use strategy_api::{BackendStrategyRegistration, ConfigFieldKind, Strategy, StrategyMetadata};
 
+pub use bollinger_rsi_engine::BollingerRsiMeanReversion;
+pub use bollinger_rsi_model::BollingerRsiConfig;
 pub use close_threshold_engine::CloseThreshold;
 pub use close_threshold_model::CloseThresholdConfig;
 pub use moving_average_engine::{
@@ -17,6 +19,7 @@ pub static REGISTRATIONS: &[BackendStrategyRegistration] = &[
     moving_average_engine::REGISTRATIONS[1],
     moving_average_engine::REGISTRATIONS[2],
     close_threshold_engine::REGISTRATION,
+    bollinger_rsi_engine::REGISTRATION,
     paper_round_trip_engine::REGISTRATION,
 ];
 
@@ -34,6 +37,7 @@ pub fn registered_kinds() -> &'static [&'static str] {
         moving_average_model::FIVE_SECOND_KIND,
         moving_average_model::V2_KIND,
         close_threshold_model::KIND,
+        bollinger_rsi_model::KIND,
         paper_round_trip_model::KIND,
     ]
 }
@@ -105,6 +109,7 @@ mod tests {
                 close_threshold_model::KIND,
                 serde_json::json!({"conid": 1, "buy_below": 10.0, "sell_above": 20.0}),
             ),
+            (bollinger_rsi_model::KIND, serde_json::json!({"conid": 1})),
             (
                 paper_round_trip_model::KIND,
                 serde_json::json!({"conid": 1, "phase_bars": 1}),

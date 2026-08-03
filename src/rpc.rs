@@ -19,9 +19,9 @@ use quant_rpc_types::{
     DataCoverageParams, DataJobIdParams, DatasetSnapshotParams, InstrumentSearchParams,
     LiveApprovalParams, LogsTailParams, MarketDataBarsParams, MarketDataConidParams,
     MonitoringAcknowledgeParams, MonitoringAlertsParams, PaginationParams, PerformanceReportParams,
-    PerformanceSnapshotsParams, SafetyModeParams, SafetyNoteParams, StrategyCreateParams,
-    StrategyDeleteParams, StrategyExecutionActionsParams, StrategyExecutionToggleParams,
-    StrategyIdParams, StrategyRenameParams, StrategySignalsParams,
+    PerformanceSnapshotsParams, ResolveOrderIntentParams, SafetyModeParams, SafetyNoteParams,
+    StrategyCreateParams, StrategyDeleteParams, StrategyExecutionActionsParams,
+    StrategyExecutionToggleParams, StrategyIdParams, StrategyRenameParams, StrategySignalsParams,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -426,14 +426,53 @@ async fn dispatch(
                 outside_rth: params.outside_rth,
             };
             match storage.lock_safe().create_backfill_job(&job) {
-                Ok(job_id) => success(request.id, json!({"job_id": job_id, "state": "pending"})),
+                Ok(created) => success(
+                    request.id,
+                    json!({
+                        "job_id": created.job_id,
+                        "state": "pending",
+                        "reused": created.reused,
+                        "range_expanded": created.range_expanded
+                    }),
+                ),
                 Err(error) => failure(request.id, -32030, &error.to_string()),
             }
         }
-        "data.jobs" => match storage.lock_safe().list_data_jobs() {
-            Ok(jobs) => success(request.id, json!({"jobs": jobs})),
-            Err(error) => failure(request.id, -32030, &error.to_string()),
-        },
+        "data.jobs" => {
+            let params = match serde_json::from_value::<PaginationParams>(request.params) {
+                Ok(params) => params,
+                Err(error) => {
+                    return failure(request.id, -32602, &format!("invalid parameters: {error}"));
+                }
+            };
+            let page = params.page.max(1);
+            let page_size = params.limit.unwrap_or(params.page_size).clamp(1, 500);
+            let worker_ready = ibkr.status().state == crate::ibkr::ConnectionState::Ready;
+            let storage = storage.lock_safe();
+            match (
+                storage.list_data_jobs_page(worker_ready, page, page_size),
+                storage.data_job_queue_status(),
+            ) {
+                (Ok((jobs, total_items)), Ok((active_job_id, active_job_count))) => {
+                    let mut result = paginated("jobs", jobs, page, page_size, total_items);
+                    result
+                        .as_object_mut()
+                        .expect("paginated result is an object")
+                        .insert(
+                            "queue".into(),
+                            json!({
+                                "worker_ready": worker_ready,
+                                "active_job_id": active_job_id,
+                                "active_job_count": active_job_count
+                            }),
+                        );
+                    success(request.id, result)
+                }
+                (Err(error), _) | (_, Err(error)) => {
+                    failure(request.id, -32030, &error.to_string())
+                }
+            }
+        }
         "data.job.cancel" => {
             let params = match serde_json::from_value::<DataJobIdParams>(request.params) {
                 Ok(params) => params,
@@ -458,11 +497,12 @@ async fn dispatch(
                     return failure(request.id, -32602, &format!("invalid parameters: {error}"));
                 }
             };
-            match storage.lock_safe().historical_coverage(
+            match storage.lock_safe().historical_coverage_for_session(
                 params.conid,
                 &params.timeframe,
                 params.start,
                 params.end,
+                params.outside_rth,
             ) {
                 Ok(coverage) => success(request.id, json!({"coverage": coverage})),
                 Err(error) => failure(request.id, -32030, &error.to_string()),
@@ -1125,6 +1165,12 @@ async fn dispatch(
             #[derive(serde::Deserialize)]
             struct Params {
                 backtest_id: uuid::Uuid,
+                #[serde(default)]
+                trade_page: Option<usize>,
+                #[serde(default)]
+                trade_page_size: Option<usize>,
+                #[serde(default)]
+                max_equity_points: Option<usize>,
             }
             let params = match serde_json::from_value::<Params>(request.params) {
                 Ok(params) => params,
@@ -1132,7 +1178,15 @@ async fn dispatch(
                     return failure(request.id, -32602, &format!("invalid parameters: {error}"));
                 }
             };
-            match storage.lock_safe().backtest_details(params.backtest_id) {
+            let options = crate::storage::BacktestDetailOptions {
+                trade_page: params.trade_page.unwrap_or(1),
+                trade_page_size: params.trade_page_size.unwrap_or(200),
+                max_equity_points: params.max_equity_points.unwrap_or(2_000),
+            };
+            match storage
+                .lock_safe()
+                .backtest_details_with_options(params.backtest_id, options)
+            {
                 Ok(Some(details)) => success(request.id, details),
                 Ok(None) => failure(request.id, -32044, "backtest not found"),
                 Err(error) => failure(request.id, -32030, &error.to_string()),
@@ -1424,11 +1478,35 @@ async fn dispatch(
             }
             match ibkr.place_order(params.order).await {
                 Ok(broker_order_id) => {
+                    // The broker has acknowledged the order. Any local failure
+                    // after this point must NOT be reported as a rejection: the
+                    // order is live at IBKR even though it could not be recorded
+                    // locally. Mark the intent 'unknown' and return -32026 so
+                    // callers resolve it through reconciliation instead of
+                    // resubmitting under a new idempotency key.
                     let Some(connection_session_id) = ibkr.status().connection_session_id else {
+                        let detail = format!(
+                            "IBKR acknowledged broker order {broker_order_id} but the \
+                             connection lost its session before it could be recorded"
+                        );
+                        if let Err(storage_error) = storage
+                            .lock_safe()
+                            .mark_order_intent_unknown(intent_id, &detail)
+                        {
+                            tracing::error!(
+                                %storage_error,
+                                %intent_id,
+                                "failed to persist unknown broker order outcome"
+                            );
+                        }
                         return failure(
                             request.id,
-                            -32010,
-                            "IBKR connection lost its session after order acknowledgement",
+                            -32026,
+                            &format!(
+                                "{detail}; the order intent is recorded as 'unknown'. Do not \
+                                 retry with a new idempotency key; run reconcile and inspect \
+                                 open orders first"
+                            ),
                         );
                     };
                     let order_id = match storage.lock_safe().record_submitted_order(
@@ -1437,7 +1515,31 @@ async fn dispatch(
                         connection_session_id,
                     ) {
                         Ok(id) => id,
-                        Err(error) => return failure(request.id, -32030, &error.to_string()),
+                        Err(error) => {
+                            let detail = format!(
+                                "IBKR acknowledged broker order {broker_order_id} but recording \
+                                 it locally failed: {error}"
+                            );
+                            if let Err(storage_error) = storage
+                                .lock_safe()
+                                .mark_order_intent_unknown(intent_id, &detail)
+                            {
+                                tracing::error!(
+                                    %storage_error,
+                                    %intent_id,
+                                    "failed to persist unknown broker order outcome"
+                                );
+                            }
+                            return failure(
+                                request.id,
+                                -32026,
+                                &format!(
+                                    "{detail}; the order intent is recorded as 'unknown'. Do not \
+                                     retry with a new idempotency key; run reconcile and inspect \
+                                     open orders first"
+                                ),
+                            );
+                        }
                     };
                     success(
                         request.id,
@@ -1574,6 +1676,29 @@ async fn dispatch(
                     };
                     failure(request.id, -32023, &message)
                 }
+            }
+        }
+        "order.intent.resolve" => {
+            let params = match serde_json::from_value::<ResolveOrderIntentParams>(request.params) {
+                Ok(params) => params,
+                Err(error) => {
+                    return failure(request.id, -32602, &format!("invalid parameters: {error}"));
+                }
+            };
+            if !params.confirm {
+                return failure(
+                    request.id,
+                    -32602,
+                    "manual intent resolution requires confirm=true after verifying the true \
+                     outcome against IBKR open orders and executions",
+                );
+            }
+            match storage
+                .lock_safe()
+                .resolve_order_intent(params.order_intent_id, &params.note)
+            {
+                Ok(result) => success(request.id, result),
+                Err(error) => failure(request.id, -32030, &error.to_string()),
             }
         }
         "order.list" | "execution.list" => {
@@ -1738,7 +1863,11 @@ mod tests {
     async fn rejects_unknown_method() {
         let (sender, receiver) = watch::channel(test_status());
         drop(sender);
-        let ibkr = ibkr::spawn(IbkrConfig::default(), CancellationToken::new());
+        let ibkr = ibkr::spawn(
+            IbkrConfig::default(),
+            RiskConfig::default().max_account_data_age_seconds,
+            CancellationToken::new(),
+        );
         let directory = tempfile::tempdir().unwrap();
         let storage = Arc::new(Mutex::new(
             Storage::open(&directory.path().join("rpc.duckdb")).unwrap(),
@@ -1772,7 +1901,11 @@ mod tests {
         let cancellation = CancellationToken::new();
         let (sender, receiver) = watch::channel(test_status());
         drop(sender);
-        let ibkr = ibkr::spawn(IbkrConfig::default(), cancellation.clone());
+        let ibkr = ibkr::spawn(
+            IbkrConfig::default(),
+            RiskConfig::default().max_account_data_age_seconds,
+            cancellation.clone(),
+        );
         let directory = tempfile::tempdir().unwrap();
         let storage = Arc::new(Mutex::new(
             Storage::open(&directory.path().join("rpc-http.duckdb")).unwrap(),

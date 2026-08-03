@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bollinger-rsi-web = { path = "../../strategies/bollinger-rsi/web" }
 close-threshold-web = { path = "../../strategies/close-threshold/web" }
 moving-average-web = { path = "../../strategies/moving-average/web" }
 paper-round-trip-web = { path = "../../strategies/paper-round-trip/web" }

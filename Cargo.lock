@@ -392,6 +392,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "bollinger-rsi-engine"
+version = "0.1.0"
+dependencies = [
+ "bollinger-rsi-model",
+ "chrono",
+ "serde_json",
+ "strategy-api",
+]
+
+[[package]]
+name = "bollinger-rsi-model"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "strategy-api",
+]
+
+[[package]]
+name = "bollinger-rsi-web"
+version = "0.1.0"
+dependencies = [
+ "bollinger-rsi-model",
+ "serde_json",
+ "strategy-web-kit",
+ "yew",
+]
+
+[[package]]
 name = "bs58"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3171,6 +3199,8 @@ dependencies = [
 name = "strategy-catalog-backend"
 version = "0.1.0"
 dependencies = [
+ "bollinger-rsi-engine",
+ "bollinger-rsi-model",
  "close-threshold-engine",
  "close-threshold-model",
  "moving-average-engine",
@@ -3185,6 +3215,7 @@ dependencies = [
 name = "strategy-catalog-web"
 version = "0.1.0"
 dependencies = [
+ "bollinger-rsi-web",
  "close-threshold-web",
  "moving-average-web",
  "paper-round-trip-web",

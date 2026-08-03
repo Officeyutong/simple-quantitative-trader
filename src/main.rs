@@ -213,7 +213,7 @@ enum DataCommand {
     Jobs,
     /// Cancel a queued or retrying historical-data job.
     Cancel { job_id: uuid::Uuid },
-    /// Inspect registered Parquet coverage and raw time gaps.
+    /// Inspect verified historical-download coverage and raw file gaps.
     Coverage {
         #[arg(long)]
         conid: i32,
@@ -223,6 +223,9 @@ enum DataCommand {
         start: chrono::DateTime<chrono::Utc>,
         #[arg(long)]
         end: chrono::DateTime<chrono::Utc>,
+        /// Inspect data requested with extended-hours trading enabled.
+        #[arg(long)]
+        outside_rth: bool,
     },
     /// Verify size and checksum of every active dataset file.
     Verify,
@@ -428,10 +431,12 @@ enum BacktestCommand {
         quantity: f64,
         #[arg(long, default_value_t = 100_000.0)]
         initial_cash: f64,
-        #[arg(long, default_value_t = 0.0)]
-        slippage_bps: f64,
-        #[arg(long, default_value_t = 0.0)]
-        commission_per_order: f64,
+        /// Database fee model used by this ad-hoc backtest.
+        #[arg(long)]
+        cost_model_id: uuid::Uuid,
+        /// Use historical data downloaded with extended-hours trading enabled.
+        #[arg(long)]
+        outside_rth: bool,
         #[arg(long, default_value_t = 0)]
         seed: i64,
     },
@@ -453,10 +458,12 @@ enum BacktestCommand {
         quantity: f64,
         #[arg(long, default_value_t = 100_000.0)]
         initial_cash: f64,
-        #[arg(long, default_value_t = 0.0)]
-        slippage_bps: f64,
-        #[arg(long, default_value_t = 0.0)]
-        commission_per_order: f64,
+        /// Database fee model used by this ad-hoc backtest.
+        #[arg(long)]
+        cost_model_id: uuid::Uuid,
+        /// Use historical data downloaded with extended-hours trading enabled.
+        #[arg(long)]
+        outside_rth: bool,
         #[arg(long, default_value_t = 0)]
         seed: i64,
     },
@@ -759,7 +766,12 @@ async fn run() -> Result<()> {
                     "outside_rth": outside_rth
                 }),
                 DataCommand::Jobs => {
-                    let value = rpc_call(&config, "data.jobs").await?;
+                    let value = rpc_call_with_params(
+                        &config,
+                        "data.jobs",
+                        json!({"page": 1, "page_size": 200}),
+                    )
+                    .await?;
                     print_value(&value, cli.json);
                     return Ok(());
                 }
@@ -775,6 +787,7 @@ async fn run() -> Result<()> {
                     timeframe,
                     start,
                     end,
+                    outside_rth,
                 } => {
                     let value = rpc_call_with_params(
                         &config,
@@ -783,7 +796,8 @@ async fn run() -> Result<()> {
                             "conid": conid,
                             "timeframe": timeframe,
                             "start": start,
-                            "end": end
+                            "end": end,
+                            "outside_rth": outside_rth
                         }),
                     )
                     .await?;
@@ -1003,8 +1017,8 @@ async fn run() -> Result<()> {
                     long_window,
                     quantity,
                     initial_cash,
-                    slippage_bps,
-                    commission_per_order,
+                    cost_model_id,
+                    outside_rth,
                     seed,
                 } => (
                     "backtest.run",
@@ -1018,8 +1032,8 @@ async fn run() -> Result<()> {
                         "strategy_kind": "moving_average_cross",
                         "quantity": quantity,
                         "initial_cash": initial_cash,
-                        "slippage_bps": slippage_bps,
-                        "commission_per_order": commission_per_order,
+                        "cost_model_id": cost_model_id,
+                        "outside_rth": outside_rth,
                         "seed": seed
                     }),
                 ),
@@ -1032,8 +1046,8 @@ async fn run() -> Result<()> {
                     config_json,
                     quantity,
                     initial_cash,
-                    slippage_bps,
-                    commission_per_order,
+                    cost_model_id,
+                    outside_rth,
                     seed,
                 } => (
                     "backtest.run",
@@ -1046,8 +1060,8 @@ async fn run() -> Result<()> {
                         "strategy_config": serde_json::from_str::<Value>(&config_json)?,
                         "quantity": quantity,
                         "initial_cash": initial_cash,
-                        "slippage_bps": slippage_bps,
-                        "commission_per_order": commission_per_order,
+                        "cost_model_id": cost_model_id,
+                        "outside_rth": outside_rth,
                         "seed": seed
                     }),
                 ),
@@ -1298,7 +1312,11 @@ async fn run_daemon(config: Config) -> Result<()> {
     let started_at = Utc::now();
     let cancellation = CancellationToken::new();
     let critical_task_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let ibkr = ibkr::spawn(config.ibkr.clone(), cancellation.clone());
+    let ibkr = ibkr::spawn(
+        config.ibkr.clone(),
+        config.risk.max_account_data_age_seconds,
+        cancellation.clone(),
+    );
     let persisted_market_data = storage.lock_safe().market_data_subscriptions()?;
     for mut contract in persisted_market_data {
         contract.normalize_streaming_subscription();
@@ -1325,7 +1343,6 @@ async fn run_daemon(config: Config) -> Result<()> {
         .expect("IBKR event receiver is available exactly once");
     let event_storage = storage.clone();
     let event_cancellation = cancellation.clone();
-    let event_base_currency = config.risk.base_currency.clone();
     spawn_supervised(
         "broker-event-persister",
         cancellation.clone(),
@@ -1337,29 +1354,122 @@ async fn run_daemon(config: Config) -> Result<()> {
                     event = broker_events.recv() => {
                         let Some(event) = event else { break };
                         let mut guard = event_storage.lock_safe();
-                        if let crate::ibkr::BrokerEvent::AccountSummary {
-                            tag,
-                            value,
-                            currency,
-                            observed_at,
-                            ..
-                        } = &event
-                            && tag.ends_with("ExchangeRate")
-                            && currency.len() == 3
-                            && !currency.eq_ignore_ascii_case(&event_base_currency)
-                            && let Ok(rate) = value.parse::<f64>()
-                        {
-                            let _ = guard.upsert_fx_rate(&crate::storage::FxRateInput {
-                                base_currency: currency.clone(),
-                                quote_currency: event_base_currency.clone(),
-                                rate,
-                                source: "ibkr_account_summary".into(),
-                                observed_at: *observed_at,
-                            });
-                        }
                         if let Err(error) = guard.apply_broker_event(&event) {
                             tracing::error!(%error, ?event, "failed to persist IBKR broker event");
                         }
+                    }
+                }
+            }
+        },
+    );
+    let fx_storage = storage.clone();
+    let fx_ibkr = ibkr.clone();
+    let fx_cancellation = cancellation.clone();
+    let fx_base_currency = config.risk.base_currency.trim().to_ascii_uppercase();
+    let fx_refresh_seconds = config.risk.fx_rate_refresh_seconds;
+    let mut fx_ibkr_status = ibkr.subscribe_status();
+    spawn_supervised(
+        "fx-rate-refresher",
+        cancellation.clone(),
+        critical_task_failed.clone(),
+        async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(fx_refresh_seconds));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                let refresh = tokio::select! {
+                    _ = fx_cancellation.cancelled() => break,
+                    _ = interval.tick() => {
+                        fx_ibkr_status.borrow().state == ibkr::ConnectionState::Ready
+                    }
+                    changed = fx_ibkr_status.changed() => {
+                        if changed.is_err() { break; }
+                        fx_ibkr_status.borrow().state == ibkr::ConnectionState::Ready
+                    }
+                };
+                if !refresh {
+                    continue;
+                }
+
+                let required = match fx_storage
+                    .lock_safe()
+                    .required_fx_currencies(&fx_base_currency)
+                {
+                    Ok(required) => required,
+                    Err(error) => {
+                        tracing::error!(%error, "failed to discover required FX currencies");
+                        continue;
+                    }
+                };
+                if required.is_empty() {
+                    let _ = fx_storage.lock_safe().upsert_monitoring_alert(
+                        "fx_rate_refresh_failed",
+                        "warning",
+                        "no non-base FX currencies are currently required",
+                        false,
+                    );
+                    continue;
+                }
+
+                match fx_ibkr.fx_rate_snapshot(fx_base_currency.clone()).await {
+                    Ok(snapshots) => {
+                        let available = snapshots
+                            .iter()
+                            .map(|snapshot| snapshot.base_currency.clone())
+                            .collect::<std::collections::HashSet<_>>();
+                        let missing = required
+                            .iter()
+                            .filter(|currency| !available.contains(*currency))
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        let mut guard = fx_storage.lock_safe();
+                        let mut persist_error = None;
+                        for snapshot in &snapshots {
+                            if let Err(error) = guard.upsert_fx_rate(&crate::storage::FxRateInput {
+                                base_currency: snapshot.base_currency.clone(),
+                                quote_currency: snapshot.quote_currency.clone(),
+                                rate: snapshot.rate,
+                                source: "ibkr_account_updates".into(),
+                                observed_at: snapshot.observed_at,
+                            }) {
+                                persist_error = Some(error.to_string());
+                                break;
+                            }
+                        }
+                        let failure = persist_error.or_else(|| {
+                            (!missing.is_empty()).then(|| {
+                                format!(
+                                    "IBKR account updates did not return required currency pair(s): {} -> {}",
+                                    missing.join(", "),
+                                    fx_base_currency
+                                )
+                            })
+                        });
+                        let _ = guard.upsert_monitoring_alert(
+                            "fx_rate_refresh_failed",
+                            "warning",
+                            failure
+                                .as_deref()
+                                .unwrap_or("IBKR FX rates are refreshing normally"),
+                            failure.is_some(),
+                        );
+                        if let Some(error) = failure {
+                            tracing::warn!(%error, "IBKR FX-rate refresh was incomplete");
+                        } else {
+                            tracing::info!(
+                                rate_count = snapshots.len(),
+                                quote_currency = %fx_base_currency,
+                                "refreshed FX rates from IBKR account updates"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to refresh FX rates from IBKR");
+                        let _ = fx_storage.lock_safe().upsert_monitoring_alert(
+                            "fx_rate_refresh_failed",
+                            "warning",
+                            &error,
+                            true,
+                        );
                     }
                 }
             }
@@ -1577,12 +1687,12 @@ async fn run_daemon(config: Config) -> Result<()> {
                                     detail,
                                 );
                             } else if action.legs.iter().any(|leg| {
-                                !leg.contract.currency.eq_ignore_ascii_case(&cost.currency)
+                                !leg.contract.currency.eq_ignore_ascii_case(&cost.model.currency)
                             }) {
                                 let detail = format!(
                                     "cost gate blocked: model currency {} does not match every \
                                      execution leg currency",
-                                    cost.currency
+                                    cost.model.currency
                                 );
                                 let mut guard = execution_storage.lock_safe();
                                 let _ = guard.record_strategy_cost_gate(
@@ -1611,8 +1721,11 @@ async fn run_daemon(config: Config) -> Result<()> {
                                 for (leg, price) in &prepared_legs {
                                     let leg_notional = leg.quantity * price.unwrap_or(0.0);
                                     notional += leg_notional;
-                                    round_trip_cost +=
-                                        estimate_round_trip_cost(cost, leg_notional, leg.quantity);
+                                    round_trip_cost += cost.model.estimated_round_trip_cost(
+                                        leg_notional,
+                                        leg.quantity,
+                                        cost.actual_fee_bps_p90,
+                                    );
                                 }
                                 let required_edge_bps = if notional > 0.0 {
                                     round_trip_cost / notional * 10_000.0
@@ -1963,17 +2076,29 @@ async fn run_daemon(config: Config) -> Result<()> {
                             end: slice_end,
                             outside_rth: job.request.outside_rth,
                         };
-                        match job_ibkr.historical_bars(request).await {
+                        // A slice fetch that hangs must not freeze the job in
+                        // 'running' forever; time it out and let the retry
+                        // machinery take over.
+                        let fetch = tokio::time::timeout(
+                            Duration::from_secs(120),
+                            job_ibkr.historical_bars(request),
+                        )
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err("timed out waiting for IBKR historical bars".into())
+                        });
+                        match fetch {
                             Ok(bars) => {
                                 let result = if bars.is_empty() {
                                     Ok(())
                                 } else {
                                     job_storage
                                         .lock_safe()
-                                        .write_historical_bars(
+                                        .write_historical_bars_for_session(
                                             &job_storage_config.lake_dir,
                                             &job_storage_config.staging_dir,
                                             &bars,
+                                            job.request.outside_rth,
                                         )
                                         .map(|_| ())
                                 };
@@ -1983,7 +2108,19 @@ async fn run_daemon(config: Config) -> Result<()> {
                                             .lock_safe()
                                             .advance_backfill_job(job.job_id, slice_end, job.request.end)
                                         {
+                                            // Leaving the job in 'running' would freeze it until
+                                            // the next daemon restart because claiming only
+                                            // considers pending/retrying jobs. Rewriting the
+                                            // slice on retry is idempotent: fully covered
+                                            // Parquet files are superseded transactionally.
                                             tracing::error!(%error, job_id = %job.job_id, "failed to advance data job");
+                                            let _ = job_storage
+                                                .lock_safe()
+                                                .fail_backfill_job(
+                                                    job.job_id,
+                                                    job.attempts,
+                                                    &format!("failed to advance cursor: {error}"),
+                                                );
                                         }
                                     }
                                     Err(error) => {
@@ -2012,22 +2149,35 @@ async fn run_daemon(config: Config) -> Result<()> {
         cancellation.clone(),
         critical_task_failed.clone(),
         async move {
+            // Reconciliation runs on every transition to Ready and
+            // periodically in between: unknown intents and external orders
+            // that appear mid-session must become visible to the readiness
+            // gate without waiting for the next reconnect.
+            let mut interval = tokio::time::interval(Duration::from_secs(600));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                tokio::select! {
+                let run = tokio::select! {
                     _ = reconcile_cancellation.cancelled() => break,
                     changed = ibkr_status.changed() => {
                         if changed.is_err() { break; }
-                        if ibkr_status.borrow().state == ibkr::ConnectionState::Ready {
-                            match reconcile_ibkr.reconcile().await {
-                                Ok(snapshot) => match reconcile_storage
-                                    .lock_safe()
-                                    .reconcile(&snapshot)
-                                {
-                                    Ok(report) => tracing::info!(?report, "automatic IBKR reconciliation completed"),
-                                    Err(error) => tracing::error!(%error, "automatic reconciliation persistence failed"),
-                                },
-                                Err(error) => tracing::error!(%error, "automatic IBKR reconciliation failed"),
+                        ibkr_status.borrow().state == ibkr::ConnectionState::Ready
+                    }
+                    _ = interval.tick() => {
+                        ibkr_status.borrow().state == ibkr::ConnectionState::Ready
+                    }
+                };
+                if run {
+                    match reconcile_ibkr.reconcile().await {
+                        Ok(snapshot) => match reconcile_storage.lock_safe().reconcile(&snapshot) {
+                            Ok(report) => {
+                                tracing::info!(?report, "automatic IBKR reconciliation completed")
                             }
+                            Err(error) => {
+                                tracing::error!(%error, "automatic reconciliation persistence failed")
+                            }
+                        },
+                        Err(error) => {
+                            tracing::error!(%error, "automatic IBKR reconciliation failed")
                         }
                     }
                 }
@@ -2194,28 +2344,6 @@ fn strategy_session_rejection(
     }
 }
 
-fn estimate_round_trip_cost(
-    cost: &crate::storage::ClaimedCostControl,
-    notional: f64,
-    quantity: f64,
-) -> f64 {
-    let buy_fee = (cost.buy_fixed_fee
-        + quantity * cost.buy_per_share_fee
-        + notional * cost.buy_rate_bps / 10_000.0)
-        .max(cost.buy_min_fee);
-    let sell_fee = (cost.sell_fixed_fee
-        + quantity * cost.sell_per_share_fee
-        + notional * (cost.sell_rate_bps + cost.sell_tax_bps) / 10_000.0)
-        .max(cost.sell_min_fee);
-    let configured_commissions = buy_fee + sell_fee;
-    let learned_commissions = cost
-        .actual_fee_bps_p90
-        .map(|bps| 2.0 * notional * bps / 10_000.0)
-        .unwrap_or(0.0);
-    configured_commissions.max(learned_commissions)
-        + notional * (cost.estimated_spread_bps + 2.0 * cost.estimated_slippage_bps) / 10_000.0
-}
-
 fn order_params(order: OrderArgs) -> Value {
     json!({
         "idempotency_key": order.idempotency_key,
@@ -2301,41 +2429,70 @@ mod execution_tests {
     #[test]
     fn cost_estimate_supports_fixed_and_proportional_fees() {
         let mut cost = crate::storage::ClaimedCostControl {
-            currency: "USD".into(),
-            buy_fixed_fee: 1.0,
-            buy_per_share_fee: 0.0,
-            buy_rate_bps: 0.0,
-            buy_min_fee: 1.0,
-            sell_fixed_fee: 1.0,
-            sell_per_share_fee: 0.0,
-            sell_rate_bps: 0.0,
-            sell_min_fee: 1.0,
-            sell_tax_bps: 0.0,
-            estimated_spread_bps: 0.0,
-            estimated_slippage_bps: 0.0,
+            model: crate::storage::ExecutionCostModelInput {
+                cost_model_id: None,
+                name: "test".into(),
+                currency: "USD".into(),
+                buy_fixed_fee: 1.0,
+                buy_per_share_fee: 0.0,
+                buy_rate_bps: 0.0,
+                buy_min_fee: 1.0,
+                sell_fixed_fee: 1.0,
+                sell_per_share_fee: 0.0,
+                sell_rate_bps: 0.0,
+                sell_min_fee: 1.0,
+                sell_tax_bps: 0.0,
+                estimated_spread_bps: 0.0,
+                estimated_slippage_bps: 0.0,
+            },
             minimum_cost_multiple: 2.0,
             maximum_commission_to_gross_profit_ratio: 0.5,
             minimum_completed_trades: 5,
             actual_fee_bps_p90: None,
         };
-        assert_eq!(estimate_round_trip_cost(&cost, 1_000.0, 10.0), 2.0);
-        cost.buy_fixed_fee = 0.0;
-        cost.sell_fixed_fee = 0.0;
-        cost.buy_min_fee = 0.0;
-        cost.sell_min_fee = 0.0;
-        cost.buy_rate_bps = 5.0;
-        cost.sell_rate_bps = 5.0;
-        assert_eq!(estimate_round_trip_cost(&cost, 10_000.0, 10.0), 10.0);
-        cost.buy_min_fee = 15.0;
-        cost.sell_min_fee = 15.0;
-        assert_eq!(estimate_round_trip_cost(&cost, 1_000.0, 10.0), 30.0);
-        cost.buy_min_fee = 0.0;
-        cost.sell_min_fee = 0.0;
-        cost.buy_rate_bps = 0.0;
-        cost.sell_rate_bps = 0.0;
-        cost.buy_per_share_fee = 0.005;
-        cost.sell_per_share_fee = 0.005;
-        assert_eq!(estimate_round_trip_cost(&cost, 1_000.0, 100.0), 1.0);
+        assert_eq!(
+            cost.model.estimated_round_trip_cost(1_000.0, 10.0, None),
+            2.0
+        );
+        cost.model.buy_fixed_fee = 0.0;
+        cost.model.sell_fixed_fee = 0.0;
+        cost.model.buy_min_fee = 0.0;
+        cost.model.sell_min_fee = 0.0;
+        cost.model.buy_rate_bps = 5.0;
+        cost.model.sell_rate_bps = 5.0;
+        assert_eq!(
+            cost.model.estimated_round_trip_cost(10_000.0, 10.0, None),
+            10.0
+        );
+        cost.model.buy_min_fee = 15.0;
+        cost.model.sell_min_fee = 15.0;
+        assert_eq!(
+            cost.model.estimated_round_trip_cost(1_000.0, 10.0, None),
+            30.0
+        );
+        cost.model.buy_min_fee = 0.0;
+        cost.model.sell_min_fee = 0.0;
+        cost.model.buy_rate_bps = 0.0;
+        cost.model.sell_rate_bps = 0.0;
+        cost.model.buy_per_share_fee = 0.005;
+        cost.model.sell_per_share_fee = 0.005;
+        assert_eq!(
+            cost.model.estimated_round_trip_cost(1_000.0, 100.0, None),
+            1.0
+        );
+        cost.model.buy_per_share_fee = 0.0;
+        cost.model.sell_per_share_fee = 0.0;
+        cost.model.buy_min_fee = 1.0;
+        cost.model.sell_min_fee = 1.0;
+        cost.model.sell_tax_bps = 10.0;
+        cost.model.estimated_spread_bps = 4.0;
+        cost.model.estimated_slippage_bps = 3.0;
+        // Buy/sell minimum commissions (2), sell tax (1), one full spread
+        // crossing (0.4), and two one-way slippage estimates (0.6).
+        assert_eq!(
+            cost.model.estimated_round_trip_cost(1_000.0, 100.0, None),
+            4.0
+        );
     }
 
     #[test]

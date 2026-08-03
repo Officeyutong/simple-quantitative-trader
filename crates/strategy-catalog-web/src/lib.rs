@@ -8,6 +8,7 @@ pub static REGISTRATIONS: &[StrategyWebRegistration] = &[
     moving_average_web::REGISTRATIONS[1],
     moving_average_web::REGISTRATIONS[2],
     close_threshold_web::REGISTRATION,
+    bollinger_rsi_web::REGISTRATION,
     paper_round_trip_web::REGISTRATION,
 ];
 

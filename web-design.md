@@ -9,8 +9,9 @@
 使用 `jsonrpsee` 同时提供 HTTP 和 WebSocket JSON-RPC，CLI 与 Yew/WASM 客户端共享
 `quant-rpc-types`。Unix Domain Socket 和自定义换行 framing 已不再使用。
 
-Web 当前包含总览、证券搜索、策略、策略状态、策略绩效、回测、交易成本、均线策略向导、
-Paper 验证、订单与成交、运行维护、实时日志、RPC 工具和 RPC 设置。页面默认每
+Web 当前包含总览、证券搜索、策略、策略状态、策略绩效、回测、下载任务、交易成本、
+交易日历、均线策略向导、均值回归向导、Paper 验证、订单与成交、运行维护、实时日志、
+RPC 工具和 RPC 设置。页面默认每
 5 秒刷新；RPC 工具的方法表来自 `quant_rpc_types::ALL_METHODS`，因此新增 RPC 时
 应同时更新共享清单。
 
@@ -367,7 +368,10 @@ RPC WebSocket URL 可在“RPC 设置”页面修改，并以键
    - 合约搜索与选择；
    - 行情订阅、quote、fresh/delayed/failed 状态；
    - 最近 minute bars；
-   - backfill job、coverage 和数据校验。
+   - backfill job、精确请求范围进度、成功抓取 coverage 和数据校验；
+   - 区分正在下载、排队中和等待 IBKR，显示队列位置、前方任务数及当前 worker 任务；
+   - 重叠活动请求由后端合并，Web 显示新建、复用或扩展已有任务的结果；
+   - 只有后端返回 `backtest_ready=true` 才允许回测，任意重叠文件不能代表完整覆盖。
 4. **Strategies**
    - 创建、启动、暂停和停止；
    - signal 时间线；
@@ -380,13 +384,20 @@ RPC WebSocket URL 可在“RPC 设置”页面修改，并以键
    - 权益/回撤曲线；
    - 净 PnL、Sharpe、Sortino、胜率和换手率；
    - 历史快照。
-6. **Orders**
+6. **Backtest**
+   - 只选择已保存策略，证券、周期和交易时段由策略配置锁定；
+   - 要求历史下载完整覆盖请求范围；
+   - 展示策略绑定的数据库费用模型并校验币种，不再提供独立佣金/滑点输入；
+   - 展示费用模型快照，以及佣金/税费、点差、滑点和总执行成本；
+   - 长周期权益曲线由服务端限量均匀抽样，成交记录使用服务端分页，详情响应不得通过
+     提高 RPC 大小上限来容纳全部 5 秒数据。
+7. **Orders**
    - preview 表单；
    - 风险决策逐项展示；
    - submit 二次确认；
    - order、execution、commission 和 unknown 状态；
    - 撤单。
-7. **Operations**
+8. **Operations**
    - monitoring metrics 和 alerts；
    - reconcile 状态、差异和 acknowledge；
    - backup、数据快照、FX 和 UTC 交易 session；
@@ -440,8 +451,10 @@ route 离开时取消前端等待，但 mutation 已送达后仍通过相同 ide
 |---|---|---|
 | Dashboard | `system.*`, `account.*`, `portfolio.positions`, `monitor.*` | `ibkr.connect` |
 | Market Data | `instrument.*`, `market_data.*`, `data.*` | subscribe、unsubscribe、backfill |
+| Download Jobs | `data.jobs`（服务端分页及全局队列摘要） | `data.job.cancel` |
 | Strategies | `strategy.*`, `strategy.execution.*` | create/start/pause/stop/configure/enable |
 | Performance | `performance.*` | 无 |
+| Backtest | `backtest.*`, `execution_cost.*`, `data.coverage` | `backtest.run`、创建下载任务 |
 | Orders | `order.list`, `execution.list`, positions | preview/submit/cancel |
 | Operations | reconcile、backup、FX、calendar、safety | acknowledge/create/set |
 

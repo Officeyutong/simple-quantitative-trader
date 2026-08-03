@@ -76,6 +76,7 @@ pub const ALL_METHODS: &[&str] = &[
     "order.preview",
     "order.submit",
     "order.cancel",
+    "order.intent.resolve",
     "order.list",
     "execution.list",
     "reconcile.run",
@@ -132,6 +133,17 @@ pub struct AcknowledgeDifferenceParams {
     pub note: String,
 }
 
+/// Manually resolves an order intent stuck in 'unknown' after the operator
+/// has confirmed the true outcome against IBKR (via reconcile and the open
+/// orders / executions views). Unknown intents block automatic execution for
+/// their contract and occupy risk headroom until resolved.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResolveOrderIntentParams {
+    pub order_intent_id: uuid::Uuid,
+    pub note: String,
+    pub confirm: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MarketDataConidParams {
     pub conid: i32,
@@ -152,6 +164,8 @@ pub struct DataCoverageParams {
     pub timeframe: String,
     pub start: chrono::DateTime<chrono::Utc>,
     pub end: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    pub outside_rth: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

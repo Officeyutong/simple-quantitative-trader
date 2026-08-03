@@ -15,7 +15,7 @@ Parquet。
 - 历史行情下载、质量检查和 Parquet 原子落盘；
 - Parquet 文件 DuckDB manifest；
 - Parquet 校验和、数据快照和确定性回测；
-- 五种内置策略、持久化运行状态、1 分钟/5 秒实时 Bar 和可复用回测核心；
+- 六种内置策略、持久化运行状态、1 分钟/5 秒实时 Bar 和可复用回测核心；
 - 仅限 paper 的目标仓位自动执行，支持单腿、多腿与目标空头仓位；
 - 市价单/限价单风险预览；
 - `trading_enabled`、最大数量和最大名义价值检查；
@@ -149,11 +149,16 @@ static_dir = "../web/dist"
 ```
 
 daemon 启动后打开 `http://127.0.0.1:8080`。控制台当前提供总览、证券搜索、策略、
-策略状态、策略绩效、回测、交易成本、均线策略向导、Paper 验证、订单与成交、运行维护、
-实时日志、RPC 工具和 RPC 设置。
+策略状态、策略绩效、回测、下载任务、交易成本、交易日历、均线策略向导、均值回归
+向导、Paper 验证、订单与成交、运行维护、实时日志、RPC 工具和 RPC 设置。
 持仓、策略执行配置、执行动作、订单、成交、告警、监控指标和系统状态均以表格展示，
 页面每 5 秒自动刷新，也可以手动立即刷新。所有操作都调用 daemon RPC，不直接访问
 DuckDB 或 IB Gateway。
+
+“下载任务”页面通过服务端分页展示数据库中的全部历史数据任务，包括真实运行状态、
+IBKR worker 状态、队列位置、证券与交易时段、完整请求范围、游标进度、已完成分片、
+重试次数和最近错误。活动任务可在该页面取消；`data.jobs` 接受 `page` 与 `page_size`
+并返回 `total_items`、`total_pages` 和全局队列摘要，因此翻页不会丢失当前 worker 信息。
 
 “策略绩效”页面可选择策略和初始资金，展示净收益、收益率、最大回撤、胜率、
 Sharpe、Sortino、交易统计及历史绩效快照。绩效只归因于该策略执行层产生并实际成交
@@ -236,7 +241,7 @@ cargo run -- --config config/local.toml strategy pause <STRATEGY_ID>
 
 策略核心按 `model`、`engine`、`web` 三类 crate 拆分；实时运行器和回测通过
 `strategy-api` 的 `Strategy` trait 共用同一算法，前后端 Catalog 负责注册。
-完整扩展流程和 `close_threshold` 示例见
+完整扩展流程、`close_threshold` 和布林带 + RSI 均值回归示例见
 [STRATEGIES.md](STRATEGIES.md)。通用创建接口：
 
 ```bash
@@ -245,6 +250,11 @@ cargo run -- --config config/local.toml strategy create \
   --name spy-threshold \
   --kind close_threshold \
   --config-json '{"conid":756733,"buy_below":600,"sell_above":800}'
+
+cargo run -- --config config/local.toml strategy create \
+  --name spy-bollinger-rsi \
+  --kind bollinger_rsi_mean_reversion \
+  --config-json '{"conid":756733,"bar_timeframe":"1m"}'
 ```
 
 可选的策略执行层默认关闭且仅支持 paper。它采用目标仓位语义，并复用完整的
@@ -270,7 +280,7 @@ cargo run -- --config config/local.toml backtest run \
   --conid 265598 --timeframe 1d \
   --start 2026-07-20T00:00:00Z --end 2026-07-25T00:00:00Z \
   --short-window 1 --long-window 2 --quantity 1 \
-  --slippage-bps 5 --commission-per-order 1 --seed 42
+  --cost-model-id <COST_MODEL_ID> --seed 42
 cargo run -- --config config/local.toml backtest list
 ```
 
@@ -279,6 +289,17 @@ Web 回测选择已有策略后，会从该策略的持久化配置自动锁定�
 `strategy_id` 对应的保存配置为权威，忽略请求中冲突的 kind、config、conid 和
 timeframe。需要测试另一只证券时，应创建新的策略配置。Parquet 历史回测不允许用
 其他周期冒充策略绑定周期；`5s` 策略会下载真实 5 秒历史 Bar，并使用这些数据回测。
+回测开始前，前端和后端都会要求所选范围已经被匹配的历史下载任务完整抓取；仅存在
+少量与范围重叠的 Parquet 文件不会被视为完整数据，也不能启动部分范围回测。
+Web 回测不再单独填写佣金和滑点：已保存策略必须先在“交易成本”页面绑定数据库费用
+模型，后端会强制使用该绑定并校验模型币种与证券币种。未绑定策略的 CLI/RPC 临时
+回测必须显式提供数据库 `cost_model_id`。每次回测会把完整模型快照保存到运行参数，
+之后修改模型不会改写历史结果。
+
+`backtest.get` 不会把长周期 5 秒回测的全部权益点一次性写入 JSON。它默认返回最多
+2,000 个均匀抽样点并保留首尾，`equity_sampling` 会说明完整点数、返回点数和步长；
+收益与回撤指标仍由完整权益序列计算。成交记录通过 `trade_page`、`trade_page_size`
+分页，单页上限 500 条，从而避免详情响应超过 RPC 的 10 MiB 限制。
 
 `quote` 会同时返回最新 ticks 和订阅状态。IBKR 拒绝订阅时，错误会持久化并显示，
 后台每 15 秒受控重试。
@@ -307,6 +328,12 @@ cargo run -- --config config/local.toml data backfill \
 `data/lake/bars/timeframe=.../conid=...`，时间统一为 UTC。
 backfill 会返回持久化 Job ID，由 daemon 在 IBKR Ready 后后台执行：
 
+同一 `conid`、Bar 周期和 `outside_rth` 下，重叠的未完成请求不会重复入队；系统会复用
+最早任务并扩展其范围，daemon 启动时也会折叠旧版本遗留的重叠任务。`data jobs` 同时
+返回持久化 `state`、面向操作员的 `runtime_state`、`queue_position` 和 `jobs_ahead`：
+队首在 IBKR Ready 时显示为正在下载，其余任务明确显示为排队中。Web“下载任务”页面
+使用 `data.jobs` 的服务端分页查看全部历史任务，而不是只截取最近一批记录。
+
 ```bash
 cargo run -- --config config/local.toml data jobs
 cargo run -- --config config/local.toml data cancel <JOB_ID>
@@ -325,7 +352,13 @@ cargo run -- --config config/local.toml data snapshot list
 ```
 
 Job 会按 timeframe 自动切片、串行 pacing、失败重试 3 次，并在 daemon 重启后
-从保存的 cursor 继续。coverage 当前报告原始时间缺口；尚未用交易日历过滤周末。
+从保存的 cursor 继续。cursor 只会在 IBKR 请求成功且数据已经落盘后推进，因此
+coverage 会合并同一 `conid`、timeframe 和 `outside_rth` 的成功抓取区间，报告
+`backtest_ready`、已验证范围和未验证范围。只有成功区间覆盖完整请求且存在相应
+Parquet Bar 时才能回测。`raw_gaps` 仍作为自然时间诊断保留；夜间、周末和休市时段
+即使没有 Bar，只要对应分片已成功请求，也不会造成错误的“不完整”判断。
+请求端点落入夏令时结束时的重复本地小时会自动扩大仅用于 IBKR 抓取的窗口，再过滤
+回原始 UTC 范围，避免第三方解码器因歧义时间退出；Bar 自身的 epoch 时间不会改变。
 
 ## 运维与发布安全
 
@@ -402,8 +435,11 @@ Sharpe、Sortino、每日权益和可选基准超额收益。启用策略会按 
 `execution_disabled`，避免出现“有信号但没有动作记录”的审计空白；这类历史信号在
 重新启用后不会补单。
 
-非账户基础币种必须有新鲜 FX 汇率。IBKR Account Summary 的 ExchangeRate 会自动
-写入，也可人工维护：
+非账户基础币种必须有新鲜 FX 汇率。daemon 每隔
+`risk.fx_rate_refresh_seconds` 秒从 IBKR Account Updates 获取 `ExchangeRate`，
+并写入 DuckDB 的 `fx_rates`；该刷新周期必须小于
+`risk.max_fx_rate_age_seconds`。IBKR 账户基础币种必须与 `risk.base_currency` 一致，
+否则 `ExchangeRate` 的报价方向无法满足风控与绩效换算。也可人工维护汇率：
 
 ```bash
 quant fx set --base USD --quote HKD --rate 7.84 --source manual
@@ -453,6 +489,8 @@ client_id = 17
 [risk]
 trading_enabled = true
 base_currency = "HKD"
+fx_rate_refresh_seconds = 300
+max_fx_rate_age_seconds = 3600
 max_order_quantity = 100.0
 max_position_quantity = 500.0
 max_order_notional = 50000.0
@@ -603,9 +641,9 @@ $BIN --config "$CFG" performance snapshots <STRATEGY_ID> --limit 500
 
 均线交叉的 `min_gap` 只过滤均线差距，不是预期收益保证。尤其是 5 秒
 策略，在存在按成交额收费、最低收费、印花税或平台费的市场，频繁反转很可能让费用
-超过毛收益。应把该市场的完整费用估算写入回测的 `commission_per_order`，并以实际
-paper `CommissionReport` 校准；当前回测只接受“每笔固定金额”，不会自动套用各市场
-阶梯费率或税费。实时自动执行应在“交易成本”页面绑定费用模型并启用成本门控。
+超过毛收益。应在“交易成本”页面维护并绑定按市场区分的数据库费用模型，并以实际
+paper `CommissionReport` 校准。实时成本门控和回测现在共享同一套固定费、每股费、
+比例费、最低费、卖出税费、点差和滑点公式；成本门控是否启用不影响回测扣费。
 
 正式评估开始后应冻结参数。需要调参时创建新的策略 ID，将其视为新的实验，避免
 把样本内调参与样本外结果混在一起。每天或修改策略前创建一致性备份：
@@ -655,9 +693,16 @@ cargo run -- --config config/local.toml order submit \
 
 - 成功：返回内部 order ID 和 broker order ID；
 - 明确拒绝：intent 标记为 `risk_rejected`/`broker_rejected`/`blocked`；
-- **结果未知**：等待 IBKR 确认超时或响应流中断时，intent 标记为 `unknown`
-  并返回错误码 `-32026`。此时订单可能仍在 IBKR 存活，必须先 `reconcile`
-  查看开放订单，绝不能换 key 重发。
+- **结果未知**：等待 IBKR 确认超时、响应流中断，或 broker 已受单但本地记录
+  失败（连接会话丢失、存储写入失败）时，intent 标记为 `unknown` 并返回错误码
+  `-32026`。此时订单可能仍在 IBKR 存活，必须先 `reconcile` 查看开放订单，
+  绝不能换 key 重发。daemon 在风险批准后、broker 确认前崩溃时，重启会把滞留
+  的 `approved` intent 同样标记为 `unknown`。
+
+`unknown` intent 会持续占用风控额度（计入活跃订单数和同合约持仓投影），并阻塞
+同一合约的自动执行。操作员在通过 `reconcile`、开放订单和成交记录确认真实结果
+后，可用 `order.intent.resolve`（参数：`order_intent_id`、`note`、
+`confirm=true`）人工解除；解除动作会写入审计记录。
 
 订单列表会保存 `remaining_quantity`、`last_fill_price`、`why_held` 和
 `market_cap_price`。IBKR 的 open/completed order 回调还会写入
@@ -668,9 +713,13 @@ cargo run -- --config config/local.toml order submit \
 
 所有 submit 尝试（包括被紧急停止、live 未批准、账户校验或就绪门控拒绝的）
 都会持久化 order intent 和 risk decision 审计记录，并消耗对应 idempotency
-key。风控检查与 intent 写入在同一个临界区内完成，并发提交无法一起挤过
-持仓、敞口和速率限制。市价单的单笔名义额检查优先采用本地最新行情价，
-仅在本地无行情时才使用自报的 `--estimated-price`。
+key。风控检查与 intent 写入在同一个临界区内完成；提交中（`approved`）和结果
+不明（`unknown`）的 intent 也计入活跃订单数与同合约持仓投影，因此并发提交
+无法一起挤过持仓、敞口、活跃订单数和速率限制。市价单的单笔名义额检查优先采用
+本地最新行情价，仅在本地无行情时才使用自报的 `--estimated-price`。持仓中存在
+无法用新鲜 FX 汇率折算为基础币种的币种时，开仓会以 `FX_RATE_UNAVAILABLE`
+拒绝，而不是低估敞口；严格平仓不受此限制（无法折算时按名义 1:1 参与单笔
+检查）。
 
 组合风险限制在 `[risk]` 中配置：
 
@@ -691,7 +740,9 @@ max_account_data_age_seconds = 120
 账户完全空仓、没有任何 `positions_current` 行，也会按“已确认的零持仓”参与风控；
 尚在同步或超过 `max_account_data_age_seconds` 的快照仍会阻止开仓。
 
-daemon 每次连接 IBKR 后会自动执行订单对账。对账完成前会拒绝提交；存在
+daemon 每次连接 IBKR 后会自动执行订单对账，此后每 10 分钟周期性重复，使会话
+中期出现的未知订单和外部订单及时进入就绪门控。对账快照读取超时会直接失败并
+重试，不会以截断的快照误判本地订单缺失。对账完成前会拒绝提交；存在
 blocking difference 时进入 `Degraded`，只允许基于当前会话新鲜持仓、方向朝向
 零且不穿过零点的纯平仓订单。撤单始终可用。可以检查状态和差异：
 

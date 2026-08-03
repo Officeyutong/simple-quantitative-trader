@@ -16,6 +16,9 @@ members = [
     "strategies/paper-round-trip/model",
     "strategies/paper-round-trip/engine",
     "strategies/paper-round-trip/web",
+    "strategies/bollinger-rsi/model",
+    "strategies/bollinger-rsi/engine",
+    "strategies/bollinger-rsi/web",
 ]
 resolver = "3"
 

@@ -10,9 +10,10 @@
 `jsonrpsee` 在配置指定的 TCP 地址上提供 HTTP/WebSocket JSON-RPC；示例配置使用
 loopback，但监听并非硬编码，外部监听需要额外的 TLS、认证和网络访问控制。
 
-策略层现有五种注册实现：`moving_average_cross`、
-`moving_average_cross_5s`、`moving_average_cross_v2`、`close_threshold` 和
-`paper_round_trip`。实时与回测共享同步、确定性的 `Strategy::evaluate` 核心；
+策略层现有六种注册实现：`moving_average_cross`、
+`moving_average_cross_5s`、`moving_average_cross_v2`、`close_threshold`、
+`bollinger_rsi_mean_reversion` 和 `paper_round_trip`。实时与回测共享同步、确定性的
+`Strategy::evaluate` 核心；
 自动执行仅限 paper，采用目标仓位语义，可配置空头和多腿，但当前策略订单只使用
 常规时段市价单；启用盘前盘后后改用最新 Bid/Ask 定价的限价单。
 
@@ -23,16 +24,16 @@ Web 各自通过 Catalog 注册策略，因此平台运行器不再按策略 `ki
 平台掌握，策略 crate 无法绕过这些边界。
 
 DuckDB 当前由进程内互斥保护的 `Storage` 统一访问，而不是下文概念图中的独立
-Storage Writer actor。数据库最新 schema 为 26：除账户、行情、策略、订单、成交、
+Storage Writer actor。数据库最新 schema 为 29：除账户、行情、策略、订单、成交、
 风控和绩效数据外，还包含 5 秒 Bar、订单剩余数量/最近成交价/`why_held`/
 market-cap price、`broker_order_events` 状态事件审计，以及支持正常/扩展和单日多
 区间的 IBKR 交易日历缓存。`strategy_runtime_states` 按策略保存带版本的 JSON
 运行状态、修订号和最后转换 Bar；状态与策略 evaluation 在同一事务提交。
 
-当前回测是多头、下一根 Bar 开盘撮合，佣金参数是每笔固定金额；它不会自动计算
-不同市场的阶梯佣金、最低收费、税费或平台费。实时绩效则使用 IBKR 实际
-`CommissionReport`。实时自动执行可绑定数据库费用模型，以每笔固定费、每股费、
-比例费、最低费、税费、点差、滑点和实际佣金 P90 建立成本门槛，并在佣金/毛利润
+当前回测是多头、下一根 Bar 开盘撮合。回测与实时成本门控共享数据库费用模型，统一
+计算每笔固定费、每股费、比例费、最低费、卖出税费、点差和滑点；已保存策略使用其
+绑定模型，临时回测显式引用 `cost_model_id`。实时绩效仍使用 IBKR 实际
+`CommissionReport`，实时门控还会与实际佣金 P90 取更保守值，并可在佣金/毛利润
 超限时自动停用。
 
 ## 1. 文档目的
@@ -478,7 +479,12 @@ pub struct EventEnvelope<T> {
 - `DatasetManifest`：已有覆盖范围、文件和统计信息；
 - `DataGap`：缺失、重复、非法或可疑时间段。
 
-下载必须幂等。以业务键去重；写入新文件前先落临时文件，校验后原子 rename，再提交 DuckDB 清单。进程崩溃后可以根据临时文件和清单恢复。
+下载必须幂等。以业务键去重；相同合约、bar size 和交易时段范围的重叠活动任务合并到
+最早任务，避免重复占用单 worker。队列对外提供持久化状态、有效运行状态、队列位置和
+前方任务数。写入新文件前先落临时文件，校验后原子 rename，再提交 DuckDB 清单。
+进程崩溃后可以根据临时文件和清单恢复。
+IBKR 历史响应的范围元数据使用交易所本地时间；端点落入夏令时重复小时的请求应在
+broker 层扩大窗口，并按原始 UTC 范围过滤 Bar，不能让元数据歧义中断任务 worker。
 
 质量检查至少包含：
 
@@ -747,18 +753,23 @@ pub trait Strategy: Send {
 
 回测引擎按 `(event_time, sequence)` 确定性排序数据，避免未来函数：
 
+- 启动前必须验证历史抓取的成功区间完整覆盖请求范围，不能因为存在任意重叠文件就
+  静默跳过缺失月份；该约束由后端强制执行，前端只负责提前展示；
+- 抓取成功区间来自持久化 backfill cursor，按 conid、timeframe 和是否包含扩展时段
+  隔离并合并；自然时间文件缺口只用于诊断，避免把夜间、周末和休市误判为行情缺失；
 - 策略在当前 bar final 后生成的订单，默认最早在下一 bar 撮合；
-- 明确配置成交模型、滑点、手续费和交易时段；
+- 使用数据库费用模型统一配置固定费、每股费、比例费、最低费、卖出税费、完整点差、
+  单边滑点和交易时段；
 - 限价/止损在 OHLC 内触发时采用保守且文档化的成交假设；
 - 公司行动和复权口径与输入数据绑定；
 - 随机行为使用记录 seed 的伪随机数生成器。
 
 回测结果保存：
 
-- 参数和代码版本；
+- 参数、费用模型快照和代码版本；
 - 数据文件 ID 或 dataset snapshot；
 - 订单、成交和每日权益；
-- 手续费、滑点、换手率、最大回撤等指标；
+- 佣金/税费、点差、滑点、总执行成本、换手率、最大回撤等指标；
 - 警告，例如缺失数据或无法确定的 bar 内成交顺序。
 
 ## 7.11 订单管理器
@@ -991,7 +1002,10 @@ quant shutdown
 
 1. 内置安全默认值；
 2. TOML 文件；
-3. `QUANT__SECTION__KEY` 格式环境变量；
+3. `QUANT__SECTION__KEY` 格式环境变量。当前实现只支持一组白名单键：
+   `QUANT__APP__DATA_DIR`、`QUANT__RPC__HTTP_LISTEN`、`QUANT__WEB__LISTEN`、
+   `QUANT__LOGGING__LEVEL`、`QUANT__RISK__TRADING_ENABLED`（覆盖交易开关会在
+   启动日志显式警告），并非任意配置键都可用环境变量覆盖；
 4. 明确的 CLI 启动参数。
 
 示例：

@@ -1,11 +1,11 @@
 use std::collections::HashMap;
-use std::{sync::Arc, time::Duration};
+use std::{panic::AssertUnwindSafe, sync::Arc, time::Duration};
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use ibapi::Client;
 use ibapi::{
-    accounts::{AccountSummaryResult, PositionUpdate},
+    accounts::{AccountMultiValue, AccountSummaryResult, AccountUpdateMulti, PositionUpdate},
     contracts::Contract,
     market_data::historical::{BarSize, BarTimestamp, Duration as HistoricalDuration},
     subscriptions::{SubscriptionItem, SubscriptionItemStreamExt},
@@ -78,6 +78,10 @@ enum Command {
         pattern: String,
         response: oneshot::Sender<CommandResult<Vec<ContractCandidate>>>,
     },
+    FxRateSnapshot {
+        quote_currency: String,
+        response: oneshot::Sender<CommandResult<Vec<FxRateSnapshot>>>,
+    },
     ContractSchedule {
         contract: ContractCandidate,
         response: oneshot::Sender<CommandResult<ContractSchedule>>,
@@ -149,6 +153,7 @@ pub enum BrokerEvent {
         side: String,
         quantity: f64,
         price: f64,
+        executed_at: DateTime<Utc>,
     },
     Commission {
         execution_id: String,
@@ -169,6 +174,13 @@ pub enum BrokerEvent {
         observed_at: DateTime<Utc>,
     },
     PositionSnapshotCompleted {
+        observed_at: DateTime<Utc>,
+    },
+    /// Confirms that the long-lived IBKR position subscription is still being
+    /// consumed. IBKR only sends position records when they change, so the
+    /// absence of updates after the initial snapshot must not make an
+    /// unchanged portfolio appear stale.
+    PositionSubscriptionHeartbeat {
         observed_at: DateTime<Utc>,
     },
     Pnl {
@@ -229,6 +241,18 @@ pub struct ContractCandidate {
     pub local_symbol: String,
     pub description: String,
     pub derivative_security_types: Vec<String>,
+}
+
+/// An IBKR account exchange rate, expressed as one unit of `base_currency`
+/// converted into the account's `quote_currency` (its configured base
+/// currency).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FxRateSnapshot {
+    pub account: String,
+    pub base_currency: String,
+    pub quote_currency: String,
+    pub rate: f64,
+    pub observed_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -383,6 +407,28 @@ impl Handle {
             .map_err(|_| "IBKR actor stopped before responding".to_string())?
     }
 
+    /// Fetches a fresh account-value snapshot from IBKR and extracts every
+    /// `ExchangeRate` whose quote currency is the configured account base
+    /// currency. This uses the account API rather than a market-data
+    /// subscription, so it does not consume an FX quote subscription or create
+    /// another competing market-data session.
+    pub async fn fx_rate_snapshot(
+        &self,
+        quote_currency: String,
+    ) -> CommandResult<Vec<FxRateSnapshot>> {
+        let (response, receiver) = oneshot::channel();
+        self.commands
+            .send(Command::FxRateSnapshot {
+                quote_currency,
+                response,
+            })
+            .await
+            .map_err(|_| "IBKR actor is not running".to_string())?;
+        receiver
+            .await
+            .map_err(|_| "IBKR actor stopped before responding".to_string())?
+    }
+
     pub async fn contract_schedule(
         &self,
         contract: ContractCandidate,
@@ -478,7 +524,11 @@ impl Handle {
     }
 }
 
-pub fn spawn(config: IbkrConfig, cancellation: CancellationToken) -> Handle {
+pub fn spawn(
+    config: IbkrConfig,
+    max_position_age_seconds: u64,
+    cancellation: CancellationToken,
+) -> Handle {
     let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
     let (event_sender, event_receiver) = mpsc::channel(1024);
     let events = std::sync::Arc::new(Mutex::new(Some(event_receiver)));
@@ -487,6 +537,7 @@ pub fn spawn(config: IbkrConfig, cancellation: CancellationToken) -> Handle {
         Actor {
             desired: config.connect_on_start,
             config,
+            position_heartbeat_interval: position_heartbeat_interval(max_position_age_seconds),
             commands: receiver,
             status: status_sender,
             cancellation,
@@ -509,6 +560,7 @@ pub fn spawn(config: IbkrConfig, cancellation: CancellationToken) -> Handle {
 
 struct Actor {
     config: IbkrConfig,
+    position_heartbeat_interval: Duration,
     commands: mpsc::Receiver<Command>,
     status: watch::Sender<ConnectionStatus>,
     cancellation: CancellationToken,
@@ -610,6 +662,43 @@ impl Actor {
                     Err(error) => Err(error),
                 };
                 let _ = response.send(result);
+            }
+            Command::FxRateSnapshot {
+                quote_currency,
+                response,
+            } => {
+                let client = self
+                    .client
+                    .as_ref()
+                    .filter(|client| client.is_connected())
+                    .cloned();
+                let accounts = self.config.account.clone().map_or_else(
+                    || self.status.borrow().managed_accounts.clone(),
+                    |account| vec![account],
+                );
+                let timeout = Duration::from_secs(self.config.request_timeout_seconds);
+                match client {
+                    Some(client) if !accounts.is_empty() => {
+                        tokio::spawn(async move {
+                            let result = fetch_fx_rate_snapshots(
+                                client,
+                                &accounts,
+                                &quote_currency,
+                                timeout,
+                            )
+                            .await;
+                            let _ = response.send(result);
+                        });
+                    }
+                    Some(_) => {
+                        let _ = response.send(Err(
+                            "IBKR returned no managed account for the FX-rate snapshot".into(),
+                        ));
+                    }
+                    None => {
+                        let _ = response.send(Err("IBKR is not ready".into()));
+                    }
+                }
             }
             Command::ContractSchedule { contract, response } => {
                 let result = match self.ready_client() {
@@ -731,19 +820,67 @@ impl Actor {
         &self,
         request: HistoricalBarsRequest,
     ) -> CommandResult<Vec<HistoricalBar>> {
+        let (broker_start, broker_end) = historical_broker_window(&request);
+        let first =
+            AssertUnwindSafe(self.fetch_historical_bars_once(&request, broker_start, broker_end))
+                .catch_unwind()
+                .await;
+        match first {
+            Ok(result) => result,
+            Err(_) => {
+                // rust-ibapi 3.3 decodes HistoricalDataEnd's local timestamps
+                // with OffsetResult::unwrap(). During a daylight-saving fall
+                // back, an endpoint inside the repeated hour panics even though
+                // every returned Bar carries an unambiguous epoch timestamp.
+                // Widening the broker request moves both metadata endpoints out
+                // of that repeated hour; results are still filtered to the
+                // original requested range below.
+                let retry_start = broker_start - chrono::Duration::hours(2);
+                let retry_end = broker_end + chrono::Duration::hours(2);
+                tracing::warn!(
+                    conid = request.contract.conid,
+                    retry_start = %retry_start,
+                    original_end = %request.end,
+                    retry_end = %retry_end,
+                    "IBKR historical response used an ambiguous DST endpoint; retrying with a widened broker window"
+                );
+                match AssertUnwindSafe(self.fetch_historical_bars_once(
+                    &request,
+                    retry_start,
+                    retry_end,
+                ))
+                .catch_unwind()
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(
+                        "IBKR historical decoder panicked on an ambiguous daylight-saving-time endpoint even after widening the request"
+                            .into(),
+                    ),
+                }
+            }
+        }
+    }
+
+    async fn fetch_historical_bars_once(
+        &self,
+        request: &HistoricalBarsRequest,
+        broker_start: DateTime<Utc>,
+        broker_end: DateTime<Utc>,
+    ) -> CommandResult<Vec<HistoricalBar>> {
         if request.end <= request.start {
             return Err("historical end must be after start".into());
         }
         let contract = candidate_contract(&request.contract);
         let client = self.ready_client()?;
-        let end = time::OffsetDateTime::from_unix_timestamp(request.end.timestamp())
+        let end = time::OffsetDateTime::from_unix_timestamp(broker_end.timestamp())
             .map_err(|error| error.to_string())?;
         let trading_hours = if request.outside_rth {
             ibapi::market_data::TradingHours::Extended
         } else {
             ibapi::market_data::TradingHours::Regular
         };
-        let duration = historical_duration(&request.timeframe, request.start, request.end)?;
+        let duration = historical_duration(&request.timeframe, broker_start, broker_end)?;
         let data = client
             .historical_data(&contract, parse_bar_size(&request.timeframe)?)
             .duration(duration)
@@ -866,30 +1003,44 @@ impl Actor {
             .borrow()
             .connection_session_id
             .ok_or_else(|| "IBKR connection has no active session id".to_string())?;
+        // Each subscription terminates when IBKR sends the corresponding End
+        // message, so the streams are drained to completion. A whole-phase
+        // timeout guards against a hung Gateway; it fails the snapshot rather
+        // than silently truncating it, because reconciliation treats the
+        // snapshot as authoritative and a truncated one could mark live
+        // orders as missing or stale orders as not open.
+        let timeout = Duration::from_secs(self.config.request_timeout_seconds);
         let mut open_stream = client
             .all_open_orders()
             .await
             .map_err(|error| error.to_string())?
             .filter_data();
         let mut open_orders = Vec::new();
-        while let Ok(Some(item)) =
-            tokio::time::timeout(Duration::from_millis(500), open_stream.next()).await
-        {
-            match item.map_err(|error| error.to_string())? {
-                ibapi::orders::Orders::OrderData(data) => {
-                    open_orders.push(order_snapshot(data, false));
-                }
-                ibapi::orders::Orders::OrderStatus(status) => {
-                    if let Some(order) = open_orders
-                        .iter_mut()
-                        .find(|order| order.broker_order_id == status.order_id)
-                    {
-                        order.status = status.status.to_string();
-                        order.perm_id = status.perm_id;
+        tokio::time::timeout(timeout, async {
+            while let Some(item) = open_stream.next().await {
+                match item.map_err(|error| error.to_string())? {
+                    ibapi::orders::Orders::OrderData(data) => {
+                        open_orders.push(order_snapshot(data, false));
+                    }
+                    ibapi::orders::Orders::OrderStatus(status) => {
+                        if let Some(order) = open_orders
+                            .iter_mut()
+                            .find(|order| order.broker_order_id == status.order_id)
+                        {
+                            order.status = status.status.to_string();
+                            order.perm_id = status.perm_id;
+                        }
                     }
                 }
             }
-        }
+            Ok::<(), String>(())
+        })
+        .await
+        .map_err(|_| {
+            "timed out collecting IBKR open orders; refusing a possibly truncated \
+             reconciliation snapshot"
+                .to_string()
+        })??;
 
         let mut completed_stream = client
             .completed_orders(false)
@@ -897,16 +1048,23 @@ impl Actor {
             .map_err(|error| error.to_string())?
             .filter_data();
         let mut completed_orders = Vec::new();
-        while let Ok(Some(item)) =
-            tokio::time::timeout(Duration::from_millis(500), completed_stream.next()).await
-        {
-            match item.map_err(|error| error.to_string())? {
-                ibapi::orders::Orders::OrderData(data) => {
-                    completed_orders.push(order_snapshot(data, true));
+        tokio::time::timeout(timeout, async {
+            while let Some(item) = completed_stream.next().await {
+                match item.map_err(|error| error.to_string())? {
+                    ibapi::orders::Orders::OrderData(data) => {
+                        completed_orders.push(order_snapshot(data, true));
+                    }
+                    ibapi::orders::Orders::OrderStatus(_) => {}
                 }
-                ibapi::orders::Orders::OrderStatus(_) => {}
             }
-        }
+            Ok::<(), String>(())
+        })
+        .await
+        .map_err(|_| {
+            "timed out collecting IBKR completed orders; refusing a possibly truncated \
+             reconciliation snapshot"
+                .to_string()
+        })??;
 
         let mut execution_stream = client
             .executions(ibapi::orders::ExecutionFilter::default())
@@ -914,12 +1072,19 @@ impl Actor {
             .map_err(|error| error.to_string())?
             .filter_data();
         let mut events = Vec::new();
-        while let Ok(Some(item)) =
-            tokio::time::timeout(Duration::from_millis(500), execution_stream.next()).await
-        {
-            let item = item.map_err(|error| error.to_string())?;
-            events.push(execution_event(item));
-        }
+        tokio::time::timeout(timeout, async {
+            while let Some(item) = execution_stream.next().await {
+                let item = item.map_err(|error| error.to_string())?;
+                events.push(execution_event(item));
+            }
+            Ok::<(), String>(())
+        })
+        .await
+        .map_err(|_| {
+            "timed out collecting IBKR executions; refusing a possibly truncated \
+             reconciliation snapshot"
+                .to_string()
+        })??;
         Ok(ReconciliationSnapshot {
             connection_session_id,
             open_orders,
@@ -1099,7 +1264,12 @@ impl Actor {
         let cancellation = self.cancellation.child_token();
         self.subscription_cancellation = Some(cancellation.clone());
 
-        spawn_position_subscription(client.clone(), self.events.clone(), cancellation.clone());
+        spawn_position_subscription(
+            client.clone(),
+            self.events.clone(),
+            cancellation.clone(),
+            self.position_heartbeat_interval,
+        );
         spawn_account_summary_subscription(
             client.clone(),
             self.events.clone(),
@@ -1136,6 +1306,7 @@ fn spawn_position_subscription(
     client: Arc<Client>,
     events: mpsc::Sender<BrokerEvent>,
     cancellation: CancellationToken,
+    heartbeat_interval: Duration,
 ) {
     tokio::spawn(async move {
         let mut subscription = match client.positions().await {
@@ -1154,9 +1325,22 @@ fn spawn_position_subscription(
         {
             return;
         }
+        let mut snapshot_complete = false;
+        let mut heartbeat = tokio::time::interval(heartbeat_interval);
+        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        // `interval` ticks immediately. Consume that tick so a heartbeat can
+        // never race ahead of the authoritative PositionEnd marker.
+        heartbeat.tick().await;
         loop {
             tokio::select! {
                 _ = cancellation.cancelled() => break,
+                _ = heartbeat.tick(), if snapshot_complete => {
+                    if events.send(BrokerEvent::PositionSubscriptionHeartbeat {
+                        observed_at: Utc::now(),
+                    }).await.is_err() {
+                        break;
+                    }
+                }
                 item = subscription.next() => match item {
                     Some(Ok(SubscriptionItem::Data(PositionUpdate::Position(position)))) => {
                         if events.send(BrokerEvent::Position {
@@ -1172,6 +1356,7 @@ fn spawn_position_subscription(
                         }).await.is_err() {
                             break;
                         }
+                        snapshot_complete = true;
                     }
                     Some(Ok(SubscriptionItem::Notice(notice))) => {
                         tracing::warn!(?notice, "IBKR position subscription notice");
@@ -1185,6 +1370,186 @@ fn spawn_position_subscription(
             }
         }
     });
+}
+
+fn position_heartbeat_interval(max_position_age_seconds: u64) -> Duration {
+    // Refresh well inside the configured risk deadline. The upper bound keeps
+    // stale-position protection responsive even when operators allow a large
+    // account-data age, while the lower bound avoids a zero-duration timer.
+    Duration::from_secs((max_position_age_seconds / 3).clamp(1, 30))
+}
+
+async fn fetch_fx_rate_snapshots(
+    client: Arc<Client>,
+    accounts: &[String],
+    quote_currency: &str,
+    timeout: Duration,
+) -> CommandResult<Vec<FxRateSnapshot>> {
+    let quote_currency = quote_currency.trim().to_ascii_uppercase();
+    if quote_currency.len() != 3 {
+        return Err("FX quote currency must be a three-letter code".into());
+    }
+
+    let mut merged = HashMap::<(String, String), FxRateSnapshot>::new();
+    let mut failures = Vec::new();
+    let mut valid_accounts = 0_usize;
+    for account in accounts {
+        match fetch_account_fx_rate_snapshots(client.clone(), account, &quote_currency, timeout)
+            .await
+        {
+            Ok(snapshots) => {
+                valid_accounts += 1;
+                for snapshot in snapshots {
+                    let key = (
+                        snapshot.base_currency.clone(),
+                        snapshot.quote_currency.clone(),
+                    );
+                    if let Some(previous) = merged.get(&key)
+                        && (previous.rate - snapshot.rate).abs()
+                            > previous.rate.abs().max(snapshot.rate.abs()) * 1e-6
+                    {
+                        tracing::warn!(
+                            base_currency = %snapshot.base_currency,
+                            quote_currency = %snapshot.quote_currency,
+                            previous_account = %previous.account,
+                            previous_rate = previous.rate,
+                            account = %snapshot.account,
+                            rate = snapshot.rate,
+                            "IBKR managed accounts returned different FX rates; using the latest snapshot"
+                        );
+                    }
+                    merged.insert(key, snapshot);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%account, %error, "failed to fetch IBKR account FX rates");
+                failures.push(format!("{account}: {error}"));
+            }
+        }
+    }
+    if valid_accounts == 0 {
+        return Err(format!(
+            "IBKR FX-rate snapshot failed for every managed account: {}",
+            failures.join("; ")
+        ));
+    }
+    let mut snapshots = merged.into_values().collect::<Vec<_>>();
+    snapshots.sort_by(|left, right| {
+        left.base_currency
+            .cmp(&right.base_currency)
+            .then_with(|| left.quote_currency.cmp(&right.quote_currency))
+    });
+    Ok(snapshots)
+}
+
+async fn fetch_account_fx_rate_snapshots(
+    client: Arc<Client>,
+    account: &str,
+    quote_currency: &str,
+    timeout: Duration,
+) -> CommandResult<Vec<FxRateSnapshot>> {
+    let account_id = ibapi::accounts::types::AccountId(account.to_owned());
+    let mut subscription = client
+        .account_updates_multi(Some(&account_id), None)
+        .await
+        .map_err(|error| error.to_string())?;
+    let collection = tokio::time::timeout(timeout, async {
+        let mut values = Vec::new();
+        loop {
+            match subscription.next().await {
+                Some(Ok(SubscriptionItem::Data(AccountUpdateMulti::AccountMultiValue(value)))) => {
+                    values.push(value)
+                }
+                Some(Ok(SubscriptionItem::Data(AccountUpdateMulti::End))) => {
+                    return Ok(values);
+                }
+                Some(Ok(SubscriptionItem::Notice(notice))) => {
+                    tracing::warn!(?notice, %account, "IBKR account-updates snapshot notice");
+                }
+                Some(Err(error)) => return Err(error.to_string()),
+                None => {
+                    return Err(
+                        "IBKR closed the account-updates stream before its end marker".into(),
+                    );
+                }
+            }
+        }
+    })
+    .await;
+    subscription.cancel().await;
+    let values = collection.map_err(|_| {
+        format!(
+            "IBKR account-updates snapshot timed out after {} seconds",
+            timeout.as_secs()
+        )
+    })??;
+    account_fx_rate_snapshots(account, quote_currency, values, Utc::now())
+}
+
+fn account_fx_rate_snapshots(
+    account: &str,
+    quote_currency: &str,
+    values: Vec<AccountMultiValue>,
+    observed_at: DateTime<Utc>,
+) -> CommandResult<Vec<FxRateSnapshot>> {
+    let quote_currency = quote_currency.trim().to_ascii_uppercase();
+    let mut rates = HashMap::<String, f64>::new();
+    let mut account_ready = true;
+    for value in values {
+        if value
+            .key
+            .trim()
+            .split('-')
+            .next()
+            .is_some_and(|key| key.eq_ignore_ascii_case("AccountReady"))
+            && value.value.trim().eq_ignore_ascii_case("false")
+        {
+            account_ready = false;
+        }
+        if !value.key.trim().ends_with("ExchangeRate") {
+            continue;
+        }
+        let currency = value.currency.trim().to_ascii_uppercase();
+        let Ok(rate) = value.value.trim().parse::<f64>() else {
+            continue;
+        };
+        if currency.len() == 3 && rate.is_finite() && rate > 0.0 {
+            rates.insert(currency, rate);
+        }
+    }
+
+    if !account_ready {
+        return Err(format!(
+            "IBKR reports account {account} is not ready; refusing possibly stale FX rates"
+        ));
+    }
+
+    let Some(account_base_rate) = rates.get(&quote_currency).copied() else {
+        return Err(format!(
+            "IBKR account updates did not identify {quote_currency} as the account base currency; \
+             risk.base_currency must match the IBKR account base currency"
+        ));
+    };
+    if (account_base_rate - 1.0).abs() > 1e-6 {
+        return Err(format!(
+            "IBKR reports {quote_currency} ExchangeRate={account_base_rate}, not 1; \
+             risk.base_currency must match the IBKR account base currency"
+        ));
+    }
+
+    let mut snapshots = rates
+        .into_iter()
+        .filter(|(currency, _)| currency != &quote_currency)
+        .map(|(base_currency, rate)| FxRateSnapshot {
+            account: account.to_owned(),
+            base_currency,
+            quote_currency: quote_currency.clone(),
+            rate,
+            observed_at,
+        })
+        .collect::<Vec<_>>();
+    snapshots.sort_by(|left, right| left.base_currency.cmp(&right.base_currency));
+    Ok(snapshots)
 }
 
 fn spawn_account_summary_subscription(
@@ -1604,6 +1969,28 @@ fn ibkr_timezone(value: &str) -> CommandResult<chrono_tz::Tz> {
         .map_err(|_| format!("unsupported IBKR contract timezone: {value}"))
 }
 
+pub(crate) fn parse_ibkr_execution_datetime(value: &str) -> CommandResult<DateTime<Utc>> {
+    let value = value.trim();
+    let (datetime, timezone) = value
+        .rsplit_once(' ')
+        .ok_or_else(|| format!("invalid IBKR execution time: {value}"))?;
+    let naive = NaiveDateTime::parse_from_str(datetime.trim(), "%Y%m%d %H:%M:%S")
+        .map_err(|error| format!("invalid IBKR execution time {value}: {error}"))?;
+    let timezone = ibkr_timezone(timezone)?;
+    timezone
+        .from_local_datetime(&naive)
+        .earliest()
+        .map(|time| time.with_timezone(&Utc))
+        .ok_or_else(|| format!("IBKR execution time {value} does not exist"))
+}
+
+fn execution_datetime_or_now(value: &str) -> DateTime<Utc> {
+    parse_ibkr_execution_datetime(value).unwrap_or_else(|error| {
+        tracing::warn!(%error, raw_time = value, "using receipt time for malformed IBKR execution time");
+        Utc::now()
+    })
+}
+
 fn normalize_search_candidate(candidate: &mut ContractCandidate) {
     candidate.normalize_streaming_subscription();
 }
@@ -1645,6 +2032,38 @@ fn parse_bar_size(value: &str) -> CommandResult<BarSize> {
         "1d" => Ok(BarSize::Day),
         _ => Err("unsupported timeframe; use 5s, 1m, 5m, 15m, 30m, 1h, or 1d".into()),
     }
+}
+
+fn historical_broker_window(request: &HistoricalBarsRequest) -> (DateTime<Utc>, DateTime<Utc>) {
+    if historical_endpoint_is_dst_ambiguous(request.start)
+        || historical_endpoint_is_dst_ambiguous(request.end)
+    {
+        (
+            request.start - chrono::Duration::hours(2),
+            request.end + chrono::Duration::hours(2),
+        )
+    } else {
+        (request.start, request.end)
+    }
+}
+
+fn historical_endpoint_is_dst_ambiguous(timestamp: DateTime<Utc>) -> bool {
+    [
+        chrono_tz::America::New_York,
+        chrono_tz::America::Chicago,
+        chrono_tz::America::Toronto,
+        chrono_tz::Europe::London,
+        chrono_tz::Europe::Paris,
+        chrono_tz::Australia::Sydney,
+    ]
+    .into_iter()
+    .any(|timezone| {
+        let local = timestamp.with_timezone(&timezone).naive_local();
+        matches!(
+            timezone.from_local_datetime(&local),
+            chrono::LocalResult::Ambiguous(_, _)
+        )
+    })
 }
 
 fn historical_duration(
@@ -1707,6 +2126,7 @@ async fn send_place_order_event(
             side: format!("{:?}", data.execution.side),
             quantity: data.execution.shares,
             price: data.execution.price,
+            executed_at: execution_datetime_or_now(&data.execution.time),
         },
         ibapi::orders::PlaceOrder::CommissionReport(report) => BrokerEvent::Commission {
             execution_id: report.execution_id,
@@ -1740,6 +2160,7 @@ fn execution_event(event: ibapi::orders::Executions) -> BrokerEvent {
             side: format!("{:?}", data.execution.side),
             quantity: data.execution.shares,
             price: data.execution.price,
+            executed_at: execution_datetime_or_now(&data.execution.time),
         },
         ibapi::orders::Executions::CommissionReport(report) => BrokerEvent::Commission {
             execution_id: report.execution_id,
@@ -1801,6 +2222,41 @@ mod tests {
     }
 
     #[test]
+    fn historical_requests_avoid_ambiguous_dst_metadata_endpoints() {
+        let start = DateTime::parse_from_rfc3339("2025-11-02T05:51:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let request = HistoricalBarsRequest {
+            contract: ContractCandidate {
+                conid: 272093,
+                symbol: "MSFT".into(),
+                security_type: "STK".into(),
+                currency: "USD".into(),
+                exchange: "NASDAQ".into(),
+                primary_exchange: "NASDAQ".into(),
+                local_symbol: "MSFT".into(),
+                description: String::new(),
+                derivative_security_types: Vec::new(),
+            },
+            timeframe: "5s".into(),
+            start,
+            end: start + chrono::Duration::hours(1),
+            outside_rth: false,
+        };
+        let (broker_start, broker_end) = historical_broker_window(&request);
+        assert_eq!(broker_start, request.start - chrono::Duration::hours(2));
+        assert_eq!(broker_end, request.end + chrono::Duration::hours(2));
+
+        let mut ordinary = request;
+        ordinary.start += chrono::Duration::days(1);
+        ordinary.end += chrono::Duration::days(1);
+        assert_eq!(
+            historical_broker_window(&ordinary),
+            (ordinary.start, ordinary.end)
+        );
+    }
+
+    #[test]
     fn stock_search_candidate_gets_safe_smart_defaults() {
         let mut candidate = ContractCandidate {
             conid: 123,
@@ -1837,6 +2293,109 @@ mod tests {
             candidate.validate_streaming_subscription().unwrap_err(),
             "market-data contract requires an exchange; use SMART for STK routing"
         );
+    }
+
+    #[test]
+    fn account_exchange_rates_are_converted_to_configured_base_currency_pairs() {
+        let observed_at = Utc::now();
+        let rates = account_fx_rate_snapshots(
+            "DU123",
+            "hkd",
+            vec![
+                AccountMultiValue {
+                    account: "DU123".into(),
+                    key: "ExchangeRate".into(),
+                    value: "1".into(),
+                    currency: "HKD".into(),
+                    ..Default::default()
+                },
+                AccountMultiValue {
+                    account: "DU123".into(),
+                    key: "ExchangeRate".into(),
+                    value: "7.8125".into(),
+                    currency: "USD".into(),
+                    ..Default::default()
+                },
+                AccountMultiValue {
+                    account: "DU123".into(),
+                    key: "CashBalance".into(),
+                    value: "1000".into(),
+                    currency: "USD".into(),
+                    ..Default::default()
+                },
+            ],
+            observed_at,
+        )
+        .unwrap();
+
+        assert_eq!(rates.len(), 1);
+        assert_eq!(rates[0].base_currency, "USD");
+        assert_eq!(rates[0].quote_currency, "HKD");
+        assert_eq!(rates[0].rate, 7.8125);
+        assert_eq!(rates[0].observed_at, observed_at);
+    }
+
+    #[test]
+    fn account_exchange_rates_reject_a_mismatched_configured_base_currency() {
+        let error = account_fx_rate_snapshots(
+            "DU123",
+            "HKD",
+            vec![
+                AccountMultiValue {
+                    account: "DU123".into(),
+                    key: "ExchangeRate".into(),
+                    value: "1".into(),
+                    currency: "USD".into(),
+                    ..Default::default()
+                },
+                AccountMultiValue {
+                    account: "DU123".into(),
+                    key: "ExchangeRate".into(),
+                    value: "0.128".into(),
+                    currency: "HKD".into(),
+                    ..Default::default()
+                },
+            ],
+            Utc::now(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("risk.base_currency must match"));
+    }
+
+    #[test]
+    fn account_exchange_rates_fail_closed_while_ibkr_account_is_not_ready() {
+        let error = account_fx_rate_snapshots(
+            "DU123",
+            "HKD",
+            vec![
+                AccountMultiValue {
+                    account: "DU123".into(),
+                    key: "AccountReady".into(),
+                    value: "false".into(),
+                    currency: String::new(),
+                    ..Default::default()
+                },
+                AccountMultiValue {
+                    account: "DU123".into(),
+                    key: "ExchangeRate".into(),
+                    value: "1".into(),
+                    currency: "HKD".into(),
+                    ..Default::default()
+                },
+                AccountMultiValue {
+                    account: "DU123".into(),
+                    key: "ExchangeRate".into(),
+                    value: "7.8".into(),
+                    currency: "USD".into(),
+                    ..Default::default()
+                },
+            ],
+            Utc::now(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("not ready"));
     }
 
     #[test]
@@ -1879,6 +2438,14 @@ mod tests {
     }
 
     #[test]
+    fn ibkr_execution_time_is_converted_from_exchange_timezone() {
+        assert_eq!(
+            parse_ibkr_execution_datetime("20260731 12:34:01 US/Eastern").unwrap(),
+            "2026-07-31T16:34:01Z".parse::<DateTime<Utc>>().unwrap()
+        );
+    }
+
+    #[test]
     fn deferred_until_open_warning_has_an_uncertain_order_outcome() {
         assert!(order_error_may_leave_order_active(
             "[399] Order Message: BUY 10 MSFT Warning: your order will not be placed at the \
@@ -1889,10 +2456,18 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn position_heartbeat_runs_well_inside_the_risk_freshness_deadline() {
+        assert_eq!(position_heartbeat_interval(1), Duration::from_secs(1));
+        assert_eq!(position_heartbeat_interval(15), Duration::from_secs(5));
+        assert_eq!(position_heartbeat_interval(120), Duration::from_secs(30));
+        assert_eq!(position_heartbeat_interval(3_600), Duration::from_secs(30));
+    }
+
     #[tokio::test]
     async fn actor_stays_disconnected_until_requested() {
         let cancellation = CancellationToken::new();
-        let handle = spawn(IbkrConfig::default(), cancellation.clone());
+        let handle = spawn(IbkrConfig::default(), 120, cancellation.clone());
         tokio::task::yield_now().await;
         assert_eq!(handle.status().state, ConnectionState::Disconnected);
         assert!(!handle.status().desired);

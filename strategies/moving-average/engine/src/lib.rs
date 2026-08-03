@@ -197,6 +197,13 @@ impl MovingAverageCrossV2 {
         });
         let filters_pass = gap_percent >= self.config.min_gap_percent
             && atr_percent >= self.config.min_atr_percent;
+        let raw_direction = if short > long {
+            1
+        } else if short < long {
+            -1
+        } else {
+            0
+        };
         let direction = if filters_pass
             && short > long
             && trend_average.is_none_or(|trend| close >= trend)
@@ -214,6 +221,7 @@ impl MovingAverageCrossV2 {
             atr,
             atr_percent,
             trend_average,
+            raw_direction,
             direction,
         }
     }
@@ -226,6 +234,7 @@ struct V2Indicators {
     atr: f64,
     atr_percent: f64,
     trend_average: Option<f64>,
+    raw_direction: i8,
     direction: i8,
 }
 
@@ -259,22 +268,21 @@ impl Strategy for MovingAverageCrossV2 {
             ));
         }
         let bars = &bars[bars.len() - self.minimum_history()..];
-        let mut streak_direction = 0;
-        let mut streak = 0usize;
         let mut previous_emission = None;
         let mut current_emission = None;
-        for end in self.base_history()..=bars.len() {
-            let direction = self.indicators(bars, end).direction;
+        let first_end = self.base_history() + self.config.confirmation_bars;
+        for end in first_end..=bars.len() {
+            let direction = self.indicators(bars, end).raw_direction;
             if direction == 0 {
-                streak_direction = 0;
-                streak = 0;
-            } else if direction == streak_direction {
-                streak += 1;
-            } else {
-                streak_direction = direction;
-                streak = 1;
+                continue;
             }
-            if streak == self.config.confirmation_bars {
+            let before_confirmation = end - self.config.confirmation_bars;
+            let crossed = self.indicators(bars, before_confirmation).raw_direction == -direction;
+            let confirmed = crossed
+                && (before_confirmation + 1..=end).all(|candidate_end| {
+                    self.indicators(bars, candidate_end).direction == direction
+                });
+            if confirmed {
                 if end == bars.len() {
                     current_emission = Some(direction);
                 } else {
@@ -514,6 +522,29 @@ mod tests {
             .unwrap();
         assert_eq!(output.signal, StrategySignal::Hold);
         assert_eq!(output.details["signal_reason"], "cooldown");
+    }
+
+    #[test]
+    fn v2_does_not_treat_filter_requalification_as_a_new_cross() {
+        let strategy = build_v2(json!({
+            "conid": 1,
+            "short_window": 2,
+            "long_window": 3,
+            "average_type": "sma",
+            "min_gap_percent": 10.0,
+            "confirmation_bars": 1,
+            "cooldown_bars": 0,
+            "atr_window": 1
+        }))
+        .unwrap();
+        let output = strategy
+            .evaluate(&bars(&[3.0, 2.0, 1.0, 4.0, 8.0]))
+            .unwrap();
+        assert_eq!(output.signal, StrategySignal::Hold);
+        assert_eq!(
+            output.details["signal_reason"],
+            "waiting_for_confirmation_or_new_cross"
+        );
     }
 
     #[test]

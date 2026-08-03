@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bollinger-rsi-engine = { path = "../../strategies/bollinger-rsi/engine" }
+bollinger-rsi-model = { path = "../../strategies/bollinger-rsi/model" }
 close-threshold-engine = { path = "../../strategies/close-threshold/engine" }
 close-threshold-model = { path = "../../strategies/close-threshold/model" }
 moving-average-engine = { path = "../../strategies/moving-average/engine" }

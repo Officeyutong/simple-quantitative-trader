@@ -92,6 +92,7 @@ pub struct IbkrConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct RiskConfig {
     pub base_currency: String,
+    pub fx_rate_refresh_seconds: u64,
     pub max_fx_rate_age_seconds: u64,
     pub trading_enabled: bool,
     pub max_order_notional: f64,
@@ -202,6 +203,7 @@ impl Default for RiskConfig {
     fn default() -> Self {
         Self {
             base_currency: "USD".into(),
+            fx_rate_refresh_seconds: 300,
             max_fx_rate_age_seconds: 3_600,
             trading_enabled: false,
             max_order_notional: 10_000.0,
@@ -375,6 +377,7 @@ impl Config {
             ));
         }
         if self.risk.base_currency.trim().len() != 3
+            || self.risk.fx_rate_refresh_seconds == 0
             || self.risk.max_fx_rate_age_seconds == 0
             || self.monitoring.interval_seconds == 0
             || self.monitoring.performance_snapshot_seconds == 0
@@ -383,6 +386,12 @@ impl Config {
         {
             return Err(AppError::Config(
                 "risk.base_currency must be a three-letter code and monitoring/FX intervals must be greater than zero".into(),
+            ));
+        }
+        if self.risk.fx_rate_refresh_seconds >= self.risk.max_fx_rate_age_seconds {
+            return Err(AppError::Config(
+                "risk.fx_rate_refresh_seconds must be less than risk.max_fx_rate_age_seconds"
+                    .into(),
             ));
         }
         if self.risk.max_order_notional <= 0.0 || self.risk.max_order_quantity <= 0.0 {
@@ -461,5 +470,21 @@ mod tests {
 
         config.rpc.allowed_web_origin = "https://*.example.com".into();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn fx_refresh_interval_must_be_positive_and_precede_expiry() {
+        let mut config = Config::default();
+        assert_eq!(config.risk.fx_rate_refresh_seconds, 300);
+        assert!(config.validate().is_ok());
+
+        config.risk.fx_rate_refresh_seconds = 0;
+        assert!(config.validate().is_err());
+
+        config.risk.fx_rate_refresh_seconds = config.risk.max_fx_rate_age_seconds;
+        assert!(config.validate().is_err());
+
+        config.risk.fx_rate_refresh_seconds = config.risk.max_fx_rate_age_seconds - 1;
+        assert!(config.validate().is_ok());
     }
 }

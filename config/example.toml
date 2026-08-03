@@ -37,6 +37,7 @@ readonly = false
 
 [risk]
 base_currency = "HKD"
+fx_rate_refresh_seconds = 300
 max_fx_rate_age_seconds = 3600
 trading_enabled = true
 max_order_notional = 10000.0

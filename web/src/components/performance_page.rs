@@ -216,6 +216,11 @@ fn performance_content(data: &PerformanceData) -> Html {
     let report = &data.report;
     let snapshots = array(&data.snapshots, "snapshots");
     let currency = text(report, "base_currency");
+    let warnings = report
+        .get("data_warnings")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let cards = [
         ("净收益", money(report, "net_pnl", &currency)),
         ("收益率", percent(report, "return")),
@@ -226,6 +231,16 @@ fn performance_content(data: &PerformanceData) -> Html {
     ];
     html! {
         <>
+            if !warnings.is_empty() || report.get("data_complete").and_then(Value::as_bool) == Some(false) {
+                <div class="alert alert-warning" role="alert">
+                    <div class="fw-semibold mb-1">{"绩效数据不完整，以下结果已排除无法可靠配对的成交数量"}</div>
+                    <ul class="mb-0">
+                        {warnings.iter().map(|warning| html! {
+                            <li>{warning.as_str().unwrap_or("检测到无法配对的成交")}</li>
+                        }).collect::<Html>()}
+                    </ul>
+                </div>
+            }
             <div class="row g-3 mb-4">
                 {cards.into_iter().map(|(label, value)| html! {
                     <div class="col-12 col-sm-6 col-xl-2">
@@ -244,7 +259,7 @@ fn performance_content(data: &PerformanceData) -> Html {
                         <tbody>
                             <tr><td>{"初始资金"}</td><td>{money(report, "initial_capital", &currency)}</td><td>{"总收益"}</td><td>{money(report, "gross_pnl", &currency)}</td></tr>
                             <tr><td>{"佣金"}</td><td>{money(report, "commissions", &currency)}</td><td>{"换手金额"}</td><td>{money(report, "turnover", &currency)}</td></tr>
-                            <tr><td>{"已实现交易"}</td><td>{integer(report, "realized_trade_count")}</td><td>{"未平仓证券数"}</td><td>{integer(report, "open_position_count")}</td></tr>
+                            <tr><td>{"完整往返交易"}</td><td>{integer(report, "realized_trade_count")}</td><td>{"未平仓证券数"}</td><td>{integer(report, "open_position_count")}</td></tr>
                             <tr><td>{"盈利交易"}</td><td>{integer(report, "winning_trade_count")}</td><td>{"亏损交易"}</td><td>{integer(report, "losing_trade_count")}</td></tr>
                             <tr><td>{"生成时间（本地）"}</td><td>{local_time(report, "generated_at")}</td><td>{"基础币种"}</td><td>{currency.clone()}</td></tr>
                         </tbody>

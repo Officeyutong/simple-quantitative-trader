@@ -301,9 +301,12 @@ fn parameter_template(method: &str) -> Value {
             "strategy_kind": "paper_round_trip",
             "strategy_config": {"conid": 0, "phase_bars": 1},
             "quantity": 1.0, "initial_cash": 100000.0,
-            "slippage_bps": 0.0, "commission_per_order": 0.0, "seed": 0
+            "cost_model_id": "00000000-0000-0000-0000-000000000000", "seed": 0
         }),
-        "backtest.get" => json!({"backtest_id": ""}),
+        "backtest.get" => json!({
+            "backtest_id": "", "trade_page": 1,
+            "trade_page_size": 200, "max_equity_points": 2000
+        }),
         "safety.set" => json!({"mode": "normal", "note": ""}),
         "safety.live_approve" => {
             json!({"conids": [], "note": "", "confirm_live_risk": false})

@@ -125,6 +125,12 @@ pub fn execution_cost_page(props: &ExecutionCostPageProps) -> Html {
         .find(|strategy| text(strategy, "strategy_id") == *strategy_id)
         .map(|strategy| text(strategy, "currency"))
         .unwrap_or_default();
+    let selected_strategy_state = strategies
+        .iter()
+        .find(|strategy| text(strategy, "strategy_id") == *strategy_id)
+        .map(|strategy| text(strategy, "state"))
+        .unwrap_or_default();
+    let strategy_is_running = selected_strategy_state == "running";
     let selected_model_currency = models
         .iter()
         .find(|model| text(model, "cost_model_id") == *control_model_id)
@@ -306,7 +312,7 @@ pub fn execution_cost_page(props: &ExecutionCostPageProps) -> Html {
                     />
                     <TextField
                         label="最大佣金/毛利润"
-                        help="累计佣金相对于累计毛利润的允许上限。0.5 表示 50%；达到最少交易数后若实际比例超过此值，系统会自动暂停策略执行。"
+                        help="累计佣金相对于正毛利润的允许上限。0.5 表示 50%；达到最少交易数且毛利润为正时，若实际比例超过此值，系统会自动暂停策略执行。毛利润为零或负数时不使用该比例熔断。"
                         value={ratio.clone()}
                     />
                     <TextField
@@ -330,8 +336,19 @@ pub fn execution_cost_page(props: &ExecutionCostPageProps) -> Html {
                             </div>
                         }).unwrap_or_default()
                     }
+                    {
+                        strategy_is_running.then(|| html! {
+                            <div class="col-12">
+                                <div class="alert alert-warning mb-0" role="alert">
+                                    <strong>{"当前无法保存："}</strong>
+                                    {"所选策略正在运行。请先到“策略”页面点击“暂停信号”，保存成本控制后再重新启动策略。"}
+                                </div>
+                            </div>
+                        }).unwrap_or_default()
+                    }
                     <div class="col-12"><button class="btn btn-primary"
-                        disabled={*busy || strategy_id.is_empty() || control_model_id.is_empty() || currency_mismatch}>
+                        title={strategy_is_running.then_some("策略运行期间不能修改成本控制，请先暂停策略")}
+                        disabled={*busy || strategy_id.is_empty() || control_model_id.is_empty() || currency_mismatch || strategy_is_running}>
                         {"保存策略控制"}
                     </button></div>
                 </div></form>

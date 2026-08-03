@@ -274,7 +274,7 @@ pub fn strategies_page(props: &StrategiesPageProps) -> Html {
                                             <td class="text-end">{number(row, "estimated_round_trip_cost")}</td>
                                             <td>{cost_gate_result(row)}</td>
                                             <td>{integer(row, "broker_order_id")}</td>
-                                            <td>{text(row, "detail")}</td>
+                                            <td>{action_detail(row)}</td>
                                         </tr>
                                     }
                                 }).collect::<Html>()
@@ -351,7 +351,7 @@ fn cost_gate_result(action: &Value) -> Html {
         "auto_paused" => (
             "自动暂停",
             "bg-warning text-dark",
-            "历史佣金与毛利润比例超过配置上限",
+            "达到最少交易数后，历史佣金相对正毛利润的比例超过配置上限",
         ),
         "execution_disabled" => (
             "执行关闭",
@@ -367,6 +367,17 @@ fn cost_gate_result(action: &Value) -> Html {
                 <div class="small text-secondary mt-1"><code>{result}</code></div>
             }).unwrap_or_default()}
         </div>
+    }
+}
+
+fn action_detail(action: &Value) -> String {
+    let detail = text(action, "detail");
+    if detail.contains("commission/gross-profit ratio inf") {
+        "自动执行已暂停：达到最少交易数后，策略毛利润仍不为正且已经产生佣金，\
+         因此佣金/毛利润比例视为无穷大。"
+            .into()
+    } else {
+        detail
     }
 }
 
