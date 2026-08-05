@@ -41,6 +41,7 @@ pub fn moving_average_wizard_page(props: &MovingAverageWizardPageProps) -> Html 
     let average_type = use_state(|| "ema".to_owned());
     let min_gap_percent = use_state(|| "0.05".to_owned());
     let confirmation_bars = use_state(|| "2".to_owned());
+    let confirmation_window_bars = use_state(|| "12".to_owned());
     let cooldown_bars = use_state(|| "3".to_owned());
     let atr_window = use_state(|| "14".to_owned());
     let min_atr_percent = use_state(|| "0".to_owned());
@@ -133,6 +134,7 @@ pub fn moving_average_wizard_page(props: &MovingAverageWizardPageProps) -> Html 
         let average_type = average_type.clone();
         let min_gap_percent = min_gap_percent.clone();
         let confirmation_bars = confirmation_bars.clone();
+        let confirmation_window_bars = confirmation_window_bars.clone();
         let cooldown_bars = cooldown_bars.clone();
         let atr_window = atr_window.clone();
         let min_atr_percent = min_atr_percent.clone();
@@ -204,13 +206,21 @@ pub fn moving_average_wizard_page(props: &MovingAverageWizardPageProps) -> Html 
                 let advanced = (
                     parse_percentage(&min_gap_percent, "最小均线差"),
                     parse_count(&confirmation_bars, "确认 Bar 数", 1, 1_000),
+                    parse_count(&confirmation_window_bars, "交叉确认窗口", 1, 10_000),
                     parse_count(&cooldown_bars, "冷却 Bar 数", 0, 10_000),
                     parse_count(&atr_window, "ATR 窗口", 1, 10_000),
                     parse_percentage(&min_atr_percent, "最小 ATR"),
                     parse_count(&trend_window, "趋势窗口", 0, 10_000),
                 );
-                let (Ok(gap), Ok(confirm), Ok(cooldown), Ok(atr), Ok(min_atr), Ok(trend)) =
-                    advanced
+                let (
+                    Ok(gap),
+                    Ok(confirm),
+                    Ok(confirm_window),
+                    Ok(cooldown),
+                    Ok(atr),
+                    Ok(min_atr),
+                    Ok(trend),
+                ) = advanced
                 else {
                     let error = [
                         advanced.0.err(),
@@ -219,6 +229,7 @@ pub fn moving_average_wizard_page(props: &MovingAverageWizardPageProps) -> Html 
                         advanced.3.err(),
                         advanced.4.err(),
                         advanced.5.err(),
+                        advanced.6.err(),
                     ]
                     .into_iter()
                     .flatten()
@@ -227,6 +238,10 @@ pub fn moving_average_wizard_page(props: &MovingAverageWizardPageProps) -> Html 
                     notice.set(Some(Err(error)));
                     return;
                 };
+                if confirm_window < confirm {
+                    notice.set(Some(Err("交叉确认窗口不能小于连续确认 Bar 数".into())));
+                    return;
+                }
                 config = json!({
                     "conid": conid,
                     "short_window": short,
@@ -235,6 +250,7 @@ pub fn moving_average_wizard_page(props: &MovingAverageWizardPageProps) -> Html 
                     "average_type": &*average_type,
                     "min_gap_percent": gap,
                     "confirmation_bars": confirm,
+                    "confirmation_window_bars": confirm_window,
                     "cooldown_bars": cooldown,
                     "atr_window": atr,
                     "min_atr_percent": min_atr,
@@ -528,6 +544,12 @@ pub fn moving_average_wizard_page(props: &MovingAverageWizardPageProps) -> Html 
                                         value={(*confirmation_bars).clone()} oninput={state_input(confirmation_bars.clone())} />
                                 </div>
                                 <div class="col-6 col-lg-2">
+                                    <label class="form-label">{"交叉确认窗口"}</label>
+                                    <input class="form-control" type="number" min="1" max="10000"
+                                        value={(*confirmation_window_bars).clone()} oninput={state_input(confirmation_window_bars.clone())} />
+                                    <div class="form-text">{"交叉后最多等待多少根 Bar 让过滤条件达标"}</div>
+                                </div>
+                                <div class="col-6 col-lg-2">
                                     <label class="form-label">{"冷却 Bar 数"}</label>
                                     <input class="form-control" type="number" min="0" max="10000"
                                         value={(*cooldown_bars).clone()} oninput={state_input(cooldown_bars.clone())} />
@@ -549,7 +571,7 @@ pub fn moving_average_wizard_page(props: &MovingAverageWizardPageProps) -> Html 
                                 </div>
                                 <div class="col-12">
                                     <div class="form-text">
-                                        {"V2 只有在均线差、ATR、趋势和连续确认条件全部满足时才产生信号；冷却期可阻止短时间内反向交易。"}
+                                        {"V2 在交叉确认窗口内等待均线差、ATR 和趋势条件达标，再要求连续确认；反向交叉、窗口超时或冷却期会阻止信号。"}
                                     </div>
                                 </div>
                             </>

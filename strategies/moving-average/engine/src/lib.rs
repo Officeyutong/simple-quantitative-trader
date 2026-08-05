@@ -142,6 +142,8 @@ impl MovingAverageCrossV2 {
             || !(0.0..=100.0).contains(&config.min_gap_percent)
             || config.confirmation_bars == 0
             || config.confirmation_bars > 1_000
+            || config.confirmation_window_bars < config.confirmation_bars
+            || config.confirmation_window_bars > 10_000
             || config.cooldown_bars > 10_000
             || config.atr_window == 0
             || config.atr_window > 10_000
@@ -152,6 +154,7 @@ impl MovingAverageCrossV2 {
             return Err(
                 "moving_average_cross_v2 requires conid > 0, timeframe 1m or 5s, \
                  0 < short_window < long_window <= 10000, confirmation_bars 1..=1000, \
+                 confirmation_window_bars between confirmation_bars and 10000, \
                  cooldown_bars <= 10000, atr_window 1..=10000, trend_window <= 10000, \
                  and percentage filters between 0 and 100"
                     .into(),
@@ -238,6 +241,13 @@ struct V2Indicators {
     direction: i8,
 }
 
+#[derive(Clone, Copy)]
+struct PendingCross {
+    direction: i8,
+    cross_end: usize,
+    qualified_bars: usize,
+}
+
 impl Strategy for MovingAverageCrossV2 {
     fn kind(&self) -> &'static str {
         V2_KIND
@@ -248,7 +258,7 @@ impl Strategy for MovingAverageCrossV2 {
     }
 
     fn minimum_history(&self) -> usize {
-        self.base_history() + self.config.confirmation_bars + self.config.cooldown_bars
+        self.base_history() + self.config.confirmation_window_bars + self.config.cooldown_bars
     }
 
     fn bar_timeframe(&self) -> &'static str {
@@ -268,52 +278,88 @@ impl Strategy for MovingAverageCrossV2 {
             ));
         }
         let bars = &bars[bars.len() - self.minimum_history()..];
-        let mut previous_emission = None;
-        let mut current_emission = None;
-        let first_end = self.base_history() + self.config.confirmation_bars;
-        for end in first_end..=bars.len() {
-            let direction = self.indicators(bars, end).raw_direction;
-            if direction == 0 {
+        let mut pending = None::<PendingCross>;
+        let mut confirmed = Vec::<(usize, i8)>::new();
+        let mut expired_at = None;
+        for end in self.base_history() + 1..=bars.len() {
+            let previous_raw = self.indicators(bars, end - 1).raw_direction;
+            let current = self.indicators(bars, end);
+            if current.raw_direction != 0 && previous_raw == -current.raw_direction {
+                pending = Some(PendingCross {
+                    direction: current.raw_direction,
+                    cross_end: end,
+                    qualified_bars: 0,
+                });
+            }
+
+            let Some(mut candidate) = pending else {
+                continue;
+            };
+            if current.raw_direction != candidate.direction {
+                pending = None;
                 continue;
             }
-            let before_confirmation = end - self.config.confirmation_bars;
-            let crossed = self.indicators(bars, before_confirmation).raw_direction == -direction;
-            let confirmed = crossed
-                && (before_confirmation + 1..=end).all(|candidate_end| {
-                    self.indicators(bars, candidate_end).direction == direction
-                });
-            if confirmed {
-                if end == bars.len() {
-                    current_emission = Some(direction);
-                } else {
-                    previous_emission = Some(end);
-                }
+            candidate.qualified_bars = if current.direction == candidate.direction {
+                candidate.qualified_bars + 1
+            } else {
+                0
+            };
+            if candidate.qualified_bars >= self.config.confirmation_bars {
+                confirmed.push((end, candidate.direction));
+                pending = None;
+            } else if end - candidate.cross_end + 1 >= self.config.confirmation_window_bars {
+                expired_at = Some(end);
+                pending = None;
+            } else {
+                pending = Some(candidate);
             }
         }
 
         let current = self.indicators(bars, bars.len());
         let previous = self.indicators(bars, bars.len() - 1);
+        let current_emission = confirmed
+            .last()
+            .copied()
+            .filter(|(end, _)| *end == bars.len());
         let cooling_down = current_emission.is_some()
-            && previous_emission
-                .is_some_and(|end| bars.len().saturating_sub(end) <= self.config.cooldown_bars);
+            && confirmed
+                .iter()
+                .rev()
+                .skip(1)
+                .any(|(end, _)| bars.len().saturating_sub(*end) <= self.config.cooldown_bars);
         let signal = match (current_emission, cooling_down) {
-            (Some(1), false) => StrategySignal::Buy,
-            (Some(-1), false) => StrategySignal::Sell,
+            (Some((_, 1)), false) => StrategySignal::Buy,
+            (Some((_, -1)), false) => StrategySignal::Sell,
             _ => StrategySignal::Hold,
         };
         let reason = if cooling_down {
             "cooldown"
         } else if current_emission.is_some() {
             "confirmed_cross"
-        } else if current.gap_percent < self.config.min_gap_percent {
+        } else if pending.is_some() && current.gap_percent < self.config.min_gap_percent {
             "gap_below_threshold"
-        } else if current.atr_percent < self.config.min_atr_percent {
+        } else if pending.is_some() && current.atr_percent < self.config.min_atr_percent {
             "atr_below_threshold"
-        } else if current.direction == 0 && self.config.trend_window > 0 {
+        } else if pending.is_some() && current.direction == 0 && self.config.trend_window > 0 {
             "trend_filter"
+        } else if pending.is_some() {
+            "waiting_for_confirmation"
+        } else if expired_at == Some(bars.len()) {
+            "confirmation_window_expired"
         } else {
-            "waiting_for_confirmation_or_new_cross"
+            "waiting_for_new_cross"
         };
+        let pending_direction = pending.map(|candidate| match candidate.direction {
+            1 => "buy",
+            -1 => "sell",
+            _ => "none",
+        });
+        let confirmation_progress = pending.map(|candidate| candidate.qualified_bars);
+        let confirmation_window_remaining = pending.map(|candidate| {
+            self.config
+                .confirmation_window_bars
+                .saturating_sub(bars.len().saturating_sub(candidate.cross_end) + 1)
+        });
         let current_bar = bars.last().expect("minimum history validated");
         Ok(StrategyOutput {
             signal,
@@ -329,6 +375,7 @@ impl Strategy for MovingAverageCrossV2 {
                 "long_window": self.config.long_window,
                 "min_gap_percent": self.config.min_gap_percent,
                 "confirmation_bars": self.config.confirmation_bars,
+                "confirmation_window_bars": self.config.confirmation_window_bars,
                 "cooldown_bars": self.config.cooldown_bars,
                 "atr_window": self.config.atr_window,
                 "min_atr_percent": self.config.min_atr_percent,
@@ -340,6 +387,9 @@ impl Strategy for MovingAverageCrossV2 {
                 "atr_percent": current.atr_percent,
                 "trend_average": current.trend_average,
                 "qualified_direction": match current.direction { 1 => "buy", -1 => "sell", _ => "none" },
+                "pending_direction": pending_direction,
+                "confirmation_progress": confirmation_progress,
+                "confirmation_window_remaining": confirmation_window_remaining,
                 "signal_reason": reason,
                 "bar": {
                     "time": current_bar.time,
@@ -459,6 +509,7 @@ mod tests {
             average_type: MovingAverageType::Ema,
             min_gap_percent: 0.0,
             confirmation_bars: 1,
+            confirmation_window_bars: 1,
             cooldown_bars: 0,
             atr_window: 2,
             min_atr_percent: 0.0,
@@ -478,6 +529,7 @@ mod tests {
             "bar_timeframe": "5s",
             "average_type": "sma",
             "confirmation_bars": 2,
+            "confirmation_window_bars": 2,
             "cooldown_bars": 0,
             "atr_window": 1
         }))
@@ -499,11 +551,14 @@ mod tests {
             "average_type": "sma",
             "min_gap_percent": 100.0,
             "confirmation_bars": 1,
+            "confirmation_window_bars": 2,
             "cooldown_bars": 0,
             "atr_window": 1
         }))
         .unwrap();
-        let output = gap_filtered.evaluate(&bars(&[3.0, 2.0, 1.0, 4.0])).unwrap();
+        let output = gap_filtered
+            .evaluate(&bars(&[3.0, 3.0, 2.0, 1.0, 4.0]))
+            .unwrap();
         assert_eq!(output.signal, StrategySignal::Hold);
         assert_eq!(output.details["signal_reason"], "gap_below_threshold");
 
@@ -513,6 +568,7 @@ mod tests {
             "long_window": 3,
             "average_type": "sma",
             "confirmation_bars": 1,
+            "confirmation_window_bars": 1,
             "cooldown_bars": 3,
             "atr_window": 1
         }))
@@ -525,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_does_not_treat_filter_requalification_as_a_new_cross() {
+    fn v2_allows_filters_to_qualify_after_the_cross_within_the_window() {
         let strategy = build_v2(json!({
             "conid": 1,
             "short_window": 2,
@@ -533,6 +589,7 @@ mod tests {
             "average_type": "sma",
             "min_gap_percent": 10.0,
             "confirmation_bars": 1,
+            "confirmation_window_bars": 2,
             "cooldown_bars": 0,
             "atr_window": 1
         }))
@@ -540,10 +597,29 @@ mod tests {
         let output = strategy
             .evaluate(&bars(&[3.0, 2.0, 1.0, 4.0, 8.0]))
             .unwrap();
+        assert_eq!(output.signal, StrategySignal::Buy);
+        assert_eq!(output.details["signal_reason"], "confirmed_cross");
+    }
+
+    #[test]
+    fn v2_expires_a_cross_that_never_qualifies_inside_the_window() {
+        let strategy = build_v2(json!({
+            "conid": 1,
+            "short_window": 2,
+            "long_window": 3,
+            "average_type": "sma",
+            "min_gap_percent": 10.0,
+            "confirmation_bars": 1,
+            "confirmation_window_bars": 1,
+            "cooldown_bars": 0,
+            "atr_window": 1
+        }))
+        .unwrap();
+        let output = strategy.evaluate(&bars(&[3.0, 2.0, 1.0, 4.0])).unwrap();
         assert_eq!(output.signal, StrategySignal::Hold);
         assert_eq!(
             output.details["signal_reason"],
-            "waiting_for_confirmation_or_new_cross"
+            "confirmation_window_expired"
         );
     }
 

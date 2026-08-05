@@ -31,6 +31,10 @@ fn default_confirmation_bars() -> usize {
     2
 }
 
+fn default_confirmation_window_bars() -> usize {
+    12
+}
+
 fn default_atr_window() -> usize {
     14
 }
@@ -48,6 +52,8 @@ pub struct MovingAverageCrossV2Config {
     pub min_gap_percent: f64,
     #[serde(default = "default_confirmation_bars")]
     pub confirmation_bars: usize,
+    #[serde(default = "default_confirmation_window_bars")]
+    pub confirmation_window_bars: usize,
     #[serde(default)]
     pub cooldown_bars: usize,
     #[serde(default = "default_atr_window")]
@@ -129,6 +135,13 @@ const V2_FIELDS: &[ConfigField] = &[
         key: "confirmation_bars",
         label: "确认 Bar",
         help: "方向连续满足条件后才发出信号",
+        kind: ConfigFieldKind::Integer,
+        required: true,
+    },
+    ConfigField {
+        key: "confirmation_window_bars",
+        label: "交叉确认窗口",
+        help: "交叉后允许等待过滤条件达标的最大 Bar 数，必须不少于确认 Bar 数",
         kind: ConfigFieldKind::Integer,
         required: true,
     },

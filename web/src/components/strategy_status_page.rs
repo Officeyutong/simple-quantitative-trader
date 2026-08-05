@@ -336,6 +336,9 @@ pub fn strategy_status_page(props: &StrategyStatusPageProps) -> Html {
                         <Status label="ATR" value={row.pointer("/output/atr").and_then(Value::as_f64).map(|v| format!("{v:.4}")).unwrap_or_else(|| "—".into())} />
                         <Status label="ATR 占价格" value={row.pointer("/output/atr_percent").and_then(Value::as_f64).map(|v| format!("{v:.4}%")).unwrap_or_else(|| "—".into())} />
                         <Status label="合格方向" value={text_at(row, "/output/qualified_direction")} />
+                        <Status label="待确认方向" value={text_at(row, "/output/pending_direction")} />
+                        <Status label="确认进度" value={row.pointer("/output/confirmation_progress").and_then(Value::as_u64).map(|v| v.to_string()).unwrap_or_else(|| "—".into())} />
+                        <Status label="确认窗口剩余 Bar" value={row.pointer("/output/confirmation_window_remaining").and_then(Value::as_u64).map(|v| v.to_string()).unwrap_or_else(|| "—".into())} />
                         <Status label="信号原因" value={text_at(row, "/output/signal_reason")} />
                         <Status label="计算写入时间（本地）" value={local_time(row, "created_at")} />
                     </div>
@@ -555,11 +558,15 @@ fn strategy_required_bars(strategy: &Value) -> u64 {
         .get("confirmation_bars")
         .and_then(Value::as_u64)
         .unwrap_or(2);
+    let confirmation_window = config
+        .get("confirmation_window_bars")
+        .and_then(Value::as_u64)
+        .unwrap_or(12);
     let cooldown = config
         .get("cooldown_bars")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    long.max(atr).max(trend) + confirmation + cooldown
+    long.max(atr).max(trend) + confirmation_window.max(confirmation) + cooldown
 }
 
 fn text_at(value: &Value, pointer: &str) -> String {

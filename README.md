@@ -517,8 +517,8 @@ IB Gateway 需要保持登录 paper 账户、开放 API、关闭 Read-Only，并
 
 - `moving_average_cross`：使用已完成的 1 分钟 Bar；
 - `moving_average_cross_5s`：使用已完成的 5 秒 Bar；
-- `moving_average_cross_v2`：可选 1 分钟或 5 秒、SMA/EMA，并提供确认、冷却、
-  ATR 与趋势过滤。
+- `moving_average_cross_v2`：可选 1 分钟或 5 秒、SMA/EMA；真实交叉后会在有限
+  窗口内等待均线差、ATR 与趋势过滤达标，再执行连续确认和冷却控制。
 
 三者可以同时存在。daemon 会从实时成交 Tick 同时聚合 1 分钟和 5 秒 OHLC，
 策略只在对应周期的 Bar 完成后计算，且同一 Bar 只计算一次。5 秒策略需要持续的

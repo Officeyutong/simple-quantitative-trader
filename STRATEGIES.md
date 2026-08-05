@@ -11,7 +11,7 @@
 | --- | --- | --- | --- |
 | `moving_average_cross` | 基础 SMA 双均线交叉 | 1 分钟 | `long_window + 1` |
 | `moving_average_cross_5s` | 基础 SMA 双均线交叉 | 5 秒 | `long_window + 1` |
-| `moving_average_cross_v2` | 带确认、冷却、波动和趋势过滤的双均线策略 | 1 分钟或 5 秒 | `max(long_window, atr_window + 1, trend_window) + confirmation_bars + cooldown_bars` |
+| `moving_average_cross_v2` | 带等待确认、冷却、波动和趋势过滤的双均线策略 | 1 分钟或 5 秒 | `max(long_window, atr_window + 1, trend_window) + confirmation_window_bars + cooldown_bars` |
 | `close_threshold` | 按收盘价上下阈值产生信号 | 1 分钟 | 1 |
 | `bollinger_rsi_mean_reversion` | 布林带与 RSI 联合确认的多头均值回归 | 1 分钟或 5 秒 | `max(bollinger_window + 1, rsi_window + 2)` |
 | `paper_round_trip` | paper 环境全链路验证 | 1 分钟 | 1 |
@@ -217,6 +217,7 @@ V2 是抗噪声双均线策略，在均线方向之外加入均线差、ATR、�
   "average_type": "ema",
   "min_gap_percent": 0.05,
   "confirmation_bars": 2,
+  "confirmation_window_bars": 12,
   "cooldown_bars": 3,
   "atr_window": 14,
   "min_atr_percent": 0.0,
@@ -233,6 +234,7 @@ V2 是抗噪声双均线策略，在均线方向之外加入均线差、ATR、�
 | `average_type` | 均线算法 | `"ema"` | `"sma"` 或 `"ema"` |
 | `min_gap_percent` | 最小均线差占价格百分比 | `0` | `0..=100` |
 | `confirmation_bars` | 方向连续成立多少根后发信号 | `2` | `1..=1000` |
+| `confirmation_window_bars` | 交叉后允许等待过滤条件达标的最大 Bar 数；包含交叉 Bar | `12` | `confirmation_bars..=10000` |
 | `cooldown_bars` | 两次新信号之间的冷却窗口 | `0` | `0..=10000` |
 | `atr_window` | ATR 窗口 | `14` | `1..=10000` |
 | `min_atr_percent` | 最小 ATR 占价格百分比 | `0` | `0..=100` |
@@ -281,24 +283,23 @@ atr_percent >= min_atr_percent
 
 ### 确认、触发和冷却
 
-确认逻辑以“真实均线交叉”为锚点，而不是简单的连续计数：
+确认逻辑以“真实均线交叉”为锚点，并为过滤条件提供有限的达标时间：
 
 - 设当前评估位置的原始均线方向（不含过滤）为 `direction`（`short > long` 为
   多头、`short < long` 为空头、相等为无方向）；
-- 触发要求确认窗口开始前一根（当前位置往前第 `confirmation_bars` 根）的原始
-  均线方向**恰好是相反方向** `-direction`，即确认窗口内发生了一次真实的均线
+- 原始方向从明确的反方向切换时创建一个待确认交叉；均线完全相等不创建交叉；
+- 待确认交叉最多保留 `confirmation_window_bars` 根 Bar。在此期间，均线差、ATR
+  或趋势过滤可以稍后达标；过滤未通过会把连续确认进度重置为 0，但不会立即丢弃
   交叉；
-- 并且从交叉后的第一根到当前 Bar，每一根的过滤后方向（通过 gap、ATR 和趋势
-  过滤）都等于 `direction`；
-- 只有当上述条件恰好在窗口最后一根 Bar 成立时才发信号，方向持续成立不会每根
-  Bar 重复触发；
+- 过滤后方向连续 `confirmation_bars` 根等于交叉方向时发出一次信号；
+- 等待期间若发生反向交叉，旧候选立即取消并以新方向重新开始；若等待窗口耗尽仍
+  未完成确认，候选过期；
+- 信号发出后候选被消费，方向持续成立不会在后续 Bar 重复触发；
 - 若同一窗口内更早的位置也曾满足触发条件，且距当前不超过 `cooldown_bars`，
   当前信号被抑制为 `hold`。
 
-这一锚点语义带来两个刻意保守的边界行为：交叉发生后若过滤条件晚一根 Bar 才开始
-满足（锚点处原始方向已与当前同向），该次交叉不再触发信号；从短长均线完全相等
-的状态直接发展出的方向也不会触发，必须存在明确的反向到正向交叉。过滤条件在确认
-窗口中途失效会使该次确认作废，且不会因过滤恢复而重新计数触发。
+因此，交叉发生时均线差尚小于阈值不会永久丢失信号；只要在等待窗口内达标并完成
+连续确认，仍可触发。等待窗口限制了陈旧交叉，避免在很久以后才追涨或追跌。
 
 候选方向为多头时发 `buy`，为空头时发 `sell`，其余情况发 `hold`。为确保实时运行
 与使用扩展历史的回测结果一致，V2 每次只使用末尾 `minimum_history()` 根 Bar。
@@ -312,10 +313,13 @@ atr_percent >= min_atr_percent
 | `gap_below_threshold` | 均线差不足 |
 | `atr_below_threshold` | 波动率不足 |
 | `trend_filter` | 过滤后无方向且趋势过滤开启（含均线无方向、未通过趋势过滤两种情况） |
-| `waiting_for_confirmation_or_new_cross` | 正在等待连续确认或新的方向触发 |
+| `waiting_for_confirmation` | 已有待确认交叉，正在等待过滤条件和连续确认 |
+| `confirmation_window_expired` | 待确认交叉未能在窗口内完成确认，已经过期 |
+| `waiting_for_new_cross` | 当前没有有效的待确认交叉 |
 
 诊断 JSON 还保存所有配置、当前短长均线、均线差、ATR、ATR 百分比、趋势均线、
-`qualified_direction` 和当前 Bar。
+`qualified_direction`、`pending_direction`、`confirmation_progress`、
+`confirmation_window_remaining` 和当前 Bar。
 
 ### 创建
 
@@ -331,6 +335,7 @@ quant strategy create \
     "average_type":"ema",
     "min_gap_percent":0.05,
     "confirmation_bars":2,
+    "confirmation_window_bars":12,
     "cooldown_bars":3,
     "atr_window":14,
     "min_atr_percent":0,
@@ -537,6 +542,7 @@ quant backtest run-strategy \
     "average_type":"ema",
     "min_gap_percent":0.05,
     "confirmation_bars":2,
+    "confirmation_window_bars":12,
     "cooldown_bars":3,
     "atr_window":14,
     "min_atr_percent":0,
