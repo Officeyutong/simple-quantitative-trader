@@ -526,7 +526,7 @@ impl Handle {
 
 pub fn spawn(
     config: IbkrConfig,
-    max_position_age_seconds: u64,
+    max_account_data_age_seconds: u64,
     cancellation: CancellationToken,
 ) -> Handle {
     let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
@@ -537,7 +537,8 @@ pub fn spawn(
         Actor {
             desired: config.connect_on_start,
             config,
-            position_heartbeat_interval: position_heartbeat_interval(max_position_age_seconds),
+            position_heartbeat_interval: position_heartbeat_interval(max_account_data_age_seconds),
+            pnl_idle_timeout: pnl_idle_timeout(max_account_data_age_seconds),
             commands: receiver,
             status: status_sender,
             cancellation,
@@ -561,6 +562,7 @@ pub fn spawn(
 struct Actor {
     config: IbkrConfig,
     position_heartbeat_interval: Duration,
+    pnl_idle_timeout: Duration,
     commands: mpsc::Receiver<Command>,
     status: watch::Sender<ConnectionStatus>,
     cancellation: CancellationToken,
@@ -1281,6 +1283,7 @@ impl Actor {
                 self.events.clone(),
                 cancellation.clone(),
                 account.clone(),
+                self.pnl_idle_timeout,
             );
         }
         for contract in self.market_data_contracts.values().cloned() {
@@ -1377,6 +1380,13 @@ fn position_heartbeat_interval(max_position_age_seconds: u64) -> Duration {
     // stale-position protection responsive even when operators allow a large
     // account-data age, while the lower bound avoids a zero-duration timer.
     Duration::from_secs((max_position_age_seconds / 3).clamp(1, 30))
+}
+
+fn pnl_idle_timeout(max_account_data_age_seconds: u64) -> Duration {
+    // PnL is a real broker value and must never be refreshed by a synthetic
+    // local heartbeat. Re-subscribe well before the risk deadline so IBKR has
+    // time to send a new authoritative snapshot.
+    Duration::from_secs((max_account_data_age_seconds / 3).clamp(1, 60))
 }
 
 async fn fetch_fx_rate_snapshots(
@@ -1606,43 +1616,82 @@ fn spawn_pnl_subscription(
     events: mpsc::Sender<BrokerEvent>,
     cancellation: CancellationToken,
     account: String,
+    idle_timeout: Duration,
 ) {
     tokio::spawn(async move {
         let account_id = ibapi::accounts::types::AccountId(account.clone());
-        let mut subscription = match client.pnl(&account_id, None).await {
-            Ok(subscription) => subscription,
-            Err(error) => {
-                tracing::error!(%error, %account, "failed to subscribe to IBKR account PnL");
-                return;
-            }
-        };
         loop {
-            tokio::select! {
-                _ = cancellation.cancelled() => break,
-                item = subscription.next() => match item {
-                    Some(Ok(SubscriptionItem::Data(pnl))) => {
-                        if events.send(BrokerEvent::Pnl {
-                            account: account.clone(),
-                            daily_pnl: pnl.daily_pnl,
-                            unrealized_pnl: pnl.unrealized_pnl,
-                            realized_pnl: pnl.realized_pnl,
-                            observed_at: Utc::now(),
-                        }).await.is_err() {
+            let subscription = tokio::select! {
+                _ = cancellation.cancelled() => return,
+                result = client.pnl(&account_id, None) => result,
+            };
+            let mut subscription = match subscription {
+                Ok(subscription) => subscription,
+                Err(error) => {
+                    tracing::warn!(%error, %account, "failed to subscribe to IBKR account PnL; retrying");
+                    if wait_for_subscription_retry(&cancellation).await {
+                        return;
+                    }
+                    continue;
+                }
+            };
+            let idle = tokio::time::sleep(idle_timeout);
+            tokio::pin!(idle);
+            let mut receiver_closed = false;
+            loop {
+                tokio::select! {
+                    _ = cancellation.cancelled() => return,
+                    _ = &mut idle => {
+                        tracing::warn!(
+                            %account,
+                            idle_seconds = idle_timeout.as_secs(),
+                            "IBKR account PnL subscription became idle; resubscribing"
+                        );
+                        break;
+                    }
+                    item = subscription.next() => match item {
+                        Some(Ok(SubscriptionItem::Data(pnl))) => {
+                            idle.as_mut().reset(Instant::now() + idle_timeout);
+                            if events.send(BrokerEvent::Pnl {
+                                account: account.clone(),
+                                daily_pnl: pnl.daily_pnl,
+                                unrealized_pnl: pnl.unrealized_pnl,
+                                realized_pnl: pnl.realized_pnl,
+                                observed_at: Utc::now(),
+                            }).await.is_err() {
+                                receiver_closed = true;
+                                break;
+                            }
+                        }
+                        Some(Ok(SubscriptionItem::Notice(notice))) => {
+                            tracing::warn!(?notice, %account, "IBKR PnL subscription notice");
+                        }
+                        Some(Err(error)) => {
+                            tracing::warn!(%error, %account, "IBKR PnL subscription failed; resubscribing");
+                            break;
+                        }
+                        None => {
+                            tracing::warn!(%account, "IBKR closed the account PnL subscription; resubscribing");
                             break;
                         }
                     }
-                    Some(Ok(SubscriptionItem::Notice(notice))) => {
-                        tracing::warn!(?notice, %account, "IBKR PnL subscription notice");
-                    }
-                    Some(Err(error)) => {
-                        tracing::error!(%error, %account, "IBKR PnL subscription failed");
-                        break;
-                    }
-                    None => break,
                 }
+            }
+            // Dropping the subscription sends CancelPnL before the next
+            // request, preventing overlapping request IDs at the Gateway.
+            drop(subscription);
+            if receiver_closed || wait_for_subscription_retry(&cancellation).await {
+                return;
             }
         }
     });
+}
+
+async fn wait_for_subscription_retry(cancellation: &CancellationToken) -> bool {
+    tokio::select! {
+        _ = cancellation.cancelled() => true,
+        _ = tokio::time::sleep(Duration::from_secs(1)) => false,
+    }
 }
 
 fn spawn_market_data_subscription(
@@ -2462,6 +2511,14 @@ mod tests {
         assert_eq!(position_heartbeat_interval(15), Duration::from_secs(5));
         assert_eq!(position_heartbeat_interval(120), Duration::from_secs(30));
         assert_eq!(position_heartbeat_interval(3_600), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn pnl_idle_watchdog_runs_before_the_risk_freshness_deadline() {
+        assert_eq!(pnl_idle_timeout(1), Duration::from_secs(1));
+        assert_eq!(pnl_idle_timeout(15), Duration::from_secs(5));
+        assert_eq!(pnl_idle_timeout(120), Duration::from_secs(40));
+        assert_eq!(pnl_idle_timeout(3_600), Duration::from_secs(60));
     }
 
     #[tokio::test]
