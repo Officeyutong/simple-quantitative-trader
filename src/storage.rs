@@ -7531,6 +7531,59 @@ impl Storage {
         })
     }
 
+    /// Creates work only for portions of a requested range that have not
+    /// already been traversed successfully by an earlier backfill. A range can
+    /// contain several independent holes, so each hole receives its own
+    /// durable job instead of restarting one job from the original beginning.
+    pub fn create_unverified_backfill_jobs(
+        &mut self,
+        request: &BackfillJobRequest,
+    ) -> Result<Vec<(BackfillJobRequest, BackfillJobCreation)>> {
+        if request.end <= request.start {
+            return Err(AppError::Storage("backfill end must be after start".into()));
+        }
+        let mut request = request.clone();
+        request.start = duckdb_timestamp(request.start);
+        request.end = duckdb_timestamp(request.end);
+
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT request_json::VARCHAR, cursor_time
+                 FROM data_jobs
+                 WHERE job_type = 'historical_backfill' AND cursor_time > ?",
+            )
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        let jobs = statement
+            .query_map(params![request.start], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, DateTime<Utc>>(1)?))
+            })
+            .map_err(|error| AppError::Storage(error.to_string()))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| AppError::Storage(error.to_string()))?;
+        drop(statement);
+
+        let verified_intervals = jobs
+            .into_iter()
+            .filter_map(|(request_json, cursor_time)| {
+                let existing = serde_json::from_str::<BackfillJobRequest>(&request_json).ok()?;
+                same_backfill_coverage_scope(&existing, &request)
+                    .then(|| (existing.start, cursor_time.min(existing.end)))
+            })
+            .filter(|(start, end)| end > start)
+            .collect::<Vec<_>>();
+        let gaps = interval_gaps(request.start, request.end, &verified_intervals);
+        let mut created = Vec::with_capacity(gaps.len());
+        for (start, end) in gaps {
+            let mut gap_request = request.clone();
+            gap_request.start = start;
+            gap_request.end = end;
+            let creation = self.create_backfill_job(&gap_request)?;
+            created.push((gap_request, creation));
+        }
+        Ok(created)
+    }
+
     fn active_backfill_jobs(&self) -> Result<Vec<ActiveBackfillJob>> {
         let mut statement = self
             .connection
@@ -12691,6 +12744,16 @@ fn same_backfill_scope(left: &BackfillJobRequest, right: &BackfillJobRequest) ->
         && left.contract.security_type == right.contract.security_type
         && left.contract.currency == right.contract.currency
         && left.contract.exchange == right.contract.exchange
+        && left.timeframe == right.timeframe
+        && left.outside_rth == right.outside_rth
+        && left.fx_rate_pair == right.fx_rate_pair
+}
+
+/// Coverage is tied to the instrument identity and data semantics, not the
+/// routing exchange spelling captured in an older contract snapshot. IBKR can
+/// return the same conid as SMART or its primary exchange across sessions.
+fn same_backfill_coverage_scope(left: &BackfillJobRequest, right: &BackfillJobRequest) -> bool {
+    left.contract.conid == right.contract.conid
         && left.timeframe == right.timeframe
         && left.outside_rth == right.outside_rth
         && left.fx_rate_pair == right.fx_rate_pair
@@ -20315,6 +20378,47 @@ mod tests {
         assert_eq!(
             jobs[0].pointer("/request/end").and_then(Value::as_str),
             Some("2026-07-10T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn missing_backfill_creation_skips_verified_ranges_and_splits_gaps() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut storage = Storage::open(&directory.path().join("state.duckdb")).unwrap();
+        let start = "2026-07-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let day = chrono::Duration::days(1);
+        mark_backfill_range_verified(&mut storage, "5s", start, start + day * 2, false);
+        mark_backfill_range_verified(&mut storage, "5s", start + day * 3, start + day * 4, false);
+
+        let mut contract = spy_contract();
+        // Contract routing can change between IBKR sessions without changing
+        // the historical data identity represented by the conid.
+        contract.exchange = "ARCA".into();
+        let request = BackfillJobRequest {
+            contract,
+            timeframe: "5s".into(),
+            start,
+            end: start + day * 5,
+            outside_rth: false,
+            fx_rate_pair: None,
+        };
+        let created = storage.create_unverified_backfill_jobs(&request).unwrap();
+        assert_eq!(created.len(), 2);
+        assert_eq!(created[0].0.start, start + day * 2);
+        assert_eq!(created[0].0.end, start + day * 3);
+        assert_eq!(created[1].0.start, start + day * 4);
+        assert_eq!(created[1].0.end, start + day * 5);
+
+        for (gap, creation) in created {
+            storage
+                .advance_backfill_job(creation.job_id, gap.end, gap.end)
+                .unwrap();
+        }
+        assert!(
+            storage
+                .create_unverified_backfill_jobs(&request)
+                .unwrap()
+                .is_empty()
         );
     }
 

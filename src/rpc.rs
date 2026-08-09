@@ -465,16 +465,39 @@ async fn dispatch(
                 outside_rth: params.outside_rth,
                 fx_rate_pair: None,
             };
-            match storage.lock_safe().create_backfill_job(&job) {
-                Ok(created) => success(
-                    request.id,
-                    json!({
-                        "job_id": created.job_id,
-                        "state": "pending",
-                        "reused": created.reused,
-                        "range_expanded": created.range_expanded
-                    }),
-                ),
+            match storage.lock_safe().create_unverified_backfill_jobs(&job) {
+                Ok(created) => {
+                    let jobs = created
+                        .iter()
+                        .map(|(gap, creation)| {
+                            json!({
+                                "job_id": creation.job_id,
+                                "state": "pending",
+                                "reused": creation.reused,
+                                "range_expanded": creation.range_expanded,
+                                "start": gap.start,
+                                "end": gap.end
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let first = created.first().map(|(_, creation)| creation);
+                    success(
+                        request.id,
+                        json!({
+                            // Keep the original single-job fields for older clients.
+                            "job_id": first.map(|creation| creation.job_id),
+                            "state": if created.is_empty() { "completed" } else { "pending" },
+                            "reused": !created.is_empty()
+                                && created.iter().all(|(_, creation)| creation.reused),
+                            "range_expanded": created
+                                .iter()
+                                .any(|(_, creation)| creation.range_expanded),
+                            "already_verified": created.is_empty(),
+                            "job_count": created.len(),
+                            "jobs": jobs
+                        }),
+                    )
+                }
                 Err(error) => failure(request.id, -32030, &error.to_string()),
             }
         }

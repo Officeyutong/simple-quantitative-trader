@@ -188,8 +188,22 @@ pub fn backtest_data_panel(props: &BacktestDataPanelProps) -> Html {
                 .await
                 {
                     Ok(value) => {
-                        let id = text(&value, "job_id");
-                        created_job_id.set(Some(id.clone()));
+                        let already_verified = value
+                            .get("already_verified")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        let created_jobs = array(&value, "jobs");
+                        let id = value
+                            .get("job_id")
+                            .and_then(Value::as_str)
+                            .or_else(|| {
+                                created_jobs
+                                    .first()
+                                    .and_then(|job| job.get("job_id").and_then(Value::as_str))
+                            })
+                            .unwrap_or_default()
+                            .to_owned();
+                        created_job_id.set((!id.is_empty()).then_some(id.clone()));
                         let reused = value
                             .get("reused")
                             .and_then(Value::as_bool)
@@ -198,10 +212,26 @@ pub fn backtest_data_panel(props: &BacktestDataPanelProps) -> Html {
                             .get("range_expanded")
                             .and_then(Value::as_bool)
                             .unwrap_or(false);
-                        let message = match (reused, range_expanded) {
-                            (true, true) => format!("已合并到现有下载任务并扩展其范围：{id}"),
-                            (true, false) => format!("相同范围已在队列中，已复用下载任务：{id}"),
-                            (false, _) => format!("历史数据下载任务已创建：{id}"),
+                        let job_count = value
+                            .get("job_count")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(created_jobs.len() as u64);
+                        let message = if already_verified || job_count == 0 {
+                            "所选范围已经完成下载验证，无需创建新任务。".to_owned()
+                        } else if job_count > 1 {
+                            format!(
+                                "已按缺失范围创建或复用 {job_count} 个下载任务；已有数据不会重复下载。"
+                            )
+                        } else {
+                            match (reused, range_expanded) {
+                                (true, true) => {
+                                    format!("已合并到现有下载任务并扩展其缺失范围：{id}")
+                                }
+                                (true, false) => {
+                                    format!("该缺失范围已在队列中，已复用下载任务：{id}")
+                                }
+                                (false, _) => format!("缺失范围下载任务已创建：{id}"),
+                            }
                         };
                         success.set(Some(message));
                     }
