@@ -34,6 +34,7 @@ pub fn strategy_status_page(props: &StrategyStatusPageProps) -> Html {
     let bars = use_state(Vec::<Value>::new);
     let cost_controls = use_state(Vec::<Value>::new);
     let cost_models = use_state(Vec::<Value>::new);
+    let risk_controls = use_state(Vec::<Value>::new);
     let calendar_sessions = use_state(Vec::<Value>::new);
     let calendar_status = use_state(|| None::<Value>);
     let error = use_state(|| None::<String>);
@@ -61,6 +62,7 @@ pub fn strategy_status_page(props: &StrategyStatusPageProps) -> Html {
         let bars = bars.clone();
         let cost_controls = cost_controls.clone();
         let cost_models = cost_models.clone();
+        let risk_controls = risk_controls.clone();
         let execution_configs = array(&props.execution_configs, "configs");
         let calendar_sessions = calendar_sessions.clone();
         let calendar_status = calendar_status.clone();
@@ -76,6 +78,7 @@ pub fn strategy_status_page(props: &StrategyStatusPageProps) -> Html {
                 bars.clone(),
                 cost_controls.clone(),
                 cost_models.clone(),
+                risk_controls.clone(),
                 execution_configs.clone(),
                 calendar_sessions.clone(),
                 calendar_status.clone(),
@@ -92,6 +95,7 @@ pub fn strategy_status_page(props: &StrategyStatusPageProps) -> Html {
                     bars.clone(),
                     cost_controls.clone(),
                     cost_models.clone(),
+                    risk_controls.clone(),
                     execution_configs.clone(),
                     calendar_sessions.clone(),
                     calendar_status.clone(),
@@ -109,11 +113,12 @@ pub fn strategy_status_page(props: &StrategyStatusPageProps) -> Html {
         .find(|strategy| text(strategy, "strategy_id") == *selected_id);
     let required_bars = strategy.map(strategy_required_bars).unwrap_or(0);
     let available_bars = bars.len() as u64;
-    let bar_timeframe = strategy.map(strategy_timeframe).unwrap_or("1m");
-    let bar_timeframe_label = if bar_timeframe == "5s" {
-        "5 秒"
-    } else {
-        "1 分钟"
+    let bar_timeframe = strategy.map(strategy_timeframe).unwrap_or_default();
+    let bar_timeframe_label = match bar_timeframe.as_str() {
+        "5s" => "5 秒".to_owned(),
+        "1m" => "1 分钟".to_owned(),
+        "" => "—".to_owned(),
+        value => value.to_owned(),
     };
     let latest = evaluations.first();
     let cost_control = cost_controls
@@ -125,6 +130,9 @@ pub fn strategy_status_page(props: &StrategyStatusPageProps) -> Html {
             .iter()
             .find(|model| text(model, "cost_model_id") == cost_model_id)
     });
+    let risk_control = risk_controls
+        .iter()
+        .find(|control| text(control, "strategy_id") == *selected_id);
     let execution_configs = array(&props.execution_configs, "configs");
     let execution_config = execution_configs
         .iter()
@@ -189,7 +197,7 @@ pub fn strategy_status_page(props: &StrategyStatusPageProps) -> Html {
                             <Status label="完整策略 UUID" value={text(strategy, "strategy_id")} />
                             <Status label="名称" value={text(strategy, "name")} />
                             <Status label="类型" value={text(strategy, "kind")} />
-                            <Status label="Bar 周期" value={bar_timeframe_label.to_owned()} />
+                            <Status label="Bar 周期" value={bar_timeframe_label.clone()} />
                             <Status label="状态" value={text(strategy, "state")} />
                             <Status label="证券（官方名称）" value={official_security_name(strategy)} />
                             <Status label="所属交易所" value={security_exchange(strategy)} />
@@ -285,7 +293,7 @@ pub fn strategy_status_page(props: &StrategyStatusPageProps) -> Html {
                                     <Status label="模型币种" value={cost_model.map(|model| text(model, "currency")).unwrap_or_else(|| "—".into())} />
                                     <Status label="成本安全倍数" value={number(control, "minimum_cost_multiple")} />
                                     <Status label="佣金/毛利润上限" value={format_ratio(control, "maximum_commission_to_gross_profit_ratio")} />
-                                    <Status label="熔断最少交易数" value={integer(control, "minimum_completed_trades")} />
+                                    <Status label="门控最少交易数" value={integer(control, "minimum_completed_trades")} />
                                     <Status label="买入费用（固定/股/比例/最低）" value={cost_model.map(|model| fee_summary(model, "buy")).unwrap_or_else(|| "—".into())} />
                                     <Status label="卖出费用（固定/股/比例/最低）" value={cost_model.map(|model| fee_summary(model, "sell")).unwrap_or_else(|| "—".into())} />
                                     <Status label="卖出税费" value={cost_model.map(|model| format!("{} bps", number(model, "sell_tax_bps"))).unwrap_or_else(|| "—".into())} />
@@ -298,6 +306,71 @@ pub fn strategy_status_page(props: &StrategyStatusPageProps) -> Html {
                             </>
                         }).unwrap_or_else(|| html! {
                             <div class="alert alert-secondary mb-0">{"尚未给该策略配置成本控制；当前不会执行成本门控。"}</div>
+                        })}
+                    </div></section>
+                    <section class="card shadow-sm mb-4"><div class="card-body">
+                        <h2 class="h5">{"策略风险控制"}</h2>
+                        {risk_control.map(|control| {
+                            let statistics = control.get("statistics").unwrap_or(&Value::Null);
+                            let currency = text(control, "capital_currency");
+                            let capital = control.get("strategy_capital").and_then(Value::as_f64).unwrap_or(0.0);
+                            let loss_ratio = control.get("maximum_rolling_24h_realized_net_loss_ratio").and_then(Value::as_f64).unwrap_or(0.0);
+                            let loss_limit = capital * loss_ratio;
+                            let turnover_ratio = control.get("maximum_rolling_24h_turnover_capital_ratio").and_then(Value::as_f64).unwrap_or(0.0);
+                            let turnover_limit = capital * turnover_ratio;
+                            let data_complete = boolean(statistics, "data_complete");
+                            let threshold_reached = strategy_risk_threshold_reached(control);
+                            html! {
+                                <>
+                                    <div class="row g-3">
+                                        <Status label="风险门控" value={if boolean(control, "enabled") { "已启用".to_owned() } else { "已停用".to_owned() }} />
+                                        <Status label="基础币种" value={currency.clone()} />
+                                        <Status label="策略资本" value={format!("{} {}", number(control, "strategy_capital"), currency)} />
+                                        <Status label="最大持仓/资本" value={format_optional_ratio(control, "maximum_position_capital_ratio")} />
+                                        <Status label="24h 最大净亏损" value={if loss_limit > 0.0 { format!("{loss_limit:.2} {}（{}）", currency, format_ratio(control, "maximum_rolling_24h_realized_net_loss_ratio")) } else { "关闭".into() }} />
+                                        <Status label="最大连续净亏损交易" value={format_optional_count(control, "maximum_consecutive_net_losing_trades")} />
+                                        <Status label="24h 最多完成交易" value={format_optional_count(control, "maximum_rolling_24h_completed_trades")} />
+                                        <Status label="24h 最大换手" value={if turnover_limit > 0.0 { format!("{turnover_limit:.2} {}（{} 倍资本）", currency, number(control, "maximum_rolling_24h_turnover_capital_ratio")) } else { "关闭".into() }} />
+                                        <Status label="统计基线复位时间（本地）" value={local_time(control, "statistics_reset_at")} />
+                                        <Status label="最近复位说明" value={text(control, "statistics_reset_note")} />
+                                        <Status label="统计完整性" value={if data_complete { "完整".to_owned() } else { "不完整".to_owned() }} />
+                                        <Status label="24h 已实现净损益" value={risk_money(statistics, "rolling_24h_realized_net_pnl", &currency)} />
+                                        <Status label="24h 换手" value={risk_money(statistics, "rolling_24h_turnover", &currency)} />
+                                        <Status label="24h 完成交易" value={number(statistics, "rolling_24h_completed_trades")} />
+                                        <Status label="连续净亏损交易" value={number(statistics, "consecutive_net_losing_trades")} />
+                                    </div>
+                                    <div class="alert alert-info mt-3 mb-0">
+                                        {"策略风险门控只阻止开仓、加仓和反向开仓；经当前持仓验证的严格减仓和平仓只旁路这些策略级开仓阈值，全局交易开关、交易控制/紧急停止和交易日历仍然有效。最大持仓限制会在下单时用新鲜行情和汇率计算。"}
+                                    </div>
+                                    {(!boolean(control, "currency_matches_daemon")).then(|| html! {
+                                        <div class="alert alert-danger mt-3 mb-0">
+                                            <strong>{"自动执行启用及新的风险增加动作已被阻止："}</strong>
+                                            {statistics.get("warning")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("策略资本币种缺失或与 daemon 当前 risk.base_currency 不一致。请暂停策略，到“交易成本”页面核对资本金额并重新保存策略风险控制。")}
+                                        </div>
+                                    }).unwrap_or_default()}
+                                    {(!boolean(control, "enabled")).then(|| html! {
+                                        <div class="alert alert-warning mt-3 mb-0">{"该策略的风险门控当前未启用。"}</div>
+                                    }).unwrap_or_default()}
+                                    {(boolean(control, "currency_matches_daemon") && boolean(control, "enabled") && (!data_complete || threshold_reached)).then(|| html! {
+                                        <div class="alert alert-danger mt-3 mb-0">
+                                            {if !data_complete {
+                                                "风险统计不完整，新的风险增加订单会被阻止；严格减仓和平仓不受该策略级阈值限制，但仍须通过全局交易开关、交易控制/紧急停止和交易日历。"
+                                            } else {
+                                                "当前至少一个滚动风险阈值已经达到，新的风险增加订单会被阻止；严格减仓和平仓不受该策略级阈值限制，但仍须通过全局交易开关、交易控制/紧急停止和交易日历。"
+                                            }}
+                                        </div>
+                                    }).unwrap_or_default()}
+                                    {statistics.get("warning").and_then(Value::as_str).map(|warning| html! {
+                                        <div class="alert alert-warning mt-3 mb-0">{format!("统计数据警告：{warning}")}</div>
+                                    }).filter(|_| boolean(control, "currency_matches_daemon")).unwrap_or_default()}
+                                </>
+                            }
+                        }).unwrap_or_else(|| html! {
+                            <div class="alert alert-danger mb-0">
+                                {"该策略尚未配置策略级风险控制：自动执行启用及新的风险增加动作已被阻止。请到“交易成本”页面设置并保存策略资本、基础币种、亏损、交易次数及换手限制；严格减仓仍须通过账户级风险和交易控制。"}
+                            </div>
                         })}
                     </div></section>
                     <section class="card shadow-sm mb-4"><div class="card-body">
@@ -379,6 +452,7 @@ fn refresh_status(
     bars: UseStateHandle<Vec<Value>>,
     cost_controls: UseStateHandle<Vec<Value>>,
     cost_models: UseStateHandle<Vec<Value>>,
+    risk_controls: UseStateHandle<Vec<Value>>,
     execution_configs: Vec<Value>,
     calendar_sessions: UseStateHandle<Vec<Value>>,
     calendar_status: UseStateHandle<Option<Value>>,
@@ -399,12 +473,12 @@ fn refresh_status(
         .iter()
         .find(|strategy| text(strategy, "strategy_id") == strategy_id)
         .map(strategy_timeframe)
-        .unwrap_or("1m");
+        .unwrap_or_default();
     let required = strategies
         .iter()
         .find(|strategy| text(strategy, "strategy_id") == strategy_id)
         .map(strategy_required_bars)
-        .unwrap_or(100)
+        .unwrap_or(0)
         .max(200);
     let execution_config = execution_configs
         .iter()
@@ -440,6 +514,13 @@ fn refresh_status(
         match call_method(&endpoint, "execution_cost.model.list", json!({})).await {
             Ok(value) if *current_selection == requested_strategy_id => {
                 cost_models.set(array(&value, "models"))
+            }
+            Ok(_) => return,
+            Err(message) => error.set(Some(message)),
+        }
+        match call_method(&endpoint, "execution_risk.control.list", json!({})).await {
+            Ok(value) if *current_selection == requested_strategy_id => {
+                risk_controls.set(array(&value, "controls"))
             }
             Ok(_) => return,
             Err(message) => error.set(Some(message)),
@@ -481,7 +562,7 @@ fn refresh_status(
             calendar_status.set(None);
             calendar_sessions.set(Vec::new());
         }
-        if conid > 0 {
+        if conid > 0 && !timeframe.is_empty() {
             match call_method(
                 &endpoint,
                 "market_data.bars",
@@ -522,51 +603,108 @@ fn format_ratio(value: &Value, key: &str) -> String {
         .unwrap_or_else(|| "—".into())
 }
 
-fn strategy_timeframe(strategy: &Value) -> &'static str {
-    if text(strategy, "kind") == "moving_average_cross_5s"
-        || (text(strategy, "kind") == "moving_average_cross_v2"
-            && strategy
-                .pointer("/config/bar_timeframe")
-                .and_then(Value::as_str)
-                == Some("5s"))
-    {
-        "5s"
-    } else {
-        "1m"
-    }
+fn format_optional_ratio(value: &Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(Value::as_f64)
+        .map(|ratio| {
+            if ratio <= 0.0 {
+                String::from("关闭")
+            } else {
+                format!("{} ({:.2}%)", number(value, key), ratio * 100.0)
+            }
+        })
+        .unwrap_or_else(|| String::from("—"))
+}
+
+fn format_optional_count(value: &Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(Value::as_u64)
+        .map(|count| {
+            if count == 0 {
+                String::from("关闭")
+            } else {
+                count.to_string()
+            }
+        })
+        .unwrap_or_else(|| String::from("—"))
+}
+
+fn risk_money(value: &Value, key: &str, currency: &str) -> String {
+    value
+        .get(key)
+        .and_then(Value::as_f64)
+        .map(|amount| format!("{amount:.2} {currency}"))
+        .unwrap_or_else(|| String::from("—"))
+}
+
+fn strategy_risk_threshold_reached(control: &Value) -> bool {
+    let statistics = control.get("statistics").unwrap_or(&Value::Null);
+    let capital = control
+        .get("strategy_capital")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let loss_ratio = control
+        .get("maximum_rolling_24h_realized_net_loss_ratio")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let realized_net_pnl = statistics
+        .get("rolling_24h_realized_net_pnl")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let loss_reached =
+        capital > 0.0 && loss_ratio > 0.0 && realized_net_pnl <= -(capital * loss_ratio);
+
+    let maximum_consecutive_losses = control
+        .get("maximum_consecutive_net_losing_trades")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let consecutive_losses = statistics
+        .get("consecutive_net_losing_trades")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let consecutive_losses_reached =
+        maximum_consecutive_losses > 0 && consecutive_losses >= maximum_consecutive_losses;
+
+    let maximum_completed_trades = control
+        .get("maximum_rolling_24h_completed_trades")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let completed_trades = statistics
+        .get("rolling_24h_completed_trades")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let completed_trades_reached =
+        maximum_completed_trades > 0 && completed_trades >= maximum_completed_trades;
+
+    let turnover_ratio = control
+        .get("maximum_rolling_24h_turnover_capital_ratio")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let turnover = statistics
+        .get("rolling_24h_turnover")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    let turnover_reached =
+        capital > 0.0 && turnover_ratio > 0.0 && turnover >= capital * turnover_ratio;
+
+    loss_reached || consecutive_losses_reached || completed_trades_reached || turnover_reached
+}
+
+fn strategy_timeframe(strategy: &Value) -> String {
+    strategy
+        .get("bar_timeframe")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
 }
 
 fn strategy_required_bars(strategy: &Value) -> u64 {
-    let config = strategy.get("config").unwrap_or(&Value::Null);
-    let long = config
-        .get("long_window")
+    strategy
+        .get("minimum_history")
         .and_then(Value::as_u64)
-        .unwrap_or(0);
-    if text(strategy, "kind") != "moving_average_cross_v2" {
-        return long + 1;
-    }
-    let atr = config
-        .get("atr_window")
-        .and_then(Value::as_u64)
-        .unwrap_or(14)
-        + 1;
-    let trend = config
-        .get("trend_window")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let confirmation = config
-        .get("confirmation_bars")
-        .and_then(Value::as_u64)
-        .unwrap_or(2);
-    let confirmation_window = config
-        .get("confirmation_window_bars")
-        .and_then(Value::as_u64)
-        .unwrap_or(12);
-    let cooldown = config
-        .get("cooldown_bars")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    long.max(atr).max(trend) + confirmation_window.max(confirmation) + cooldown
+        .unwrap_or(0)
 }
 
 fn text_at(value: &Value, pointer: &str) -> String {

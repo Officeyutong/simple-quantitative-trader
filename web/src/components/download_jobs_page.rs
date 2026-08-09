@@ -117,7 +117,7 @@ pub fn download_jobs_page(props: &DownloadJobsPageProps) -> Html {
                 <div class="card-body border-bottom">
                     <div class="d-flex flex-wrap justify-content-between align-items-center gap-3">
                         <div>
-                            <h2 class="h5 mb-1">{"历史数据下载任务"}</h2>
+                            <h2 class="h5 mb-1">{"历史行情与汇率下载任务"}</h2>
                             <div class="text-secondary">
                                 {"展示数据库中的全部任务；真实状态、队列位置和下载进度每 5 秒更新。"}
                             </div>
@@ -168,6 +168,25 @@ pub fn download_jobs_page(props: &DownloadJobsPageProps) -> Html {
                             jobs.iter().map(|job| {
                                 let job_id = text(job, "job_id");
                                 let progress = job_progress_percent(job);
+                                let fx_base = job.pointer("/request/fx_rate_pair/base_currency")
+                                    .and_then(Value::as_str);
+                                let fx_quote = job.pointer("/request/fx_rate_pair/quote_currency")
+                                    .and_then(Value::as_str);
+                                let is_fx = fx_base.is_some() && fx_quote.is_some();
+                                let security_title = match (fx_base, fx_quote) {
+                                    (Some(base), Some(quote)) => format!("{base}/{quote} 历史汇率"),
+                                    _ => request_text(job, "/request/contract/symbol"),
+                                };
+                                let security_detail = if is_fx {
+                                    "IBKR IDEALPRO · MIDPOINT".to_owned()
+                                } else {
+                                    format!(
+                                        "{} · Conid {} · {}",
+                                        request_exchange(job),
+                                        request_integer(job, "/request/contract/conid"),
+                                        request_text(job, "/request/contract/currency"),
+                                    )
+                                };
                                 let cancel_in_progress = (*cancelling).as_deref() == Some(job_id.as_str());
                                 let cancel = {
                                     let endpoint = props.endpoint.clone();
@@ -192,21 +211,18 @@ pub fn download_jobs_page(props: &DownloadJobsPageProps) -> Html {
                                     <td class="text-nowrap">{local_time(job, "created_at")}</td>
                                     <td title={job_id.clone()}><code>{short_job_id(&job_id)}</code></td>
                                     <td>
-                                        <div class="fw-semibold">{request_text(job, "/request/contract/symbol")}</div>
+                                        <div class="fw-semibold">{security_title}</div>
                                         <div class="small text-secondary">
-                                            {format!(
-                                                "{} · Conid {} · {}",
-                                                request_exchange(job),
-                                                request_integer(job, "/request/contract/conid"),
-                                                request_text(job, "/request/contract/currency"),
-                                            )}
+                                            {security_detail}
                                         </div>
                                     </td>
                                     <td class="text-nowrap">
                                         <div>{format!(
                                             "{} · {}",
                                             request_text(job, "/request/timeframe"),
-                                            if job.pointer("/request/outside_rth").and_then(Value::as_bool).unwrap_or(false) {
+                                            if is_fx {
+                                                "历史绩效汇率"
+                                            } else if job.pointer("/request/outside_rth").and_then(Value::as_bool).unwrap_or(false) {
                                                 "含盘前盘后"
                                             } else {
                                                 "常规交易时段"

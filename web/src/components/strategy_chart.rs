@@ -2,7 +2,7 @@ use chrono::{DateTime, Local};
 use plotly::{
     Candlestick, Plot, Scatter,
     common::{Line, Mode, Title},
-    layout::{Axis, HoverMode, Layout, RangeSlider},
+    layout::{Axis, AxisType, HoverMode, Layout, RangeSlider},
 };
 use serde_json::Value;
 use yew::prelude::*;
@@ -51,6 +51,7 @@ pub fn strategy_chart(props: &StrategyChartProps) -> Html {
                     .unwrap_or_default()
                     .to_owned()
             });
+            let ordered_bars = without_orphan_bar_fragments(ordered_bars);
             let times = local_times(&ordered_bars, "bar_time");
             let mut plot = Plot::new();
             if !times.is_empty() {
@@ -104,6 +105,10 @@ pub fn strategy_chart(props: &StrategyChartProps) -> Html {
                     .x_axis(
                         Axis::new()
                             .title(Title::with_text("时间（浏览器本地时区）"))
+                            // Trading charts should not reserve horizontal
+                            // space for nights, weekends, or connectivity
+                            // gaps. Each persisted Bar occupies one category.
+                            .type_(AxisType::Category)
                             .range_slider(RangeSlider::new().visible(false)),
                     )
                     .y_axis(Axis::new().title(Title::with_text("价格")))
@@ -161,4 +166,88 @@ fn numbers(rows: &[Value], key: &str) -> Vec<f64> {
     rows.iter()
         .map(|row| row.get(key).and_then(Value::as_f64).unwrap_or(f64::NAN))
         .collect()
+}
+
+/// Old daemon versions could turn the one-off Last snapshot delivered during
+/// a reconnect into an isolated Bar. Hide only runs shorter than three Bars
+/// when a real contiguous run exists; a genuinely new/short data set remains
+/// visible until it has accumulated enough Bars.
+fn without_orphan_bar_fragments(rows: Vec<Value>) -> Vec<Value> {
+    if rows.len() < 3 {
+        return rows;
+    }
+    let interval_seconds = rows
+        .iter()
+        .find_map(|row| row.get("timeframe").and_then(Value::as_str))
+        .and_then(|timeframe| match timeframe {
+            "5s" => Some(5),
+            "1m" => Some(60),
+            _ => None,
+        });
+    let Some(interval_seconds) = interval_seconds else {
+        return rows;
+    };
+    let timestamps = rows
+        .iter()
+        .map(|row| {
+            row.get("bar_time")
+                .and_then(Value::as_str)
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                .map(|time| time.timestamp())
+        })
+        .collect::<Vec<_>>();
+    if timestamps.iter().any(Option::is_none) {
+        return rows;
+    }
+
+    let mut keep = vec![false; rows.len()];
+    let mut run_start = 0;
+    for index in 1..=rows.len() {
+        let run_ended = index == rows.len()
+            || timestamps[index].expect("validated timestamp")
+                - timestamps[index - 1].expect("validated timestamp")
+                > interval_seconds * 2;
+        if run_ended {
+            if index - run_start >= 3 {
+                keep[run_start..index].fill(true);
+            }
+            run_start = index;
+        }
+    }
+    if !keep.iter().any(|keep| *keep) {
+        return rows;
+    }
+    rows.into_iter()
+        .zip(keep)
+        .filter_map(|(row, keep)| keep.then_some(row))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::without_orphan_bar_fragments;
+
+    fn bar(time: &str) -> serde_json::Value {
+        serde_json::json!({"bar_time": time, "timeframe": "5s"})
+    }
+
+    #[test]
+    fn orphan_reconnect_snapshots_are_hidden_when_contiguous_bars_exist() {
+        let bars = vec![
+            bar("2026-08-07T15:44:40Z"),
+            bar("2026-08-07T15:44:45Z"),
+            bar("2026-08-07T15:44:50Z"),
+            bar("2026-08-08T11:39:45Z"),
+            bar("2026-08-08T12:27:10Z"),
+        ];
+        let filtered = without_orphan_bar_fragments(bars);
+        assert_eq!(filtered.len(), 3);
+        assert_eq!(filtered[2]["bar_time"], "2026-08-07T15:44:50Z");
+    }
+
+    #[test]
+    fn a_short_new_data_set_remains_visible() {
+        let bars = vec![bar("2026-08-08T13:00:00Z"), bar("2026-08-08T13:00:05Z")];
+        assert_eq!(without_orphan_bar_fragments(bars).len(), 2);
+    }
 }

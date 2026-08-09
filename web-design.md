@@ -377,13 +377,16 @@ RPC WebSocket URL 可在“RPC 设置”页面修改，并以键
    - signal 时间线；
    - 单腿/组合 execution 配置；
    - enable/disable 确认；
-   - action 和每腿执行状态。
+   - action 和每腿执行状态；
+   - 在交易成本页维护数据库策略风险预算，在策略状态页展示资本/仓位、滚动 24 小时
+     净亏损、连续亏损、交易次数、换手及数据完整性；运行中禁用保存并说明先暂停。
 5. **Performance**
    - 策略选择；
    - 初始资金和 benchmark；
    - 权益/回撤曲线；
-   - 净 PnL、Sharpe、Sortino、胜率和换手率；
-   - 历史快照。
+   - 分开显示已实现净 PnL、未实现 PnL 和完整盯市总 PnL；不完整时显示原因而非回退；
+   - 已实现权益口径的最大回撤、Sharpe、Sortino，以及胜率和换手率；
+   - 历史快照区分旧版仅已实现口径和新版完整盯市口径。
 6. **Backtest**
    - 只选择已保存策略，证券、周期和交易时段由策略配置锁定；
    - 要求历史下载完整覆盖请求范围；
@@ -451,9 +454,9 @@ route 离开时取消前端等待，但 mutation 已送达后仍通过相同 ide
 |---|---|---|
 | Dashboard | `system.*`, `account.*`, `portfolio.positions`, `monitor.*` | `ibkr.connect` |
 | Market Data | `instrument.*`, `market_data.*`, `data.*` | subscribe、unsubscribe、backfill |
-| Download Jobs | `data.jobs`（服务端分页及全局队列摘要） | `data.job.cancel` |
+| Download Jobs | `data.jobs`（服务端分页及全局队列摘要，含行情和 FX） | `data.job.cancel` |
 | Strategies | `strategy.*`, `strategy.execution.*` | create/start/pause/stop/configure/enable |
-| Performance | `performance.*` | 无 |
+| Performance | `performance.report`、`performance.snapshots` | `performance.repair_history`（先对账，再创建 FX 历史任务） |
 | Backtest | `backtest.*`, `execution_cost.*`, `data.coverage` | `backtest.run`、创建下载任务 |
 | Orders | `order.list`, `execution.list`, positions | preview/submit/cancel |
 | Operations | reconcile、backup、FX、calendar、safety | acknowledge/create/set |

@@ -4,5 +4,5 @@
 //! strongly typed configuration and registration now live in independent
 //! workspace crates.
 
-pub use strategy_api::{Strategy, StrategyBar, StrategySignal};
+pub use strategy_api::{Strategy, StrategyBar};
 pub use strategy_catalog_backend::{build, metadata_json, registered_kinds};

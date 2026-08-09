@@ -35,9 +35,9 @@ pub fn backtest_page(props: &BacktestPageProps) -> Html {
     });
     let start = use_state(|| local_datetime_value(-7.0 * 86_400_000.0));
     let end = use_state(|| local_datetime_value(0.0));
-    let quantity = use_state(|| "1".to_owned());
     let initial_cash = use_state(|| "100000".to_owned());
     let seed = use_state(|| "42".to_owned());
+    let cost_gate_mode = use_state(|| "match_strategy".to_owned());
     let busy = use_state(|| false);
     let data_ready = use_state(|| false);
     let list_busy = use_state(|| true);
@@ -71,12 +71,28 @@ pub fn backtest_page(props: &BacktestPageProps) -> Html {
     let instrument = selected_strategy.as_ref().and_then(strategy_instrument);
     let timeframe = selected_strategy
         .as_ref()
-        .map(strategy_timeframe)
-        .unwrap_or_default();
-    let outside_rth = array(&props.execution_configs, "configs")
+        .and_then(|strategy| strategy.get("bar_timeframe"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let minimum_history = selected_strategy
+        .as_ref()
+        .and_then(|strategy| strategy.get("minimum_history"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let is_portfolio = selected_strategy
+        .as_ref()
+        .is_some_and(|strategy| boolean(strategy, "is_portfolio"));
+    let strategy_metadata_ready = !timeframe.is_empty() && minimum_history > 0;
+    let execution_configs = array(&props.execution_configs, "configs");
+    let execution_config = execution_configs
         .iter()
         .find(|config| text(config, "strategy_id") == *strategy_id)
+        .cloned();
+    let outside_rth = execution_config
+        .as_ref()
         .is_some_and(|config| boolean(config, "outside_rth"));
+    let execution_config_ready = execution_config.is_some();
     let cost_control = cost_controls
         .iter()
         .find(|control| text(control, "strategy_id") == *strategy_id);
@@ -86,10 +102,21 @@ pub fn backtest_page(props: &BacktestPageProps) -> Html {
             .iter()
             .find(|model| text(model, "cost_model_id") == model_id)
     });
-    let strategy_currency = selected_strategy
+    // The saved execution contract is the same currency source used by live
+    // order submission. Fall back to the catalog instrument only for a
+    // strategy that has not yet saved an execution configuration.
+    let strategy_currency = execution_config
         .as_ref()
-        .map(|strategy| text(strategy, "currency"))
+        .and_then(|config| config.pointer("/contract/currency"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            selected_strategy
+                .as_ref()
+                .map(|strategy| text(strategy, "currency"))
+        })
         .unwrap_or_default();
+    let initial_cash_label = initial_cash_label(&strategy_currency);
     let cost_currency_matches = cost_model
         .is_some_and(|model| text(model, "currency").eq_ignore_ascii_case(&strategy_currency));
     let cost_model_ready = cost_model.is_some() && cost_currency_matches;
@@ -138,11 +165,14 @@ pub fn backtest_page(props: &BacktestPageProps) -> Html {
         let strategy_id = strategy_id.clone();
         let instrument = instrument.clone();
         let timeframe = timeframe.clone();
+        let minimum_history = minimum_history;
+        let is_portfolio = is_portfolio;
         let outside_rth = outside_rth;
+        let execution_config = execution_config.clone();
         let start = start.clone();
         let end = end.clone();
-        let quantity = quantity.clone();
         let initial_cash = initial_cash.clone();
+        let cost_gate_mode = cost_gate_mode.clone();
         let cost_model_ready = cost_model_ready;
         let seed = seed.clone();
         let busy = busy.clone();
@@ -152,6 +182,20 @@ pub fn backtest_page(props: &BacktestPageProps) -> Html {
         let notice = notice.clone();
         Callback::from(move |event: SubmitEvent| {
             event.prevent_default();
+            if is_portfolio {
+                notice.set(Some(Err(
+                    "策略绑定回测当前只支持单腿执行配置；该策略使用组合执行配置，无法运行回测。"
+                        .into(),
+                )));
+                return;
+            }
+            if timeframe.is_empty() || minimum_history == 0 {
+                notice.set(Some(Err(
+                    "后端没有返回策略实现的 Bar 周期或最少历史 Bar 数；请确认 Web 与后端版本一致后重试。"
+                        .into(),
+                )));
+                return;
+            }
             let Some(contract) = instrument.clone() else {
                 notice.set(Some(Err(
                     "策略绑定的证券资料不完整；请先通过证券搜索或行情订阅保存该合约资料。".into(),
@@ -171,6 +215,13 @@ pub fn backtest_page(props: &BacktestPageProps) -> Html {
                 )));
                 return;
             }
+            let Some(execution_config) = execution_config.as_ref() else {
+                notice.set(Some(Err(
+                    "该策略尚未保存自动执行配置；回测无法确定与实时运行一致的多头目标、空头目标和做空权限。请先在策略执行配置中保存这些参数。"
+                        .into(),
+                )));
+                return;
+            };
             let Some(strategy) = strategies
                 .iter()
                 .find(|strategy| text(strategy, "strategy_id") == *strategy_id)
@@ -185,13 +236,33 @@ pub fn backtest_page(props: &BacktestPageProps) -> Html {
                     .filter(|number| number.is_finite() && *number > 0.0)
                     .ok_or_else(|| format!("{label}必须大于 0"))
             };
-            let quantity_value = match parse_positive(&quantity, "交易数量") {
-                Ok(value) => value,
-                Err(error) => {
-                    notice.set(Some(Err(error)));
-                    return;
-                }
+            let Some(quantity_value) = execution_config
+                .get("target_quantity")
+                .and_then(Value::as_f64)
+                .filter(|value| value.is_finite() && *value > 0.0)
+            else {
+                notice.set(Some(Err(
+                    "策略执行配置中的多头目标仓位无效；请暂停策略并重新保存执行配置。".into(),
+                )));
+                return;
             };
+            let Some(short_target_quantity) = execution_config
+                .get("short_target_quantity")
+                .and_then(Value::as_f64)
+                .filter(|value| value.is_finite() && *value <= 0.0)
+            else {
+                notice.set(Some(Err(
+                    "策略执行配置中的空头目标仓位无效；它必须小于或等于 0。".into(),
+                )));
+                return;
+            };
+            let allow_short = boolean(execution_config, "allow_short");
+            if !allow_short && short_target_quantity < 0.0 {
+                notice.set(Some(Err(
+                    "策略执行配置禁止做空，但空头目标仓位小于 0；请先修正执行配置。".into(),
+                )));
+                return;
+            }
             let cash_value = match parse_positive(&initial_cash, "初始资金") {
                 Ok(value) => value,
                 Err(error) => {
@@ -218,6 +289,7 @@ pub fn backtest_page(props: &BacktestPageProps) -> Html {
             }
             let params = json!({
                 "strategy_id": *strategy_id,
+                "cost_gate_mode": (*cost_gate_mode).clone(),
                 "conid": conid,
                 "timeframe": timeframe.clone(),
                 "outside_rth": outside_rth,
@@ -226,6 +298,8 @@ pub fn backtest_page(props: &BacktestPageProps) -> Html {
                 "strategy_kind": text(strategy, "kind"),
                 "strategy_config": strategy.get("config").cloned().unwrap_or_else(|| json!({})),
                 "quantity": quantity_value,
+                "short_target_quantity": short_target_quantity,
+                "allow_short": allow_short,
                 "initial_cash": cash_value,
                 "seed": seed.parse::<i64>().unwrap_or(0)
             });
@@ -277,7 +351,7 @@ pub fn backtest_page(props: &BacktestPageProps) -> Html {
             <section class="card shadow-sm mb-4"><div class="card-body">
                 <h2 class="h5">{"运行回测"}</h2>
                 <p class="text-secondary">
-                    {"使用本地 Parquet Bar，按收盘信号并在下一根 Bar 开盘成交，避免未来函数。请先确保所选时间范围已有历史数据。"}
+                    {"使用本地 Parquet Bar，按收盘信号并在下一根 Bar 开盘成交，避免未来函数。仓位目标强制使用所选策略已保存的执行配置。"}
                 </p>
                 <form onsubmit={run}>
                     <div class="row g-3">
@@ -314,7 +388,11 @@ pub fn backtest_page(props: &BacktestPageProps) -> Html {
                                     <div>{format!("{} ({}) · {} · Conid {}",
                                         official_security_name(value), text(value, "symbol"),
                                         security_exchange(value), integer(value, "conid"))}</div>
-                                    <div class="small mt-1">{format!("Bar 周期：{}（由策略配置锁定）", timeframe)}</div>
+                                    <div class="small mt-1">{format!(
+                                        "Bar 周期：{}；最少历史：{} 根（由后端策略实现锁定）",
+                                        if timeframe.is_empty() { "—" } else { timeframe.as_str() },
+                                        if minimum_history == 0 { "—".into() } else { minimum_history.to_string() },
+                                    )}</div>
                                     <div class="small mt-1">{format!("下载及回测交易时段：{}", if outside_rth { "含盘前盘后" } else { "常规交易时段" })}</div>
                                 </div>
                             }).unwrap_or_else(|| html! {
@@ -323,6 +401,27 @@ pub fn backtest_page(props: &BacktestPageProps) -> Html {
                                 </div>
                             })}
                         </div>
+                        {if is_portfolio {
+                            html! {
+                                <div class="col-12">
+                                    <div class="alert alert-warning mb-0">
+                                        <div class="fw-semibold">{"当前不能对组合执行策略运行绑定回测"}</div>
+                                        <div class="small mt-1">
+                                            {"当前回测引擎只支持单腿执行配置；组合策略需要逐腿成交、费用和权益计算支持后才能启用。"}
+                                        </div>
+                                    </div>
+                                </div>
+                            }
+                        } else { Html::default() }}
+                        {if !strategy_metadata_ready {
+                            html! {
+                                <div class="col-12">
+                                    <div class="alert alert-danger mb-0">
+                                        {"后端未提供策略实现的 Bar 周期或最少历史 Bar 数。请更新并重启后端，Web 不会自行猜测这些参数。"}
+                                    </div>
+                                </div>
+                            }
+                        } else { Html::default() }}
                         <Field label="开始时间（本地）" value={start.clone()} kind="datetime-local" />
                         <Field label="结束时间（本地）" value={end.clone()} kind="datetime-local" />
                         {if timeframe == "5s" {
@@ -334,32 +433,67 @@ pub fn backtest_page(props: &BacktestPageProps) -> Html {
                                 </div>
                             }
                         } else { Html::default() }}
-                        <BacktestDataPanel
-                            endpoint={props.endpoint.clone()}
-                            strategy_id={(*strategy_id).clone()}
-                            instrument={instrument.clone()}
-                            timeframe={timeframe.clone()}
-                            start={(*start).clone()}
-                            end={(*end).clone()}
-                            outside_rth={outside_rth}
-                            on_ready={{
-                                let data_ready = data_ready.clone();
-                                Callback::from(move |ready| data_ready.set(ready))
+                        {if !is_portfolio && strategy_metadata_ready {
+                            html! {
+                                <BacktestDataPanel
+                                    endpoint={props.endpoint.clone()}
+                                    strategy_id={(*strategy_id).clone()}
+                                    instrument={instrument.clone()}
+                                    timeframe={timeframe.clone()}
+                                    start={(*start).clone()}
+                                    end={(*end).clone()}
+                                    outside_rth={outside_rth}
+                                    on_ready={{
+                                        let data_ready = data_ready.clone();
+                                        Callback::from(move |ready| data_ready.set(ready))
+                                    }}
+                                    on_error={{
+                                        let notice = notice.clone();
+                                        Callback::from(move |error| notice.set(Some(Err(error))))
+                                    }}
+                                />
+                            }
+                        } else { Html::default() }}
+                        <div class="col-12">
+                            {if is_portfolio {
+                                Html::default()
+                            } else {
+                                execution_target_panel(execution_config.as_ref())
                             }}
-                            on_error={{
-                                let notice = notice.clone();
-                                Callback::from(move |error| notice.set(Some(Err(error))))
-                            }}
-                        />
-                        <Field label="每次交易数量" value={quantity.clone()} kind="number" />
-                        <Field label="初始资金" value={initial_cash.clone()} kind="number" />
+                        </div>
+                        <Field label={initial_cash_label} value={initial_cash.clone()} kind="number" />
                         <Field label="随机种子" value={seed.clone()} kind="number" />
                         <div class="col-12">
                             {cost_model_panel(cost_control, cost_model, &strategy_currency, *cost_loading)}
                         </div>
                         <div class="col-12">
+                            <label class="form-label" for="backtest-cost-gate-mode">{"成本门控模拟模式"}</label>
+                            <select
+                                id="backtest-cost-gate-mode"
+                                class="form-select"
+                                value={(*cost_gate_mode).clone()}
+                                onchange={{
+                                    let cost_gate_mode = cost_gate_mode.clone();
+                                    Callback::from(move |event: Event| {
+                                        let input: web_sys::HtmlSelectElement = event.target_unchecked_into();
+                                        cost_gate_mode.set(input.value());
+                                    })
+                                }}
+                            >
+                                <option value="match_strategy">{"按当前策略成本门控模拟（默认）"}</option>
+                                <option value="fees_only">{"仅扣除交易费用，不拦截信号"}</option>
+                            </select>
+                            <div class="form-text">
+                                {if *cost_gate_mode == "match_strategy" {
+                                    "冻结当前策略的安全倍数、佣金/已完成周期毛利润阈值和实时佣金 P90；减仓和平仓仍始终绕过成本门控。"
+                                } else {
+                                    "只计算佣金、税费、点差和滑点，所有策略信号都不会被成本门控过滤。"
+                                }}
+                            </div>
+                        </div>
+                        <div class="col-12">
                             <button class="btn btn-primary" type="submit"
-                                disabled={*busy || *cost_loading || instrument.is_none() || strategy_id.is_empty() || !*data_ready || !cost_model_ready}>
+                                disabled={*busy || *cost_loading || instrument.is_none() || strategy_id.is_empty() || !*data_ready || !cost_model_ready || !execution_config_ready || is_portfolio || !strategy_metadata_ready}>
                                 {if *busy {
                                     html! { <><span class="spinner-border spinner-border-sm me-2" />{"回测运行中…"}</> }
                                 } else { html! { "运行回测" } }}
@@ -474,21 +608,48 @@ fn strategy_instrument(strategy: &Value) -> Option<Value> {
     }))
 }
 
-fn strategy_timeframe(strategy: &Value) -> String {
-    match text(strategy, "kind").as_str() {
-        "moving_average_cross_5s" => "5s".into(),
-        "moving_average_cross_v2" => strategy
-            .pointer("/config/bar_timeframe")
-            .and_then(Value::as_str)
-            .unwrap_or("1m")
-            .to_owned(),
-        _ => "1m".into(),
+fn execution_target_panel(config: Option<&Value>) -> Html {
+    let Some(config) = config else {
+        return html! {
+            <div class="alert alert-danger mb-0">
+                <div class="fw-semibold">{"尚未保存策略执行配置，无法运行回测"}</div>
+                <div class="small mt-1">
+                    {"请先保存该策略的自动执行配置。回测必须与实时运行使用相同的多头目标、空头目标和做空权限，不能在这里临时覆盖。"}
+                </div>
+            </div>
+        };
+    };
+    html! {
+        <div class="card bg-light">
+            <div class="card-body">
+                <div class="fw-semibold mb-1">{"策略执行目标（只读）"}</div>
+                <div class="small text-secondary mb-3">
+                    {"这些值来自已保存的策略执行配置，并随回测参数保存。修改时请先到策略执行配置页面暂停策略并重新保存。"}
+                </div>
+                <div class="row g-3">
+                    <div class="col-12 col-md-4">
+                        <label class="form-label">{"多头目标仓位"}</label>
+                        <input class="form-control" type="number" value={number(config, "target_quantity")} readonly={true} />
+                    </div>
+                    <div class="col-12 col-md-4">
+                        <label class="form-label">{"空头目标仓位"}</label>
+                        <input class="form-control" type="number" value={number(config, "short_target_quantity")} readonly={true} />
+                    </div>
+                    <div class="col-12 col-md-4 d-flex align-items-end">
+                        <div class="form-check mb-2">
+                            <input class="form-check-input" type="checkbox" checked={boolean(config, "allow_short")} disabled={true} />
+                            <label class="form-check-label">{"允许做空"}</label>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
     }
 }
 
 #[derive(Properties, PartialEq)]
 struct FieldProps {
-    label: &'static str,
+    label: String,
     value: UseStateHandle<String>,
     kind: &'static str,
 }
@@ -497,7 +658,7 @@ struct FieldProps {
 fn field(props: &FieldProps) -> Html {
     html! {
         <div class="col-12 col-md-6 col-xl-3">
-            <label class="form-label">{props.label}</label>
+            <label class="form-label">{props.label.clone()}</label>
             <input class="form-control" type={props.kind} value={(*props.value).clone()}
                 step={if props.kind == "number" { "any" } else { "1" }}
                 oninput={{
@@ -589,7 +750,7 @@ fn cost_model_panel(
                         <div class="small text-secondary">{"模型值会随本次回测保存，之后修改费用模型不会改写历史结果。"}</div>
                     </div>
                     <span class={classes!("badge", if boolean(control, "enabled") { "bg-success" } else { "bg-secondary" })}>
-                        {if boolean(control, "enabled") { "实时成本门控已启用" } else { "实时门控关闭，但回测仍计费" }}
+                        {if boolean(control, "enabled") { "策略成本门控已启用" } else { "策略成本门控已停用" }}
                     </span>
                 </div>
                 <div class="row g-2 small">
@@ -606,8 +767,20 @@ fn cost_model_panel(
                         {format!("点差 {} bps；单边滑点 {} bps", number(model, "estimated_spread_bps"), number(model, "estimated_slippage_bps"))}
                     </div>
                 </div>
+                <div class="alert alert-info py-2 mt-3 mb-0">
+                    {"回测始终按此费用模型扣除佣金、税费、点差和滑点。“按当前策略成本门控模拟”还会复现信号强度/往返成本安全门槛，以及路径依赖的佣金/已完成周期毛利润门控。策略风险、账户状态、行情新鲜度、活动订单冲突和交易日历门控不在回测范围内。"}
+                </div>
             </div>
         </div>
+    }
+}
+
+fn initial_cash_label(currency: &str) -> String {
+    let currency = currency.trim().to_ascii_uppercase();
+    if currency.is_empty() {
+        "初始资金（证券币种未知）".into()
+    } else {
+        format!("初始资金（{currency}）")
     }
 }
 
@@ -779,4 +952,20 @@ fn local_datetime_value(offset_ms: f64) -> String {
     (Local::now() + TimeDelta::milliseconds(offset_ms as i64))
         .format("%Y-%m-%dT%H:%M")
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::initial_cash_label;
+
+    #[test]
+    fn initial_cash_label_uses_the_instrument_currency() {
+        assert_eq!(initial_cash_label("usd"), "初始资金（USD）");
+        assert_eq!(initial_cash_label(" HKD "), "初始资金（HKD）");
+    }
+
+    #[test]
+    fn initial_cash_label_does_not_silently_imply_a_currency() {
+        assert_eq!(initial_cash_label(""), "初始资金（证券币种未知）");
+    }
 }

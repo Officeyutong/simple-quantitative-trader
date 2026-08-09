@@ -15,7 +15,7 @@ use std::{
     time::Duration,
 };
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use serde_json::{Value, json};
 use tokio::sync::watch;
@@ -427,8 +427,17 @@ enum BacktestCommand {
         short_window: usize,
         #[arg(long)]
         long_window: usize,
+        /// Target long position for a buy signal. The legacy option name is
+        /// retained for RPC/CLI compatibility.
         #[arg(long, default_value_t = 1.0)]
         quantity: f64,
+        /// Target position for a sell signal. Use a negative value with
+        /// --allow-short to model a short target; zero means flatten.
+        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+        short_target_quantity: f64,
+        /// Permit sell signals to target a negative position.
+        #[arg(long)]
+        allow_short: bool,
         #[arg(long, default_value_t = 100_000.0)]
         initial_cash: f64,
         /// Database fee model used by this ad-hoc backtest.
@@ -454,8 +463,17 @@ enum BacktestCommand {
         kind: String,
         #[arg(long)]
         config_json: String,
+        /// Target long position for a buy signal. The legacy option name is
+        /// retained for RPC/CLI compatibility.
         #[arg(long, default_value_t = 1.0)]
         quantity: f64,
+        /// Target position for a sell signal. Use a negative value with
+        /// --allow-short to model a short target; zero means flatten.
+        #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+        short_target_quantity: f64,
+        /// Permit sell signals to target a negative position.
+        #[arg(long)]
+        allow_short: bool,
         #[arg(long, default_value_t = 100_000.0)]
         initial_cash: f64,
         /// Database fee model used by this ad-hoc backtest.
@@ -1016,6 +1034,8 @@ async fn run() -> Result<()> {
                     short_window,
                     long_window,
                     quantity,
+                    short_target_quantity,
+                    allow_short,
                     initial_cash,
                     cost_model_id,
                     outside_rth,
@@ -1031,6 +1051,8 @@ async fn run() -> Result<()> {
                         "long_window": long_window,
                         "strategy_kind": "moving_average_cross",
                         "quantity": quantity,
+                        "short_target_quantity": short_target_quantity,
+                        "allow_short": allow_short,
                         "initial_cash": initial_cash,
                         "cost_model_id": cost_model_id,
                         "outside_rth": outside_rth,
@@ -1045,6 +1067,8 @@ async fn run() -> Result<()> {
                     kind,
                     config_json,
                     quantity,
+                    short_target_quantity,
+                    allow_short,
                     initial_cash,
                     cost_model_id,
                     outside_rth,
@@ -1059,6 +1083,8 @@ async fn run() -> Result<()> {
                         "strategy_kind": kind,
                         "strategy_config": serde_json::from_str::<Value>(&config_json)?,
                         "quantity": quantity,
+                        "short_target_quantity": short_target_quantity,
+                        "allow_short": allow_short,
                         "initial_cash": initial_cash,
                         "cost_model_id": cost_model_id,
                         "outside_rth": outside_rth,
@@ -1308,6 +1334,11 @@ async fn run_daemon(config: Config) -> Result<()> {
     std::fs::create_dir_all(&config.storage.staging_dir)?;
 
     let storage = Arc::new(Mutex::new(Storage::open(&config.storage.duckdb_path)?));
+    // Serializes strategy target/configuration mutations with the final
+    // authorization-to-broker-acknowledgement interval.  Without this gate a
+    // new Bar could supersede a target after local authorization while the old
+    // order was already being handed to IBKR.
+    let strategy_order_coordination = Arc::new(tokio::sync::Mutex::new(()));
     let schema_version = storage.lock_safe().schema_version()?;
     let started_at = Utc::now();
     let cancellation = CancellationToken::new();
@@ -1476,6 +1507,7 @@ async fn run_daemon(config: Config) -> Result<()> {
         },
     );
     let strategy_storage = storage.clone();
+    let strategy_evaluation_coordination = strategy_order_coordination.clone();
     let strategy_cancellation = cancellation.clone();
     spawn_supervised(
         "strategy-evaluator",
@@ -1488,6 +1520,7 @@ async fn run_daemon(config: Config) -> Result<()> {
                 tokio::select! {
                     _ = strategy_cancellation.cancelled() => break,
                     _ = interval.tick() => {
+                        let _submission_guard = strategy_evaluation_coordination.lock().await;
                         match strategy_storage
                             .lock_safe()
                             .evaluate_running_strategies()
@@ -1510,6 +1543,9 @@ async fn run_daemon(config: Config) -> Result<()> {
     let execution_timeout = Duration::from_secs(config.rpc.request_timeout_seconds);
     let execution_environment = config.app.environment;
     let execution_trading_enabled = config.risk.trading_enabled;
+    let execution_base_currency = config.risk.base_currency.clone();
+    let execution_max_fx_rate_age_seconds = config.risk.max_fx_rate_age_seconds;
+    let execution_max_market_data_age_seconds = config.risk.max_market_data_age_seconds;
     spawn_supervised(
         "strategy-execution-worker",
         cancellation.clone(),
@@ -1521,14 +1557,70 @@ async fn run_daemon(config: Config) -> Result<()> {
                 tokio::select! {
                     _ = execution_cancellation.cancelled() => break,
                     _ = interval.tick() => {
-                        if execution_environment != crate::config::Environment::Paper
-                            || !execution_trading_enabled
-                        {
+                        if execution_environment != crate::config::Environment::Paper {
+                            continue;
+                        }
+                        // A newer strategy signal revokes the old target, but a
+                        // previously acknowledged limit order remains live until
+                        // IBKR cancels it. Process every reconciliation-first
+                        // cancellation candidate before any new strategy action.
+                        // Trying the whole snapshot prevents one broker-side
+                        // cancellation failure from starving unrelated orders.
+                        // Unknown outcomes are not included here and continue to
+                        // block on reconciliation.
+                        let obsolete_orders = execution_storage
+                            .lock_safe()
+                            .revoked_strategy_order_cancellations();
+                        match obsolete_orders {
+                            Ok(candidates) if !candidates.is_empty() => {
+                                for candidate in candidates {
+                                    let result = rpc::call(
+                                        execution_rpc_address,
+                                        "order.cancel",
+                                        json!({"broker_order_id": candidate.broker_order_id}),
+                                        execution_timeout,
+                                    )
+                                    .await;
+                                    match result {
+                                        Ok(_) => tracing::info!(
+                                            strategy_id = %candidate.strategy_id,
+                                            action_id = %candidate.action_id,
+                                            leg_index = candidate.leg_index,
+                                            broker_order_id = candidate.broker_order_id,
+                                            "requested cancellation of an order from an inactive strategy target"
+                                        ),
+                                        Err(error) => tracing::warn!(
+                                            %error,
+                                            strategy_id = %candidate.strategy_id,
+                                            action_id = %candidate.action_id,
+                                            leg_index = candidate.leg_index,
+                                            broker_order_id = candidate.broker_order_id,
+                                            "failed to cancel an order from an inactive strategy target; continuing with the remaining cancellation candidates"
+                                        ),
+                                    }
+                                }
+                                continue;
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                tracing::error!(
+                                    %error,
+                                    "failed to inspect orders from inactive strategy targets; refusing new automatic execution"
+                                );
+                                continue;
+                            }
+                        }
+                        if !execution_trading_enabled {
                             continue;
                         }
                         let action = match execution_storage
                             .lock_safe()
-                            .claim_strategy_action()
+                            .claim_strategy_action_with_risk(
+                                &execution_base_currency,
+                                execution_max_fx_rate_age_seconds,
+                                execution_max_market_data_age_seconds,
+                                Utc::now(),
+                            )
                         {
                             Ok(Some(action)) => action,
                             Ok(None) => continue,
@@ -1552,15 +1644,50 @@ async fn run_daemon(config: Config) -> Result<()> {
                         let mut prepared_legs = Vec::new();
                         let mut preflight_error = None;
                         for leg in &action.legs {
+                            let quote_now = Utc::now();
+                            let market_data = match execution_storage
+                                .lock_safe()
+                                .market_data_health(
+                                    leg.contract.conid,
+                                    execution_max_market_data_age_seconds,
+                                    quote_now,
+                                )
+                            {
+                                Ok(health) => health,
+                                Err(error) => {
+                                    preflight_error = Some(format!(
+                                        "failed to inspect market-data health for {}: {error}",
+                                        leg.contract.symbol
+                                    ));
+                                    break;
+                                }
+                            };
+                            let risk_reducing = leg.is_risk_reducing();
+                            if let Some(detail) = strategy_market_data_rejection(
+                                &leg.contract.symbol,
+                                &market_data,
+                                risk_reducing,
+                            ) {
+                                preflight_error = Some(detail);
+                                break;
+                            }
                             let estimated_price = execution_storage
                                 .lock_safe()
                                 .latest_quote(leg.contract.conid)
                                 .ok()
-                                .and_then(|quote| strategy_execution_price(&quote, &leg.side));
-                            if estimated_price.is_none() {
+                                .and_then(|quote| {
+                                    strategy_execution_price(
+                                        &quote,
+                                        &leg.side,
+                                        quote_now,
+                                        execution_max_market_data_age_seconds,
+                                    )
+                                });
+                            if estimated_price.is_none() && !risk_reducing {
                                 preflight_error = Some(format!(
-                                    "{} requires a fresh live Bid/Ask; delayed market data is \
-                                     never accepted for automatic execution",
+                                    "{} risk-increasing order requires a fresh, side-specific \
+                                     live Bid/Ask; stale or delayed ticks are never used for \
+                                     automatic execution",
                                     leg.contract.symbol
                                 ));
                                 break;
@@ -1635,6 +1762,29 @@ async fn run_daemon(config: Config) -> Result<()> {
                                         &calendar_exchange,
                                         status,
                                     ) {
+                                        if status == Some(false) {
+                                            let not_before = execution_storage
+                                                .lock_safe()
+                                                .next_market_session_open_for(
+                                                    &calendar_exchange,
+                                                    calendar_now,
+                                                    action.outside_rth,
+                                                )
+                                                .ok()
+                                                .flatten()
+                                                .unwrap_or_else(|| {
+                                                    calendar_now + chrono::Duration::minutes(5)
+                                                });
+                                            let _ = execution_storage
+                                                .lock_safe()
+                                                .defer_strategy_action_retry(
+                                                    action.action_id,
+                                                    not_before,
+                                                    &format!(
+                                                        "market is closed; protective retry deferred until {not_before}"
+                                                    ),
+                                                );
+                                        }
                                         preflight_error = Some(detail);
                                         break;
                                     }
@@ -1674,19 +1824,7 @@ async fn run_daemon(config: Config) -> Result<()> {
                         if let Some(cost) = &action.cost_control {
                             let risk_reducing =
                                 action.legs.iter().all(|leg| leg.is_risk_reducing());
-                            if risk_reducing {
-                                let detail = "cost gate bypassed: every execution leg reduces or \
-                                              closes an existing position";
-                                let _ = execution_storage.lock_safe().record_strategy_cost_gate(
-                                    action.action_id,
-                                    "processing",
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                    action.signal_edge_bps,
-                                    detail,
-                                );
-                            } else if action.legs.iter().any(|leg| {
+                            if !risk_reducing && action.legs.iter().any(|leg| {
                                 !leg.contract.currency.eq_ignore_ascii_case(&cost.model.currency)
                             }) {
                                 let detail = format!(
@@ -1716,46 +1854,53 @@ async fn run_daemon(config: Config) -> Result<()> {
                                 }
                                 continue;
                             } else {
-                                let mut notional = 0.0;
-                                let mut round_trip_cost = 0.0;
-                                for (leg, price) in &prepared_legs {
-                                    let leg_notional = leg.quantity * price.unwrap_or(0.0);
-                                    notional += leg_notional;
-                                    round_trip_cost += cost.model.estimated_round_trip_cost(
-                                        leg_notional,
-                                        leg.quantity,
-                                        cost.actual_fee_bps_p90,
-                                    );
-                                }
-                                let required_edge_bps = if notional > 0.0 {
-                                    round_trip_cost / notional * 10_000.0
-                                        * cost.minimum_cost_multiple
-                                } else {
-                                    f64::INFINITY
-                                };
-                                let passed = action
-                                    .signal_edge_bps
-                                    .is_some_and(|edge| edge >= required_edge_bps);
-                                let detail = format!(
-                                    "cost gate {}: signal edge {} bps, required {:.4} bps, \
-                                     estimated round-trip cost {:.4} on notional {:.4}",
-                                    if passed { "passed" } else { "blocked" },
-                                    action
-                                        .signal_edge_bps
-                                        .map(|value| format!("{value:.4}"))
-                                        .unwrap_or_else(|| "unavailable".into()),
-                                    required_edge_bps,
-                                    round_trip_cost,
-                                    notional
+                                let estimates = prepared_legs
+                                    .iter()
+                                    .map(|(leg, price)| crate::storage::CostGateLegEstimate {
+                                        quantity: leg.quantity,
+                                        price: price.unwrap_or(0.0),
+                                    })
+                                    .collect::<Vec<_>>();
+                                let decision = crate::storage::evaluate_transaction_cost_gate(
+                                    &cost.model,
+                                    cost.minimum_cost_multiple,
+                                    cost.actual_fee_bps_p90,
+                                    action.signal_edge_bps,
+                                    risk_reducing,
+                                    &estimates,
                                 );
+                                let passed = !matches!(
+                                    decision.outcome,
+                                    crate::storage::TransactionCostGateOutcome::Blocked
+                                );
+                                let detail = if matches!(
+                                    decision.outcome,
+                                    crate::storage::TransactionCostGateOutcome::BypassedRiskReduction
+                                ) {
+                                    "cost gate bypassed: every execution leg reduces or closes an existing position"
+                                        .to_owned()
+                                } else {
+                                    format!(
+                                        "cost gate {}: signal edge {} bps, required {:.4} bps, \
+                                         estimated round-trip cost {:.4} on notional {:.4}",
+                                        if passed { "passed" } else { "blocked" },
+                                        action
+                                            .signal_edge_bps
+                                            .map(|value| format!("{value:.4}"))
+                                            .unwrap_or_else(|| "unavailable".into()),
+                                        decision.required_edge_bps,
+                                        decision.estimated_round_trip_cost,
+                                        decision.estimated_notional
+                                    )
+                                };
                                 let state = if passed { "processing" } else { "skipped" };
                                 let mut guard = execution_storage.lock_safe();
                                 let _ = guard.record_strategy_cost_gate(
                                     action.action_id,
                                     state,
-                                    notional,
-                                    round_trip_cost,
-                                    required_edge_bps,
+                                    decision.estimated_notional,
+                                    decision.estimated_round_trip_cost,
+                                    decision.required_edge_bps,
                                     action.signal_edge_bps,
                                     &detail,
                                 );
@@ -1778,12 +1923,54 @@ async fn run_daemon(config: Config) -> Result<()> {
                         let mut first_order_intent_id = None;
                         let mut first_broker_order_id = None;
                         let mut batch_error = None;
-                        for (leg, estimated_price) in prepared_legs {
+                        let mut submitted_leg_count = 0usize;
+                        for prepared_index in 0..prepared_legs.len() {
+                            let (leg, estimated_price) = prepared_legs[prepared_index].clone();
+                            if let Err(error) = execution_storage
+                                .lock_safe()
+                                .ensure_strategy_action_leg_submission_authorized(
+                                    action.action_id,
+                                    leg.leg_index,
+                                    &action.account,
+                                    &leg.contract,
+                                )
+                            {
+                                let detail = format!(
+                                    "order was not submitted because its persisted authorization \
+                                     changed after claim: {error}"
+                                );
+                                let mut guard = execution_storage.lock_safe();
+                                for (remaining_leg, _) in
+                                    prepared_legs.iter().skip(prepared_index)
+                                {
+                                    let _ = guard.finish_strategy_action_leg(
+                                        action.action_id,
+                                        remaining_leg.leg_index,
+                                        "skipped",
+                                        None,
+                                        None,
+                                        Some(&detail),
+                                    );
+                                }
+                                // If an earlier portfolio leg already reached
+                                // order.submit, retain the parent as submitted
+                                // and its first intent for reconciliation. With
+                                // no submitted leg this is a clean local skip.
+                                batch_error = Some((
+                                    detail,
+                                    if submitted_leg_count > 0 {
+                                        "submitted"
+                                    } else {
+                                        "skipped"
+                                    },
+                                ));
+                                break;
+                            }
                             let params = json!({
                                 "idempotency_key": leg.idempotency_key,
                                 "account": action.account.clone(),
                                 "contract": leg.contract,
-                                "side": leg.side,
+                                "side": leg.side.clone(),
                                 "quantity": leg.quantity,
                                 "order_type": action.order_type.clone(),
                                 "limit_price": if action.order_type == "limit" {
@@ -1792,7 +1979,17 @@ async fn run_daemon(config: Config) -> Result<()> {
                                     None
                                 },
                                 "outside_rth": action.outside_rth,
-                                "estimated_price": estimated_price
+                                "estimated_price": estimated_price,
+                                "strategy_provenance": {
+                                    "strategy_id": action.strategy_id,
+                                    "action_id": action.action_id,
+                                    "leg_index": leg.leg_index,
+                                    "source_evaluation_id": action.source_evaluation_id,
+                                    "target_quantity": leg.target_quantity,
+                                    "claimed_current_quantity": leg.current_quantity,
+                                    "side": leg.side.clone(),
+                                    "quantity": leg.quantity
+                                }
                             });
                             match rpc::call(
                                 execution_rpc_address,
@@ -1811,6 +2008,7 @@ async fn run_daemon(config: Config) -> Result<()> {
                                         first_order_intent_id.or(order_intent_id);
                                     first_broker_order_id =
                                         first_broker_order_id.or(broker_order_id);
+                                    submitted_leg_count += 1;
                                     let _ = execution_storage
                                         .lock_safe()
                                         .finish_strategy_action_leg(
@@ -1853,6 +2051,25 @@ async fn run_daemon(config: Config) -> Result<()> {
                                             None,
                                             Some(&detail),
                                         );
+                                    if prepared_index + 1 < prepared_legs.len() {
+                                        let remaining_detail = format!(
+                                            "not submitted because an earlier portfolio leg ended \
+                                             in state {state}: {detail}"
+                                        );
+                                        let mut guard = execution_storage.lock_safe();
+                                        for (remaining_leg, _) in
+                                            prepared_legs.iter().skip(prepared_index + 1)
+                                        {
+                                            let _ = guard.finish_strategy_action_leg(
+                                                action.action_id,
+                                                remaining_leg.leg_index,
+                                                "skipped",
+                                                None,
+                                                None,
+                                                Some(&remaining_detail),
+                                            );
+                                        }
+                                    }
                                     batch_error = Some((detail, state));
                                     break;
                                 }
@@ -1994,6 +2211,8 @@ async fn run_daemon(config: Config) -> Result<()> {
                                                 monitor_config.performance_initial_capital,
                                                 &monitor_risk.base_currency,
                                                 monitor_risk.max_fx_rate_age_seconds,
+                                                monitor_risk.max_market_data_age_seconds,
+                                                monitor_risk.max_account_data_age_seconds,
                                                 None,
                                                 Utc::now(),
                                             ) {
@@ -2091,6 +2310,19 @@ async fn run_daemon(config: Config) -> Result<()> {
                             Ok(bars) => {
                                 let result = if bars.is_empty() {
                                     Ok(())
+                                } else if let Some(target) = &job.request.fx_rate_pair {
+                                    job_storage
+                                        .lock_safe()
+                                        .write_historical_fx_bars(target, &bars)
+                                        .map(|written| {
+                                            tracing::info!(
+                                                job_id = %job.job_id,
+                                                base_currency = %target.base_currency,
+                                                quote_currency = %target.quote_currency,
+                                                written,
+                                                "persisted historical IBKR FX rates"
+                                            );
+                                        })
                                 } else {
                                     job_storage
                                         .lock_safe()
@@ -2229,6 +2461,7 @@ async fn run_daemon(config: Config) -> Result<()> {
         status_receiver,
         ibkr,
         storage.clone(),
+        strategy_order_coordination,
         config.risk.clone(),
         config.storage.lake_dir.clone(),
         config.storage.staging_dir.clone(),
@@ -2296,17 +2529,48 @@ fn print_value(value: &Value, force_json: bool) {
     }
 }
 
-fn strategy_execution_price(quote: &Value, side: &str) -> Option<f64> {
-    let types: &[&str] = if side.eq_ignore_ascii_case("buy") {
-        &["Ask", "Bid"]
+fn strategy_execution_price(
+    quote: &Value,
+    side: &str,
+    now: DateTime<Utc>,
+    maximum_age_seconds: u64,
+) -> Option<f64> {
+    let tick_type = if side.eq_ignore_ascii_case("buy") {
+        "Ask"
     } else {
-        &["Bid", "Ask"]
+        "Bid"
     };
-    types.iter().find_map(|tick_type| {
-        quote["ticks"][tick_type]["numeric_value"]
-            .as_f64()
-            .filter(|price| price.is_finite() && *price > 0.0)
-    })
+    let tick = &quote["ticks"][tick_type];
+    let observed_at = tick["observed_at"]
+        .as_str()
+        .and_then(|value| value.parse::<DateTime<Utc>>().ok())?;
+    if (now - observed_at).num_seconds().max(0) > maximum_age_seconds as i64 {
+        return None;
+    }
+    tick["numeric_value"]
+        .as_f64()
+        .filter(|price| price.is_finite() && *price > 0.0)
+}
+
+fn strategy_market_data_rejection(
+    symbol: &str,
+    health: &crate::storage::MarketDataHealth,
+    risk_reducing: bool,
+) -> Option<String> {
+    if health.state == "fresh" || risk_reducing {
+        return None;
+    }
+    let age = health
+        .age_seconds
+        .map(|seconds| format!("{seconds}s"))
+        .unwrap_or_else(|| "unavailable".into());
+    let subscription = health.subscription_state.as_deref().unwrap_or("missing");
+    Some(format!(
+        "{symbol} risk-increasing order skipped locally: market data is {} \
+         (subscription {subscription}, age {age}, maximum {}s); only a strictly \
+         position-reducing order may bypass non-fresh market data",
+        health.state, health.maximum_age_seconds
+    ))
 }
 
 fn strategy_submission_error_state(uncertain: bool) -> &'static str {
@@ -2394,22 +2658,71 @@ mod execution_tests {
     use crate::storage::position_change_is_risk_reducing;
 
     #[test]
-    fn automatic_execution_never_uses_delayed_ticks() {
+    fn automatic_execution_uses_only_fresh_live_ticks() {
+        let now = "2026-08-07T08:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let delayed = json!({
             "ticks": {
-                "DelayedBid": {"numeric_value": 100.0},
-                "DelayedAsk": {"numeric_value": 101.0}
+                "DelayedBid": {"numeric_value": 100.0, "observed_at": now},
+                "DelayedAsk": {"numeric_value": 101.0, "observed_at": now}
             }
         });
-        assert_eq!(strategy_execution_price(&delayed, "buy"), None);
+        assert_eq!(strategy_execution_price(&delayed, "buy", now, 30), None);
         let live = json!({
             "ticks": {
-                "Bid": {"numeric_value": 100.0},
-                "Ask": {"numeric_value": 101.0}
+                "Bid": {"numeric_value": 100.0, "observed_at": now - chrono::Duration::seconds(1)},
+                "Ask": {"numeric_value": 101.0, "observed_at": now - chrono::Duration::seconds(1)}
             }
         });
-        assert_eq!(strategy_execution_price(&live, "buy"), Some(101.0));
-        assert_eq!(strategy_execution_price(&live, "sell"), Some(100.0));
+        assert_eq!(strategy_execution_price(&live, "buy", now, 30), Some(101.0));
+        assert_eq!(
+            strategy_execution_price(&live, "sell", now, 30),
+            Some(100.0)
+        );
+
+        let stale_ask = json!({
+            "ticks": {
+                "Bid": {"numeric_value": 100.0, "observed_at": now - chrono::Duration::seconds(1)},
+                "Ask": {"numeric_value": 101.0, "observed_at": now - chrono::Duration::seconds(31)}
+            }
+        });
+        assert_eq!(
+            strategy_execution_price(&stale_ask, "buy", now, 30),
+            None,
+            "a buy must never substitute Bid for a missing/stale Ask"
+        );
+        let stale = json!({
+            "ticks": {
+                "Bid": {"numeric_value": 100.0, "observed_at": now - chrono::Duration::seconds(31)},
+                "Ask": {"numeric_value": 101.0, "observed_at": now - chrono::Duration::seconds(31)}
+            }
+        });
+        assert_eq!(strategy_execution_price(&stale, "buy", now, 30), None);
+    }
+
+    #[test]
+    fn non_fresh_market_data_only_bypasses_preflight_for_strict_reductions() {
+        let health = crate::storage::MarketDataHealth {
+            state: "stale",
+            conid: 272093,
+            subscription_state: Some("retrying".into()),
+            latest_price: Some(100.0),
+            latest_price_type: Some("Ask".into()),
+            observed_at: None,
+            age_seconds: Some(31),
+            maximum_age_seconds: 30,
+        };
+
+        let rejection = strategy_market_data_rejection("MSFT", &health, false).unwrap();
+        assert!(rejection.contains("MSFT risk-increasing order skipped locally"));
+        assert!(rejection.contains("market data is stale"));
+        assert!(rejection.contains("strictly position-reducing"));
+        assert_eq!(strategy_market_data_rejection("MSFT", &health, true), None);
+
+        let fresh = crate::storage::MarketDataHealth {
+            state: "fresh",
+            ..health
+        };
+        assert_eq!(strategy_market_data_rejection("MSFT", &fresh, false), None);
     }
 
     #[test]

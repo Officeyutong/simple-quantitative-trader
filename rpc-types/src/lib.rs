@@ -52,7 +52,11 @@ pub const ALL_METHODS: &[&str] = &[
     "execution_cost.model.delete",
     "execution_cost.control.configure",
     "execution_cost.control.list",
+    "execution_risk.control.configure",
+    "execution_risk.control.list",
+    "execution_risk.control.reset",
     "performance.report",
+    "performance.repair_history",
     "performance.snapshots",
     "fx.set",
     "fx.list",
@@ -76,6 +80,7 @@ pub const ALL_METHODS: &[&str] = &[
     "order.preview",
     "order.submit",
     "order.cancel",
+    "order.intent.list",
     "order.intent.resolve",
     "order.list",
     "execution.list",
@@ -125,6 +130,23 @@ pub struct InstrumentSearchParams {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CancelOrderParams {
     pub broker_order_id: i32,
+}
+
+/// Persisted strategy provenance carried by the automatic execution worker.
+///
+/// The daemon revalidates this snapshot while holding the same storage lock
+/// that persists the order intent.  Manual orders omit it; strategy-prefixed
+/// idempotency keys are rejected when it is missing.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StrategyOrderProvenance {
+    pub strategy_id: uuid::Uuid,
+    pub action_id: uuid::Uuid,
+    pub leg_index: i32,
+    pub source_evaluation_id: uuid::Uuid,
+    pub target_quantity: f64,
+    pub claimed_current_quantity: f64,
+    pub side: String,
+    pub quantity: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

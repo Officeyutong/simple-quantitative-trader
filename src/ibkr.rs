@@ -7,7 +7,7 @@ use ibapi::Client;
 use ibapi::{
     accounts::{AccountMultiValue, AccountSummaryResult, AccountUpdateMulti, PositionUpdate},
     contracts::Contract,
-    market_data::historical::{BarSize, BarTimestamp, Duration as HistoricalDuration},
+    market_data::historical::{BarSize, BarTimestamp, Duration as HistoricalDuration, WhatToShow},
     subscriptions::{SubscriptionItem, SubscriptionItemStreamExt},
 };
 use serde::{Deserialize, Serialize};
@@ -168,12 +168,15 @@ pub enum BrokerEvent {
         observed_at: DateTime<Utc>,
     },
     Position {
+        subscription_id: uuid::Uuid,
         position: PositionSnapshot,
     },
     PositionSnapshotStarted {
+        subscription_id: uuid::Uuid,
         observed_at: DateTime<Utc>,
     },
     PositionSnapshotCompleted {
+        subscription_id: uuid::Uuid,
         observed_at: DateTime<Utc>,
     },
     /// Confirms that the long-lived IBKR position subscription is still being
@@ -181,7 +184,16 @@ pub enum BrokerEvent {
     /// absence of updates after the initial snapshot must not make an
     /// unchanged portfolio appear stale.
     PositionSubscriptionHeartbeat {
+        subscription_id: uuid::Uuid,
         observed_at: DateTime<Utc>,
+    },
+    /// Invalidates the authoritative position lease when IBKR closes the
+    /// stream or the stream fails. The subscription identifier ensures a
+    /// delayed terminal event cannot invalidate a newer snapshot.
+    PositionSubscriptionEnded {
+        subscription_id: uuid::Uuid,
+        observed_at: DateTime<Utc>,
+        reason: String,
     },
     Pnl {
         account: String,
@@ -219,6 +231,7 @@ pub struct OpenOrderSnapshot {
     pub limit_price: Option<f64>,
     pub status: String,
     pub completed_time: Option<String>,
+    pub completed_status: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -883,14 +896,18 @@ impl Actor {
             ibapi::market_data::TradingHours::Regular
         };
         let duration = historical_duration(&request.timeframe, broker_start, broker_end)?;
-        let data = client
+        let mut builder = client
             .historical_data(&contract, parse_bar_size(&request.timeframe)?)
             .duration(duration)
             .ending(end)
-            .trading_hours(trading_hours)
-            .fetch()
-            .await
-            .map_err(|error| error.to_string())?;
+            .trading_hours(trading_hours);
+        // CASH contracts do not provide a stock-like TRADES series. MIDPOINT
+        // is the auditable IBKR historical source used to convert executions
+        // into the configured performance currency.
+        if request.contract.security_type.eq_ignore_ascii_case("CASH") {
+            builder = builder.what_to_show(WhatToShow::MidPoint);
+        }
+        let data = builder.fetch().await.map_err(|error| error.to_string())?;
         data.bars
             .into_iter()
             .map(|bar| {
@@ -1312,64 +1329,113 @@ fn spawn_position_subscription(
     heartbeat_interval: Duration,
 ) {
     tokio::spawn(async move {
-        let mut subscription = match client.positions().await {
-            Ok(subscription) => subscription,
-            Err(error) => {
-                tracing::error!(%error, "failed to subscribe to IBKR positions");
+        loop {
+            // Mark the lease as synchronizing before awaiting the IBKR request.
+            // Otherwise a failed or hung subscribe call could leave a previous
+            // session's `ready` snapshot trusted indefinitely.
+            let subscription_id = uuid::Uuid::now_v7();
+            let started_at = Utc::now();
+            if events
+                .send(BrokerEvent::PositionSnapshotStarted {
+                    subscription_id,
+                    observed_at: started_at,
+                })
+                .await
+                .is_err()
+            {
                 return;
             }
-        };
-        if events
-            .send(BrokerEvent::PositionSnapshotStarted {
-                observed_at: Utc::now(),
-            })
-            .await
-            .is_err()
-        {
-            return;
-        }
-        let mut snapshot_complete = false;
-        let mut heartbeat = tokio::time::interval(heartbeat_interval);
-        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        // `interval` ticks immediately. Consume that tick so a heartbeat can
-        // never race ahead of the authoritative PositionEnd marker.
-        heartbeat.tick().await;
-        loop {
-            tokio::select! {
-                _ = cancellation.cancelled() => break,
-                _ = heartbeat.tick(), if snapshot_complete => {
-                    if events.send(BrokerEvent::PositionSubscriptionHeartbeat {
-                        observed_at: Utc::now(),
-                    }).await.is_err() {
-                        break;
-                    }
-                }
-                item = subscription.next() => match item {
-                    Some(Ok(SubscriptionItem::Data(PositionUpdate::Position(position)))) => {
-                        if events.send(BrokerEvent::Position {
-                            position: position_snapshot(position),
-                        }).await.is_err() {
-                            break;
-                        }
-                    }
-                    Some(Ok(SubscriptionItem::Data(PositionUpdate::PositionEnd))) => {
-                        tracing::debug!("initial IBKR position snapshot completed");
-                        if events.send(BrokerEvent::PositionSnapshotCompleted {
+            let subscription = tokio::select! {
+                _ = cancellation.cancelled() => return,
+                result = client.positions() => result,
+            };
+            let mut subscription = match subscription {
+                Ok(subscription) => subscription,
+                Err(error) => {
+                    let reason = format!("failed to subscribe to IBKR positions: {error}");
+                    tracing::error!(%error, "failed to subscribe to IBKR positions; retrying");
+                    if events
+                        .send(BrokerEvent::PositionSubscriptionEnded {
+                            subscription_id,
                             observed_at: Utc::now(),
-                        }).await.is_err() {
-                            break;
-                        }
-                        snapshot_complete = true;
+                            reason,
+                        })
+                        .await
+                        .is_err()
+                        || wait_for_subscription_retry(&cancellation).await
+                    {
+                        return;
                     }
-                    Some(Ok(SubscriptionItem::Notice(notice))) => {
-                        tracing::warn!(?notice, "IBKR position subscription notice");
-                    }
-                    Some(Err(error)) => {
-                        tracing::error!(%error, "IBKR position subscription failed");
-                        break;
-                    }
-                    None => break,
+                    continue;
                 }
+            };
+            let mut snapshot_complete = false;
+            let mut heartbeat = tokio::time::interval(heartbeat_interval);
+            heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            // `interval` ticks immediately. Consume that tick so a heartbeat can
+            // never race ahead of the authoritative PositionEnd marker.
+            heartbeat.tick().await;
+            let terminal_reason = loop {
+                tokio::select! {
+                    _ = cancellation.cancelled() => return,
+                    _ = heartbeat.tick(), if snapshot_complete => {
+                        if !client.is_connected() {
+                            break "IBKR client disconnected while the position subscription was active".to_owned();
+                        }
+                        let observed_at = Utc::now();
+                        if events.send(BrokerEvent::PositionSubscriptionHeartbeat {
+                            subscription_id,
+                            observed_at,
+                        }).await.is_err() {
+                            return;
+                        }
+                    }
+                    item = subscription.next() => match item {
+                        Some(Ok(SubscriptionItem::Data(PositionUpdate::Position(position)))) => {
+                            if events.send(BrokerEvent::Position {
+                                subscription_id,
+                                position: position_snapshot(position),
+                            }).await.is_err() {
+                                return;
+                            }
+                        }
+                        Some(Ok(SubscriptionItem::Data(PositionUpdate::PositionEnd))) => {
+                            tracing::debug!("initial IBKR position snapshot completed");
+                            let observed_at = Utc::now();
+                            if events.send(BrokerEvent::PositionSnapshotCompleted {
+                                subscription_id,
+                                observed_at,
+                            }).await.is_err() {
+                                return;
+                            }
+                            snapshot_complete = true;
+                        }
+                        Some(Ok(SubscriptionItem::Notice(notice))) => {
+                            tracing::warn!(?notice, "IBKR position subscription notice");
+                        }
+                        Some(Err(error)) => {
+                            tracing::error!(%error, "IBKR position subscription failed; invalidating the snapshot and retrying");
+                            break format!("IBKR position subscription failed: {error}");
+                        }
+                        None => {
+                            tracing::warn!("IBKR closed the position subscription; invalidating the snapshot and retrying");
+                            break "IBKR closed the position subscription".to_owned();
+                        }
+                    }
+                }
+            };
+            drop(subscription);
+            if events
+                .send(BrokerEvent::PositionSubscriptionEnded {
+                    subscription_id,
+                    observed_at: Utc::now(),
+                    reason: terminal_reason,
+                })
+                .await
+                .is_err()
+                || wait_for_subscription_retry(&cancellation).await
+            {
+                return;
             }
         }
     });
@@ -1875,6 +1941,9 @@ async fn send_market_tick(
 }
 
 fn order_snapshot(data: ibapi::orders::OrderData, completed: bool) -> OpenOrderSnapshot {
+    let completed_time = completed.then_some(data.order_state.completed_time);
+    let completed_status = (!data.order_state.completed_status.trim().is_empty())
+        .then_some(data.order_state.completed_status);
     OpenOrderSnapshot {
         broker_order_id: data.order_id,
         perm_id: data.order.perm_id,
@@ -1887,7 +1956,8 @@ fn order_snapshot(data: ibapi::orders::OrderData, completed: bool) -> OpenOrderS
         order_type: data.order.order_type,
         limit_price: data.order.limit_price,
         status: data.order_state.status.to_string(),
-        completed_time: completed.then_some(data.order_state.completed_time),
+        completed_time,
+        completed_status,
     }
 }
 

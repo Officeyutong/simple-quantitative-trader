@@ -2069,6 +2069,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "moving-average-model",
+ "serde",
  "serde_json",
  "strategy-api",
 ]

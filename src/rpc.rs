@@ -21,11 +21,12 @@ use quant_rpc_types::{
     MonitoringAcknowledgeParams, MonitoringAlertsParams, PaginationParams, PerformanceReportParams,
     PerformanceSnapshotsParams, ResolveOrderIntentParams, SafetyModeParams, SafetyNoteParams,
     StrategyCreateParams, StrategyDeleteParams, StrategyExecutionActionsParams,
-    StrategyExecutionToggleParams, StrategyIdParams, StrategyRenameParams, StrategySignalsParams,
+    StrategyExecutionToggleParams, StrategyIdParams, StrategyOrderProvenance, StrategyRenameParams,
+    StrategySignalsParams,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::watch;
+use tokio::sync::{Mutex as AsyncMutex, watch};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceBuilder;
 use tower_http::validate_request::{ValidateRequest, ValidateRequestHeaderLayer};
@@ -95,6 +96,8 @@ struct OrderParams {
     #[serde(flatten)]
     order: ibkr::BrokerOrderRequest,
     estimated_price: Option<f64>,
+    #[serde(default)]
+    strategy_provenance: Option<StrategyOrderProvenance>,
 }
 
 #[derive(Clone)]
@@ -103,6 +106,7 @@ pub struct RpcServer {
     status: watch::Receiver<SystemStatus>,
     ibkr: ibkr::Handle,
     storage: Arc<Mutex<Storage>>,
+    strategy_order_coordination: Arc<AsyncMutex<()>>,
     risk_config: RiskConfig,
     lake_dir: std::path::PathBuf,
     staging_dir: std::path::PathBuf,
@@ -145,6 +149,7 @@ impl RpcServer {
         status: watch::Receiver<SystemStatus>,
         ibkr: ibkr::Handle,
         storage: Arc<Mutex<Storage>>,
+        strategy_order_coordination: Arc<AsyncMutex<()>>,
         risk_config: RiskConfig,
         lake_dir: std::path::PathBuf,
         staging_dir: std::path::PathBuf,
@@ -156,6 +161,7 @@ impl RpcServer {
             status,
             ibkr,
             storage,
+            strategy_order_coordination,
             risk_config,
             lake_dir,
             staging_dir,
@@ -212,6 +218,7 @@ impl RpcServer {
                                 &context.status,
                                 &context.ibkr,
                                 &context.storage,
+                                &context.strategy_order_coordination,
                                 &context.risk_config,
                                 &context.lake_dir,
                                 &context.staging_dir,
@@ -255,11 +262,32 @@ impl RpcServer {
     }
 }
 
+fn strategy_order_coordination_required(method: &str) -> bool {
+    matches!(
+        method,
+        "order.submit"
+            | "strategy.start"
+            | "strategy.pause"
+            | "strategy.stop"
+            | "strategy.delete"
+            | "strategy.execution.configure"
+            | "strategy.execution.configure_portfolio"
+            | "strategy.execution.enable"
+            | "strategy.execution.disable"
+            | "execution_cost.model.upsert"
+            | "execution_cost.model.delete"
+            | "execution_cost.control.configure"
+            | "execution_risk.control.configure"
+            | "execution_risk.control.reset"
+    )
+}
+
 async fn dispatch(
     request: Request,
     status: &watch::Receiver<SystemStatus>,
     ibkr: &ibkr::Handle,
     storage: &Arc<Mutex<Storage>>,
+    strategy_order_coordination: &Arc<AsyncMutex<()>>,
     risk_config: &RiskConfig,
     lake_dir: &Path,
     staging_dir: &Path,
@@ -269,6 +297,17 @@ async fn dispatch(
     if request.jsonrpc != "2.0" {
         return failure(request.id, -32600, "jsonrpc must be \"2.0\"");
     }
+
+    // A strategy order becomes externally irreversible when it is handed to
+    // IBKR.  Serialize that hand-off with every operation that can invalidate
+    // its persisted target or execution semantics.  The strategy evaluator
+    // uses this same gate, so a newer signal cannot supersede the target after
+    // final local authorization but before the broker acknowledges the order.
+    let _strategy_order_guard = if strategy_order_coordination_required(&request.method) {
+        Some(strategy_order_coordination.lock().await)
+    } else {
+        None
+    };
 
     match request.method.as_str() {
         "system.status" => {
@@ -424,6 +463,7 @@ async fn dispatch(
                 start: params.start,
                 end: params.end,
                 outside_rth: params.outside_rth,
+                fx_rate_pair: None,
             };
             match storage.lock_safe().create_backfill_job(&job) {
                 Ok(created) => success(
@@ -777,7 +817,12 @@ async fn dispatch(
                     "automatic strategy execution is supported only in paper environment",
                 );
             }
-            match storage.lock_safe().configure_strategy_execution(&params) {
+            match storage
+                .lock_safe()
+                .configure_strategy_execution_with_capital_currency(
+                    &params,
+                    &risk_config.base_currency,
+                ) {
                 Ok(()) => success(
                     request.id,
                     json!({"strategy_id": params.strategy_id, "enabled": false}),
@@ -804,8 +849,10 @@ async fn dispatch(
             }
             match storage
                 .lock_safe()
-                .configure_strategy_portfolio_execution(&params)
-            {
+                .configure_strategy_portfolio_execution_with_capital_currency(
+                    &params,
+                    &risk_config.base_currency,
+                ) {
                 Ok(()) => success(
                     request.id,
                     json!({
@@ -843,8 +890,11 @@ async fn dispatch(
             }
             match storage
                 .lock_safe()
-                .set_strategy_execution_enabled(params.strategy_id, enabled)
-            {
+                .set_strategy_execution_enabled_with_capital_currency(
+                    params.strategy_id,
+                    enabled,
+                    &risk_config.base_currency,
+                ) {
                 Ok(true) => success(
                     request.id,
                     json!({"strategy_id": params.strategy_id, "enabled": enabled}),
@@ -939,6 +989,117 @@ async fn dispatch(
             Ok(controls) => success(request.id, json!({"controls": controls})),
             Err(error) => failure(request.id, -32030, &error.to_string()),
         },
+        "execution_risk.control.configure" => {
+            let mut params = match serde_json::from_value::<crate::storage::StrategyRiskControlInput>(
+                request.params,
+            ) {
+                Ok(params) => params,
+                Err(error) => {
+                    return failure(request.id, -32602, &format!("invalid parameters: {error}"));
+                }
+            };
+            // RPC v2 clients created before schema 34 did not send this field.
+            // Saving is an explicit operator action, so binding that submitted
+            // amount to the daemon's current validated base currency is both
+            // backward compatible and unambiguous.
+            if params
+                .capital_currency
+                .as_deref()
+                .is_none_or(|currency| currency.trim().is_empty())
+            {
+                params.capital_currency = Some(risk_config.base_currency.clone());
+            }
+            if !params.capital_currency.as_deref().is_some_and(|currency| {
+                currency
+                    .trim()
+                    .eq_ignore_ascii_case(risk_config.base_currency.trim())
+            }) {
+                return failure(
+                    request.id,
+                    -32602,
+                    "capital_currency must match the daemon risk.base_currency; reload the page before saving",
+                );
+            }
+            match storage.lock_safe().configure_strategy_risk_control(&params) {
+                Ok(()) => success(request.id, json!({"strategy_id": params.strategy_id})),
+                Err(error) => failure(request.id, -32030, &error.to_string()),
+            }
+        }
+        "execution_risk.control.list" => match storage.lock_safe().list_strategy_risk_controls(
+            &risk_config.base_currency,
+            risk_config.max_fx_rate_age_seconds,
+            Utc::now(),
+        ) {
+            Ok(controls) => success(
+                request.id,
+                json!({
+                    "controls": controls,
+                    "base_currency": risk_config.base_currency.to_ascii_uppercase()
+                }),
+            ),
+            Err(error) => failure(request.id, -32030, &error.to_string()),
+        },
+        "execution_risk.control.reset" => {
+            let params = match serde_json::from_value::<crate::storage::StrategyRiskResetInput>(
+                request.params,
+            ) {
+                Ok(params) if params.confirm && !params.note.trim().is_empty() => params,
+                Ok(_) => {
+                    return failure(
+                        request.id,
+                        -32602,
+                        "reset requires confirm=true and a non-empty note",
+                    );
+                }
+                Err(error) => {
+                    return failure(request.id, -32602, &format!("invalid parameters: {error}"));
+                }
+            };
+            match storage.lock_safe().reset_strategy_risk_statistics(&params) {
+                Ok(true) => success(request.id, json!({"strategy_id": params.strategy_id})),
+                Ok(false) => failure(request.id, -32044, "strategy risk control not found"),
+                Err(error) => failure(request.id, -32030, &error.to_string()),
+            }
+        }
+        "performance.repair_history" => {
+            let params = match serde_json::from_value::<StrategyIdParams>(request.params) {
+                Ok(params) => params,
+                Err(error) => {
+                    return failure(request.id, -32602, &format!("invalid parameters: {error}"));
+                }
+            };
+            // Reconciliation is the only authoritative API repair for missing
+            // execution rows. A failure does not prevent the independent FX
+            // repair from being queued, and is returned explicitly for review.
+            let (reconciliation, reconciliation_error) = match ibkr.reconcile().await {
+                Ok(snapshot) => match storage.lock_safe().reconcile(&snapshot) {
+                    Ok(report) => (serde_json::to_value(report).ok(), None),
+                    Err(error) => (None, Some(error.to_string())),
+                },
+                Err(error) => (None, Some(error)),
+            };
+            match storage.lock_safe().create_strategy_historical_fx_jobs(
+                params.strategy_id,
+                &risk_config.base_currency,
+                risk_config.max_fx_rate_age_seconds,
+            ) {
+                Ok((gaps, jobs)) => success(
+                    request.id,
+                    json!({
+                        "strategy_id": params.strategy_id,
+                        "reconciliation": reconciliation,
+                        "reconciliation_error": reconciliation_error,
+                        "fx_gaps": gaps,
+                        "jobs": jobs.into_iter().map(|job| json!({
+                            "job_id": job.job_id,
+                            "reused": job.reused,
+                            "range_expanded": job.range_expanded,
+                        })).collect::<Vec<_>>()
+                    }),
+                ),
+                Err(error) => failure(request.id, -32030, &error.to_string()),
+            }
+        }
         "performance.report" => {
             let params = match serde_json::from_value::<PerformanceReportParams>(request.params) {
                 Ok(params) => params,
@@ -951,6 +1112,8 @@ async fn dispatch(
                 params.initial_capital,
                 &risk_config.base_currency,
                 risk_config.max_fx_rate_age_seconds,
+                risk_config.max_market_data_age_seconds,
+                risk_config.max_account_data_age_seconds,
                 params.benchmark_conid,
                 Utc::now(),
             ) {
@@ -1258,6 +1421,16 @@ async fn dispatch(
                     return failure(request.id, -32602, &format!("invalid parameters: {error}"));
                 }
             };
+            if submit
+                && params.idempotency_key.starts_with("strategy:")
+                && params.strategy_provenance.is_none()
+            {
+                return failure(
+                    request.id,
+                    -32602,
+                    "automatic strategy orders require persisted action provenance",
+                );
+            }
             let ibkr_status = ibkr.status();
             let account_managed = ibkr
                 .managed_accounts()
@@ -1271,6 +1444,19 @@ async fn dispatch(
             // and is released before the broker call below.
             let (decision, portfolio_risk, intent_id) = {
                 let mut guard = storage.lock_safe();
+                if let Some(provenance) = &params.strategy_provenance
+                    && let Err(error) = guard.ensure_strategy_order_submission_authorized(
+                        provenance,
+                        &params.idempotency_key,
+                        &params.account,
+                        &params.order,
+                    )
+                {
+                    // This failure deliberately does not create an order intent:
+                    // the persisted desired target remains active and the next
+                    // worker pass will recompute a safe delta from fresh state.
+                    return failure(request.id, -32027, &error.to_string());
+                }
                 let trading_control = match guard.trading_control() {
                     Ok(control) => control,
                     Err(error) => return failure(request.id, -32030, &error.to_string()),
@@ -1286,6 +1472,8 @@ async fn dispatch(
                         &params.order.side,
                         params.order.quantity,
                         connected_at,
+                        risk_config.max_account_data_age_seconds,
+                        Utc::now(),
                     ) {
                         Ok(close_only) => Some(close_only),
                         Err(error) => return failure(request.id, -32030, &error.to_string()),
@@ -1312,16 +1500,29 @@ async fn dispatch(
                     risk_config.max_fx_rate_age_seconds,
                     Utc::now(),
                 ) {
-                    Ok(rate) => rate.or_else(|| close_only_allowed.then_some(1.0)),
+                    // A strict reduction may proceed without FX, but the
+                    // audit must not invent a 1:1 conversion rate merely to
+                    // satisfy an opening-risk calculation.
+                    Ok(rate) => rate,
                     Err(error) => return failure(request.id, -32030, &error.to_string()),
                 };
-                let decision = crate::risk::evaluate(
-                    risk_config,
-                    &params.order,
-                    effective_estimated_price,
-                    fx_rate,
-                    submit,
-                );
+                let decision = if close_only_allowed {
+                    crate::risk::allow_position_reduction(
+                        risk_config,
+                        &params.order,
+                        effective_estimated_price,
+                        fx_rate,
+                        submit,
+                    )
+                } else {
+                    crate::risk::evaluate(
+                        risk_config,
+                        &params.order,
+                        effective_estimated_price,
+                        fx_rate,
+                        submit,
+                    )
+                };
                 let reconciliation_allowed =
                     health.state == "healthy" || (health.state == "degraded" && close_only_allowed);
                 let market_data_allowed = market_data.state == "fresh" || close_only_allowed;
@@ -1415,6 +1616,15 @@ async fn dispatch(
                         Some(detail.as_str()),
                     ) {
                         Ok(id) => {
+                            if let Some(provenance) = &params.strategy_provenance
+                                && let Err(error) = guard.bind_strategy_action_leg_order_intent(
+                                    provenance.action_id,
+                                    provenance.leg_index,
+                                    id,
+                                )
+                            {
+                                return failure(request.id, -32030, &error.to_string());
+                            }
                             if let Err(error) =
                                 guard.record_risk_decision(id, "reject", reason_code, &detail)
                             {
@@ -1443,6 +1653,15 @@ async fn dispatch(
                             }),
                     ) {
                         Ok(id) => {
+                            if let Some(provenance) = &params.strategy_provenance
+                                && let Err(error) = guard.bind_strategy_action_leg_order_intent(
+                                    provenance.action_id,
+                                    provenance.leg_index,
+                                    id,
+                                )
+                            {
+                                return failure(request.id, -32030, &error.to_string());
+                            }
                             if let Err(error) = guard.record_risk_decision(
                                 id,
                                 if decision.allowed { "allow" } else { "reject" },
@@ -1701,7 +1920,7 @@ async fn dispatch(
                 Err(error) => failure(request.id, -32030, &error.to_string()),
             }
         }
-        "order.list" | "execution.list" => {
+        "order.intent.list" | "order.list" | "execution.list" => {
             let params = match serde_json::from_value::<PaginationParams>(request.params) {
                 Ok(params) => params,
                 Err(error) => {
@@ -1710,7 +1929,18 @@ async fn dispatch(
             };
             let page = params.page.max(1);
             let page_size = params.limit.unwrap_or(params.page_size).clamp(1, 500);
-            if request.method == "order.list" {
+            if request.method == "order.intent.list" {
+                match storage
+                    .lock_safe()
+                    .list_unknown_order_intents_page(page, page_size)
+                {
+                    Ok((intents, total_items)) => success(
+                        request.id,
+                        paginated("intents", intents, page, page_size, total_items),
+                    ),
+                    Err(error) => failure(request.id, -32030, &error.to_string()),
+                }
+            } else if request.method == "order.list" {
                 match storage.lock_safe().list_orders_page(page, page_size) {
                     Ok((orders, total_items)) => success(
                         request.id,
@@ -1872,6 +2102,7 @@ mod tests {
         let storage = Arc::new(Mutex::new(
             Storage::open(&directory.path().join("rpc.duckdb")).unwrap(),
         ));
+        let strategy_order_coordination = Arc::new(AsyncMutex::new(()));
         let response = dispatch(
             Request {
                 jsonrpc: "2.0".into(),
@@ -1882,6 +2113,7 @@ mod tests {
             &receiver,
             &ibkr,
             &storage,
+            &strategy_order_coordination,
             &RiskConfig::default(),
             directory.path(),
             directory.path(),
@@ -1917,6 +2149,7 @@ mod tests {
             receiver,
             ibkr,
             storage,
+            Arc::new(AsyncMutex::new(())),
             RiskConfig::default(),
             directory.path().into(),
             directory.path().into(),
@@ -1948,6 +2181,30 @@ mod tests {
         );
         cancellation.cancel();
         assert!(task.await.unwrap().is_ok());
+    }
+
+    #[test]
+    fn strategy_order_coordination_covers_target_and_execution_mutations() {
+        for method in [
+            "order.submit",
+            "strategy.start",
+            "strategy.pause",
+            "strategy.stop",
+            "strategy.execution.configure",
+            "strategy.execution.configure_portfolio",
+            "strategy.execution.enable",
+            "strategy.execution.disable",
+            "execution_cost.model.upsert",
+            "execution_cost.control.configure",
+            "execution_risk.control.configure",
+        ] {
+            assert!(
+                strategy_order_coordination_required(method),
+                "{method} must serialize with broker submission"
+            );
+        }
+        assert!(!strategy_order_coordination_required("strategy.list"));
+        assert!(!strategy_order_coordination_required("order.preview"));
     }
 
     #[test]

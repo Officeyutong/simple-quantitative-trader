@@ -9,6 +9,7 @@ use super::{
     cancel_order_button::CancelOrderButton,
     error_modal::ErrorModal,
     pagination::{Pagination, load_saved_page, save_page},
+    resolve_order_intent_button::ResolveOrderIntentButton,
     value::{
         array, integer, local_time, number, official_security_name, security_exchange, short_id,
         text,
@@ -22,6 +23,10 @@ pub struct OrdersPageProps {
 
 #[function_component(OrdersPage)]
 pub fn orders_page(props: &OrdersPageProps) -> Html {
+    let unknown_intents = use_state(Vec::<Value>::new);
+    let intent_page = use_state(|| load_saved_page("quant-trader.order-intents-page"));
+    let intent_total_pages = use_state(|| 1_usize);
+    let intent_total_items = use_state(|| 0_usize);
     let orders = use_state(Vec::<Value>::new);
     let order_page = use_state(|| load_saved_page("quant-trader.orders-page"));
     let order_total_pages = use_state(|| 1_usize);
@@ -31,6 +36,39 @@ pub fn orders_page(props: &OrdersPageProps) -> Html {
     let execution_total_pages = use_state(|| 1_usize);
     let execution_total_items = use_state(|| 0_usize);
     let error = use_state(|| None::<String>);
+    {
+        let endpoint = props.endpoint.clone();
+        let page = *intent_page;
+        let rows = unknown_intents.clone();
+        let pages = intent_total_pages.clone();
+        let items = intent_total_items.clone();
+        let error = error.clone();
+        use_effect_with((endpoint.clone(), page), move |_| {
+            load_page(
+                endpoint.clone(),
+                "order.intent.list",
+                "intents",
+                page,
+                rows.clone(),
+                pages.clone(),
+                items.clone(),
+                error.clone(),
+            );
+            let interval = Interval::new(5_000, move || {
+                load_page(
+                    endpoint.clone(),
+                    "order.intent.list",
+                    "intents",
+                    page,
+                    rows.clone(),
+                    pages.clone(),
+                    items.clone(),
+                    error.clone(),
+                )
+            });
+            move || drop(interval)
+        });
+    }
     {
         let endpoint = props.endpoint.clone();
         let page = *order_page;
@@ -103,6 +141,73 @@ pub fn orders_page(props: &OrdersPageProps) -> Html {
                 let error = error.clone();
                 Callback::from(move |_| error.set(None))
             }} />
+            {if *intent_total_items > 0 {
+                html! {
+                    <section class="mb-4">
+                        <h2 class="h5">{"待人工核查的订单意图"}</h2>
+                        <div class="alert alert-warning mb-2">
+                            {"这些订单已发送或可能已发送给 IBKR，但系统没有获得确定结果。它们会阻止同一证券继续自动交易。请先核查 IBKR，再人工解决。"}
+                        </div>
+                        <div class="card shadow-sm table-responsive">
+                            <Pagination page={*intent_page} total_pages={*intent_total_pages}
+                                total_items={*intent_total_items} on_page={{
+                                    let page = intent_page.clone();
+                                    Callback::from(move |next| {
+                                        save_page("quant-trader.order-intents-page", next);
+                                        page.set(next);
+                                    })
+                                }} />
+                            <table class="table table-hover align-middle mb-0">
+                                <thead><tr>
+                                    <th>{"创建时间（本地）"}</th><th>{"Intent ID"}</th>
+                                    <th>{"账户"}</th><th>{"证券及交易所"}</th><th>{"方向"}</th>
+                                    <th class="text-end">{"数量"}</th><th>{"进入 unknown 的原因"}</th>
+                                    <th>{"操作"}</th>
+                                </tr></thead>
+                                <tbody>{unknown_intents.iter().map(|row| {
+                                    let intent_id = text(row, "order_intent_id");
+                                    let symbol = text(row, "symbol");
+                                    html! { <tr>
+                                        <td class="text-nowrap">{local_time(row, "created_at")}</td>
+                                        <td title={intent_id.clone()}><code>{short_id(row, "order_intent_id")}</code></td>
+                                        <td>{text(row, "account_id")}</td>
+                                        <td>
+                                            <div class="fw-semibold">{official_security_name(row)}</div>
+                                            <div class="small text-secondary">
+                                                {format!("{} · Conid {}", security_exchange(row), integer(row, "conid"))}
+                                            </div>
+                                        </td>
+                                        <td>{text(row, "side")}</td>
+                                        <td class="text-end">{number(row, "quantity")}</td>
+                                        <td class="text-break">{text(row, "reason")}</td>
+                                        <td>
+                                            <ResolveOrderIntentButton endpoint={props.endpoint.clone()}
+                                                order_intent_id={intent_id}
+                                                symbol={symbol}
+                                                on_resolved={{
+                                                    let endpoint = props.endpoint.clone();
+                                                    let page = *intent_page;
+                                                    let rows = unknown_intents.clone();
+                                                    let pages = intent_total_pages.clone();
+                                                    let items = intent_total_items.clone();
+                                                    let error = error.clone();
+                                                    Callback::from(move |_| load_page(
+                                                        endpoint.clone(), "order.intent.list", "intents", page,
+                                                        rows.clone(), pages.clone(), items.clone(), error.clone()
+                                                    ))
+                                                }}
+                                                on_error={{
+                                                    let error = error.clone();
+                                                    Callback::from(move |message| error.set(Some(message)))
+                                                }} />
+                                        </td>
+                                    </tr> }
+                                }).collect::<Html>()}</tbody>
+                            </table>
+                        </div>
+                    </section>
+                }
+            } else { Html::default() }}
             <section class="mb-4">
                 <h2 class="h5">{"订单"}</h2>
                 <div class="card shadow-sm table-responsive">

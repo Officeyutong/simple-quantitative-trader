@@ -86,6 +86,34 @@ pub fn evaluate(
     }
 }
 
+/// Strictly position-reducing orders have already been proven by the
+/// authoritative position snapshot.  They must remain executable when an
+/// opening-risk input (price, FX, account PnL, or a configured exposure cap)
+/// is unavailable; otherwise a safety control can trap an existing position.
+pub fn allow_position_reduction(
+    config: &RiskConfig,
+    request: &BrokerOrderRequest,
+    estimated_price: Option<f64>,
+    fx_rate_to_base: Option<f64>,
+    require_trading_enabled: bool,
+) -> Decision {
+    let price = request.limit_price.or(estimated_price).unwrap_or(0.0);
+    let rate = fx_rate_to_base.unwrap_or(0.0);
+    if require_trading_enabled && !config.trading_enabled {
+        return reject(
+            "TRADING_DISABLED",
+            "trading is disabled by configuration",
+            request.quantity * price * rate,
+        );
+    }
+    Decision {
+        allowed: true,
+        reason_code: "CLOSE_ONLY_ALLOWED",
+        detail: "strictly position-reducing order bypassed opening-risk inputs".into(),
+        estimated_notional: request.quantity * price * rate,
+    }
+}
+
 fn reject(reason_code: &'static str, detail: impl Into<String>, notional: f64) -> Decision {
     Decision {
         allowed: false,
@@ -123,5 +151,38 @@ mod tests {
         let decision = evaluate(&RiskConfig::default(), &request, None, Some(1.0), false);
         assert!(!decision.allowed);
         assert_eq!(decision.reason_code, "MAX_ORDER_NOTIONAL");
+    }
+
+    #[test]
+    fn position_reduction_remains_allowed_without_price_or_fx() {
+        let request = BrokerOrderRequest {
+            contract: ContractCandidate {
+                conid: 1,
+                symbol: "TEST".into(),
+                security_type: "STK".into(),
+                currency: "USD".into(),
+                exchange: "SMART".into(),
+                primary_exchange: String::new(),
+                local_symbol: "TEST".into(),
+                description: String::new(),
+                derivative_security_types: vec![],
+            },
+            side: "sell".into(),
+            quantity: 100.0,
+            order_type: "market".into(),
+            limit_price: None,
+            outside_rth: false,
+        };
+
+        let decision =
+            allow_position_reduction(&RiskConfig::default(), &request, None, None, false);
+        assert!(decision.allowed);
+        assert_eq!(decision.reason_code, "CLOSE_ONLY_ALLOWED");
+
+        let mut disabled = RiskConfig::default();
+        disabled.trading_enabled = false;
+        let decision = allow_position_reduction(&disabled, &request, None, None, true);
+        assert!(!decision.allowed);
+        assert_eq!(decision.reason_code, "TRADING_DISABLED");
     }
 }

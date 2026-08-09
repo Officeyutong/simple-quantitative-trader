@@ -376,7 +376,11 @@ impl Config {
                 "IBKR timeout and reconnect limits must be greater than zero".into(),
             ));
         }
-        if self.risk.base_currency.trim().len() != 3
+        let base_currency = self.risk.base_currency.trim();
+        if base_currency.len() != 3
+            || !base_currency
+                .chars()
+                .all(|character| character.is_ascii_alphabetic())
             || self.risk.fx_rate_refresh_seconds == 0
             || self.risk.max_fx_rate_age_seconds == 0
             || self.monitoring.interval_seconds == 0
@@ -486,5 +490,18 @@ mod tests {
 
         config.risk.fx_rate_refresh_seconds = config.risk.max_fx_rate_age_seconds - 1;
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn base_currency_must_be_a_three_letter_alphabetic_code() {
+        let mut config = Config::default();
+        config.risk.base_currency = "HKD".into();
+        assert!(config.validate().is_ok());
+
+        config.risk.base_currency = "123".into();
+        assert!(config.validate().is_err());
+
+        config.risk.base_currency = "US$".into();
+        assert!(config.validate().is_err());
     }
 }

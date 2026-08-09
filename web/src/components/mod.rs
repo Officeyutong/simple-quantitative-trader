@@ -25,6 +25,7 @@ mod paper_validation_page;
 mod performance_page;
 mod positions_table;
 mod rename_strategy_button;
+mod resolve_order_intent_button;
 mod rpc_tools_page;
 mod settings_page;
 mod strategies_page;

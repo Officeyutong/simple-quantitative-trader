@@ -208,6 +208,7 @@ fn is_mutation(method: &str) -> bool {
             | "strategy.signals"
             | "strategy.execution.list"
             | "strategy.execution.actions"
+            | "execution_risk.control.list"
             | "performance.report"
             | "performance.snapshots"
             | "fx.list"
@@ -220,6 +221,7 @@ fn is_mutation(method: &str) -> bool {
             | "backtest.get"
             | "backup.list"
             | "order.preview"
+            | "order.intent.list"
             | "order.list"
             | "execution.list"
             | "reconcile.status"
@@ -271,9 +273,23 @@ fn parameter_template(method: &str) -> Value {
             json!({"strategy_id": "", "confirm": true})
         }
         "strategy.execution.actions" => json!({"page": 1, "page_size": 25}),
+        "execution_risk.control.configure" => json!({
+            "strategy_id": "",
+            "enabled": true,
+            "strategy_capital": 100000.0,
+            "maximum_position_capital_ratio": 1.0,
+            "maximum_rolling_24h_realized_net_loss_ratio": 0.02,
+            "maximum_consecutive_net_losing_trades": 3,
+            "maximum_rolling_24h_completed_trades": 10,
+            "maximum_rolling_24h_turnover_capital_ratio": 10.0
+        }),
+        "execution_risk.control.reset" => json!({
+            "strategy_id": "", "confirm": true, "note": "reviewed and reset"
+        }),
         "performance.report" => {
             json!({"strategy_id": "", "initial_capital": 100000.0, "benchmark_conid": null})
         }
+        "performance.repair_history" => json!({"strategy_id": ""}),
         "performance.snapshots" => json!({"strategy_id": "", "limit": 100}),
         "fx.set" => json!({
             "base_currency": "EUR", "quote_currency": "USD", "rate": 1.0,
@@ -300,7 +316,10 @@ fn parameter_template(method: &str) -> Value {
             "start": "2026-01-01T00:00:00Z", "end": "2026-01-02T00:00:00Z",
             "strategy_kind": "paper_round_trip",
             "strategy_config": {"conid": 0, "phase_bars": 1},
-            "quantity": 1.0, "initial_cash": 100000.0,
+            "quantity": 1.0,
+            "short_target_quantity": 0.0,
+            "allow_short": false,
+            "initial_cash": 100000.0,
             "cost_model_id": "00000000-0000-0000-0000-000000000000", "seed": 0
         }),
         "backtest.get" => json!({
@@ -324,8 +343,13 @@ fn parameter_template(method: &str) -> Value {
             "estimated_price": null
         }),
         "order.cancel" => json!({"broker_order_id": 0}),
+        "order.intent.resolve" => json!({
+            "order_intent_id": "", "resolution": "not_submitted", "note": "reviewed"
+        }),
         "reconcile.acknowledge" => json!({"difference_id": "", "note": ""}),
-        "order.list" | "execution.list" => json!({"page": 1, "page_size": 25}),
+        "order.intent.list" | "order.list" | "execution.list" => {
+            json!({"page": 1, "page_size": 25})
+        }
         _ => json!({}),
     }
 }
