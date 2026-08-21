@@ -1,8 +1,8 @@
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, NaiveDateTime};
 use plotly::{
     Candlestick, Plot, Scatter,
-    common::{Line, Mode, Title},
-    layout::{Axis, AxisType, HoverMode, Layout, RangeSlider},
+    common::{Line, Mode, TickMode, Title},
+    layout::{Axis, AxisType, HoverMode, Layout, Margin, RangeSlider},
 };
 use serde_json::Value;
 use yew::prelude::*;
@@ -53,6 +53,7 @@ pub fn strategy_chart(props: &StrategyChartProps) -> Html {
             });
             let ordered_bars = without_orphan_bar_fragments(ordered_bars);
             let times = local_times(&ordered_bars, "bar_time");
+            let (tick_values, tick_text) = chart_axis_ticks(&times, 9);
             let mut plot = Plot::new();
             if !times.is_empty() {
                 plot.add_trace(Box::new(
@@ -100,7 +101,8 @@ pub fn strategy_chart(props: &StrategyChartProps) -> Html {
             plot.set_layout(
                 Layout::new()
                     .title(Title::with_text(format!("{symbol} · K 线与移动平均线")))
-                    .height(560)
+                    .height(600)
+                    .margin(Margin::new().left(70).right(190).top(80).bottom(105))
                     .hover_mode(HoverMode::XUnified)
                     .x_axis(
                         Axis::new()
@@ -109,6 +111,14 @@ pub fn strategy_chart(props: &StrategyChartProps) -> Html {
                             // space for nights, weekends, or connectivity
                             // gaps. Each persisted Bar occupies one category.
                             .type_(AxisType::Category)
+                            // Category axes otherwise try to render one full
+                            // timestamp per Bar. Sample explicit horizontal
+                            // ticks so both the date and time remain readable.
+                            .tick_mode(TickMode::Array)
+                            .tick_values(tick_values)
+                            .tick_text(tick_text)
+                            .tick_angle(0.0)
+                            .auto_margin(true)
                             .range_slider(RangeSlider::new().visible(false)),
                     )
                     .y_axis(Axis::new().title(Title::with_text("价格")))
@@ -137,8 +147,34 @@ pub fn strategy_chart(props: &StrategyChartProps) -> Html {
     );
 
     html! {
-        <div id={CHART_ID} class="w-100" style="min-height: 560px;" />
+        <div id={CHART_ID} class="w-100" style="min-height: 600px;" />
     }
+}
+
+fn chart_axis_ticks(times: &[String], maximum_ticks: usize) -> (Vec<f64>, Vec<String>) {
+    if times.is_empty() || maximum_ticks == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let tick_count = times.len().min(maximum_ticks.max(2));
+    let indexes = if tick_count == 1 {
+        vec![0]
+    } else {
+        (0..tick_count)
+            .map(|tick| tick * (times.len() - 1) / (tick_count - 1))
+            .collect::<Vec<_>>()
+    };
+    let values = indexes.iter().map(|index| *index as f64).collect();
+    let labels = indexes
+        .iter()
+        .map(|index| chart_tick_label(&times[*index]))
+        .collect();
+    (values, labels)
+}
+
+fn chart_tick_label(value: &str) -> String {
+    NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S")
+        .map(|time| time.format("%Y-%m-%d<br>%H:%M:%S").to_string())
+        .unwrap_or_else(|_| value.to_owned())
 }
 
 fn local_times(rows: &[Value], key: &str) -> Vec<String> {
@@ -225,7 +261,7 @@ fn without_orphan_bar_fragments(rows: Vec<Value>) -> Vec<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::without_orphan_bar_fragments;
+    use super::{chart_axis_ticks, without_orphan_bar_fragments};
 
     fn bar(time: &str) -> serde_json::Value {
         serde_json::json!({"bar_time": time, "timeframe": "5s"})
@@ -249,5 +285,18 @@ mod tests {
     fn a_short_new_data_set_remains_visible() {
         let bars = vec![bar("2026-08-08T13:00:00Z"), bar("2026-08-08T13:00:05Z")];
         assert_eq!(without_orphan_bar_fragments(bars).len(), 2);
+    }
+
+    #[test]
+    fn chart_axis_ticks_keep_dates_readable_without_labeling_every_bar() {
+        let times = (0..100)
+            .map(|second| format!("2026-08-07T21:30:{:02}", second % 60))
+            .collect::<Vec<_>>();
+        let (values, labels) = chart_axis_ticks(&times, 9);
+        assert_eq!(values.len(), 9);
+        assert_eq!(labels.len(), 9);
+        assert_eq!(values.first(), Some(&0.0));
+        assert_eq!(values.last(), Some(&99.0));
+        assert!(labels[0].contains("2026-08-07<br>21:30:00"));
     }
 }
